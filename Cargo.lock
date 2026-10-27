@@ -739,6 +739,7 @@ dependencies = [
  "dashmap",
  "keyspace",
  "persistence",
+ "rand",
  "resp",
  "rustls",
  "rustls-pemfile",

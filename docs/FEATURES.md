@@ -159,4 +159,4 @@ MVCC snapshot reads (`SNAPSHOT BEGIN`/`END`) and dependency-tracked invalidation
 | `reflexdb-cli` | Interactive client. |
 | `reflexdb-sentinel` | Failover watcher for a monitored primary/replica group. |
 | `reflexdb-proxy` | Dumb `--listen`/`--upstream` byte-splice pass-through in front of an existing RESP-compatible server — no RESP parsing, no feature on its own, foundation for a future proxy-side `LIVE`/single-flight layer. |
-| `reflexdb-bench-ui` | Local web UI (`BENCH_UI_BIND`, default `127.0.0.1:8080`) that drives `redis-benchmark` against a running server and charts RPS/latency/RAM/disk live, one card per command. |
+| `reflexdb-bench-ui` | Local web UI (`BENCH_UI_BIND`, default `127.0.0.1:8080`) that drives `redis-benchmark` against a running server and charts RPS/latency/RAM/disk live, one card per command — plus standalone tabs to watch `LIVE`/`UNLIVE` pushes (multi-key, optional auto-randomized values) and to demo tiered storage eviction/promotion against a real server. |

@@ -1,3 +1,4 @@
+use reflexdb_server::resp_client::{Reply, RespClient};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -96,6 +97,15 @@ const HTML: &str = r###"<!DOCTYPE html>
   canvas.mini-bar { width: 100%; height: 26px; display: block; border-radius: 6px; }
   canvas.mini-spark { width: 100%; height: 54px; display: block; border-radius: 6px; margin-top: .3rem; }
 
+  #liveFeed { max-height: 360px; overflow-y: auto; margin-bottom: 1rem; }
+  .live-feed-row { background: #14141c; border: 1px solid #2a2a38; border-left: 4px solid #22d3ee; border-radius: 10px; padding: .7rem 1rem; margin-bottom: .6rem; font-size: .88rem; }
+  .live-feed-row .lf-time { color: #8a8a99; font-size: .74rem; }
+  .live-feed-row .lf-key { color: #a78bfa; font-weight: 700; }
+  .live-feed-row .lf-result { font-weight: 700; color: #4ade80; margin-top: .25rem; font-family: ui-monospace, Menlo, monospace; }
+  .live-row { display: flex; gap: .5rem; align-items: center; margin-bottom: .5rem; }
+  .live-row input { flex: 1; min-width: 0; }
+  .live-row button { padding: .4rem .7rem; font-size: .8rem; }
+
   table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: .85rem; }
   th, td { padding: .5rem .65rem; text-align: right; border-bottom: 1px solid #24242f; }
   th:first-child, td:first-child { text-align: left; }
@@ -138,6 +148,16 @@ const HTML: &str = r###"<!DOCTYPE html>
     (history is recorded automatically on every write once <code>history-enabled yes</code> is set), then
     (2) <code>GETAT</code> point-in-time reads and (3) <code>HISTORY</code> version-log reads against those same keys.
   </span></span></button>
+  <button type="button" class="tab-btn" data-tab="live">LIVE demo<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Subscribes to <code>LIVE GET &lt;key&gt;</code> on a running server and shows every pushed
+    update as it arrives — no polling. Use the "Set value" button to trigger one.
+  </span></span></button>
+  <button type="button" class="tab-btn" data-tab="tiered">Tiered storage demo<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Writes real keys to a running server, then shows how many stayed in RAM (<code>DBSIZE</code>)
+    vs. spilled to the on-disk tier, and times a <code>GET</code> that promotes an evicted key
+    back. Needs a server started with <code>tiered-storage yes</code> and a small
+    <code>tiered-memory-limit</code> to actually see eviction happen.
+  </span></span></button>
 </div>
 
 <form id="bench" class="panel">
@@ -164,36 +184,95 @@ const HTML: &str = r###"<!DOCTYPE html>
   </div>
 </form>
 
+<div id="liveDemoPanel" class="panel" style="display:none;">
+  <label>Host</label><input id="liveHost" value="127.0.0.1">
+  <label>Port</label><input id="livePort" value="7379" type="number">
+  <label>Keys &amp; values<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Each row subscribes to its own <code>LIVE GET &lt;key&gt;</code> over the same connection —
+    add more rows to watch several keys at once. "Set" fires a one-off <code>SET</code> for that
+    row; "Auto-change" below randomizes every row's value repeatedly for you.
+  </span></span></label>
+  <div id="liveRows"></div>
+  <div class="actions">
+    <button type="button" id="liveAddRowBtn" class="secondary">+ Add key</button>
+  </div>
+  <label>Auto-change</label>
+  <div class="actions">
+    <span style="color:#9a9aa8; font-size:.88rem;">for</span>
+    <input id="liveAutoSeconds" value="10" type="number" min="1" style="width:5rem;">
+    <span style="color:#9a9aa8; font-size:.88rem;">seconds, every</span>
+    <input id="liveAutoIntervalMs" value="1000" type="number" min="100" style="width:6rem;">
+    <span style="color:#9a9aa8; font-size:.88rem;">ms</span>
+    <button type="button" id="liveAutoBtn">Start auto-change</button>
+    <button type="button" id="liveAutoStopBtn" disabled class="secondary">Stop auto-change</button>
+  </div>
+  <div class="actions">
+    <button type="button" id="liveWatchBtn">Start watching</button>
+    <button type="button" id="liveStopBtn" disabled class="secondary">Stop watching</button>
+  </div>
+</div>
+
+<div id="tieredDemoPanel" class="panel" style="display:none;">
+  <div class="note" style="grid-column: 1 / -1;">
+    <strong>This must point at a dedicated server</strong>, not your regular one (e.g. not the
+    default port <code>7379</code>) — <code>tiered-storage</code> and
+    <code>tiered-memory-limit</code> can only be set when a server <em>starts</em> (in its
+    <code>.conf</code> file), there's no way to turn tiering on or change the limit from this UI
+    or from a running client. Start one like:
+    <pre style="margin:.5rem 0 0; background:#0c0c12; padding:.6rem .8rem; border-radius:8px; font-size:.78rem;">reflexdb-server --port 7391 --dir /tmp/tiered-demo \
+  --tiered-storage yes --tiered-memory-limit 10kb --tiered-dir tiered</pre>
+  </div>
+  <label>Host</label><input id="tieredHost" value="127.0.0.1">
+  <label>Port</label><input id="tieredPort" value="7391" type="number">
+  <label>Tiered dir (on disk)</label><input id="tieredDir" value="/tmp/tiered-demo/tiered">
+  <label>Keys to write</label><input id="tieredCount" value="2000" type="number">
+  <label>Value size (bytes)</label><input id="tieredSize" value="2000" type="number">
+  <div class="actions">
+    <button type="button" id="tieredRunBtn">Run tiered storage demo</button>
+  </div>
+</div>
+
 <div class="progress-line" id="progressLine" style="display:none;">
   <div class="spinner"></div>
   <span id="progressText">Starting...</span>
   <span class="live-ticker" id="liveTicker" style="display:none;"></span>
 </div>
 
+<div id="liveFeed"></div>
+
+<div id="tieredSummary" class="hero-row" style="display:none;">
+  <div class="hero-card"><div class="k">Keys written</div><div class="v purple" id="tsWritten">-</div></div>
+  <div class="hero-card"><div class="k">DBSIZE (in RAM)</div><div class="v cyan" id="tsDbsize">-</div></div>
+  <div class="hero-card"><div class="k">Tiered dir on disk</div><div class="v green" id="tsDisk">-</div></div>
+  <div class="hero-card"><div class="k">Promote GET time</div><div class="v red" id="tsPromote">-</div></div>
+</div>
+
 <h2>Live output</h2>
 <pre id="output">Pick a preset (or edit fields) and click "Run benchmark". A card appears for every command as it starts, and fills in live.</pre>
 
-<div id="heroSection" style="display:none;">
-  <h2>Run summary</h2>
-  <div class="hero-row">
-    <div class="hero-card"><div class="k">Best throughput</div><div class="v purple" id="bestRps">-</div></div>
-    <div class="hero-card"><div class="k">Commands tested</div><div class="v cyan" id="totalCmds">-</div></div>
-    <div class="hero-card"><div class="k">Lowest p99 latency</div><div class="v red" id="bestP99">-</div></div>
-    <div class="hero-card"><div class="k">Peak server memory</div><div class="v green" id="peakMem">-</div></div>
+<div id="benchResults">
+  <div id="heroSection" style="display:none;">
+    <h2>Run summary</h2>
+    <div class="hero-row">
+      <div class="hero-card"><div class="k">Best throughput</div><div class="v purple" id="bestRps">-</div></div>
+      <div class="hero-card"><div class="k">Commands tested</div><div class="v cyan" id="totalCmds">-</div></div>
+      <div class="hero-card"><div class="k">Lowest p99 latency</div><div class="v red" id="bestP99">-</div></div>
+      <div class="hero-card"><div class="k">Peak server memory</div><div class="v green" id="peakMem">-</div></div>
+    </div>
   </div>
-</div>
 
-<h2>Per-command results</h2>
-<div class="cmd-grid" id="cmdGrid"></div>
+  <h2>Per-command results</h2>
+  <div class="cmd-grid" id="cmdGrid"></div>
 
-<div id="tableSection" style="display:none;">
-  <h2>Full numbers</h2>
-  <table id="numbersTable">
-    <thead>
-      <tr><th>Command</th><th>Variant</th><th>RPS</th><th>Avg (ms)</th><th>p90</th><th>p95</th><th>p99</th><th>Mem &Delta;</th><th>Disk &Delta;</th></tr>
-    </thead>
-    <tbody id="numbersBody"></tbody>
-  </table>
+  <div id="tableSection" style="display:none;">
+    <h2>Full numbers</h2>
+    <table id="numbersTable">
+      <thead>
+        <tr><th>Command</th><th>Variant</th><th>RPS</th><th>Avg (ms)</th><th>p90</th><th>p95</th><th>p99</th><th>Mem &Delta;</th><th>Disk &Delta;</th></tr>
+      </thead>
+      <tbody id="numbersBody"></tbody>
+    </table>
+  </div>
 </div>
 
 <script>
@@ -236,8 +315,16 @@ const liveTicker = document.getElementById('liveTicker');
 const tabRow = document.getElementById('tabRow');
 const historyTabBtn = document.getElementById('historyTabBtn');
 const runEndpoints = { sequential: '/run-profiled', parallel: '/run-profiled', history: '/run-history-profiled' };
+const benchResults = document.getElementById('benchResults');
+const liveDemoPanel = document.getElementById('liveDemoPanel');
+const tieredDemoPanel = document.getElementById('tieredDemoPanel');
+const liveFeed = document.getElementById('liveFeed');
+const tieredSummary = document.getElementById('tieredSummary');
 
 let controller = null;
+let liveController = null;
+let liveAutoController = null;
+let tieredController = null;
 let currentTab = 'sequential';
 
 for (const name of Object.keys(PRESETS)) {
@@ -262,11 +349,22 @@ for (const name of Object.keys(PRESETS)) {
 function setTab(tab) {
   currentTab = tab;
   [...tabRow.children].forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  const showSeqParallel = tab === 'sequential' || tab === 'parallel';
   [...bench.querySelectorAll('[data-mode]')].forEach(el => {
     el.style.display = el.dataset.mode.split(',').includes(tab) ? '' : 'none';
   });
   runBtn.textContent = tab === 'parallel' ? 'Run all commands in parallel' : tab === 'history' ? 'Run history benchmark' : 'Run benchmark';
+
+  const isLive = tab === 'live';
+  const isTiered = tab === 'tiered';
+  bench.style.display = (isLive || isTiered) ? 'none' : '';
+  benchResults.style.display = (isLive || isTiered) ? 'none' : '';
+  liveDemoPanel.style.display = isLive ? 'grid' : 'none';
+  tieredDemoPanel.style.display = isTiered ? 'grid' : 'none';
+  liveFeed.style.display = isLive ? '' : 'none';
+  if (!isLive && liveController) { liveController.abort(); liveController = null; }
+  if (!isLive && liveAutoController) { liveAutoController.abort(); liveAutoController = null; }
+  if (!isTiered && tieredController) { tieredController.abort(); tieredController = null; }
+  if (!isTiered) tieredSummary.style.display = 'none';
 }
 tabRow.addEventListener('click', (e) => {
   if (e.target.closest('.info-icon')) return;
@@ -571,6 +669,249 @@ function renderSummaryAndTable(cmdOrder, cmdState) {
       <td>${fmtKB(v.diskDelta)}</td>
     </tr>`).join('');
 }
+
+// ---- LIVE demo: subscribe to LIVE GET <key> for every row's key and show
+// every pushed update as it streams in (ndjson over a chunked response,
+// same shape as the benchmark endpoints above, just driven by a persistent
+// RESP connection instead of spawning redis-benchmark). Rows are added/
+// removed freely so this can watch one key or several at once.
+const liveWatchBtn = document.getElementById('liveWatchBtn');
+const liveStopBtn = document.getElementById('liveStopBtn');
+const liveRows = document.getElementById('liveRows');
+const liveAddRowBtn = document.getElementById('liveAddRowBtn');
+const liveAutoBtn = document.getElementById('liveAutoBtn');
+const liveAutoStopBtn = document.getElementById('liveAutoStopBtn');
+let liveRowCount = 0;
+
+function addLiveRow(key, value) {
+  liveRowCount += 1;
+  const row = document.createElement('div');
+  row.className = 'live-row';
+  row.innerHTML = `
+    <input class="live-row-key" value="${key}" placeholder="key">
+    <input class="live-row-value" value="${value}" placeholder="value">
+    <button type="button" class="secondary live-row-set">Set</button>
+    <button type="button" class="secondary live-row-remove">&times;</button>`;
+  row.querySelector('.live-row-set').onclick = async () => {
+    const qs = new URLSearchParams({
+      host: document.getElementById('liveHost').value,
+      port: document.getElementById('livePort').value,
+      key: row.querySelector('.live-row-key').value,
+      value: row.querySelector('.live-row-value').value,
+    }).toString();
+    try {
+      const r = await fetch('/live-set?' + qs);
+      const data = await r.json();
+      if (!data.ok) output.textContent += `\n[error] SET failed: ${data.error}\n`;
+    } catch (err) {
+      output.textContent += '\nError: ' + err.message;
+    }
+  };
+  row.querySelector('.live-row-remove').onclick = () => {
+    if (liveRows.children.length > 1) row.remove();
+  };
+  liveRows.appendChild(row);
+}
+addLiveRow('live:demo:1', 'hello');
+addLiveRow('live:demo:2', 'world');
+liveAddRowBtn.onclick = () => addLiveRow(`live:demo:${liveRowCount + 1}`, 'value');
+
+function liveKeys() {
+  return [...liveRows.querySelectorAll('.live-row-key')].map(i => i.value.trim()).filter(Boolean);
+}
+
+function addLiveFeedRow(label, key, fingerprint, result, tMs) {
+  const row = document.createElement('div');
+  row.className = 'live-feed-row';
+  const fp = fingerprint ? fingerprint.slice(0, 12) : '-';
+  const resultText = result === null || result === undefined ? '(nil)' : JSON.stringify(result);
+  row.innerHTML = `<div class="lf-time">${label} &middot; <span class="lf-key"></span> &middot; t+${tMs}ms &middot; fingerprint ${fp}</div><div class="lf-result"></div>`;
+  row.querySelector('.lf-key').textContent = key || '?';
+  row.querySelector('.lf-result').textContent = resultText;
+  liveFeed.prepend(row);
+  // Keep the DOM bounded during a long auto-change run (or anyone just
+  // leaving a watch open) — the scrollable box only shows a handful at
+  // once anyway, no need to keep thousands of old rows around.
+  while (liveFeed.children.length > 200) liveFeed.lastElementChild.remove();
+}
+
+liveWatchBtn.onclick = async () => {
+  if (liveController) liveController.abort();
+  const keys = liveKeys();
+  if (keys.length === 0) { output.textContent += '\n[error] add at least one key first\n'; return; }
+  liveController = new AbortController();
+  liveFeed.innerHTML = '';
+  output.textContent = '';
+  liveWatchBtn.disabled = true;
+  liveStopBtn.disabled = false;
+  const qs = new URLSearchParams({
+    host: document.getElementById('liveHost').value,
+    port: document.getElementById('livePort').value,
+    keys: keys.join(','),
+  }).toString();
+  try {
+    const resp = await fetch('/live-watch?' + qs, { signal: liveController.signal });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        if (!line.trim()) continue;
+        let evt;
+        try { evt = JSON.parse(line); } catch { continue; }
+        if (evt.type === 'update') {
+          const label = evt.event === 'subscribed' ? 'Subscribed' : 'Pushed update';
+          addLiveFeedRow(label, evt.key, evt.fingerprint, evt.result, evt.t_ms);
+          output.textContent += `[t+${evt.t_ms}ms] ${label} (${evt.key}): fingerprint=${evt.fingerprint} result=${JSON.stringify(evt.result)}\n`;
+          output.scrollTop = output.scrollHeight;
+        } else if (evt.type === 'error') {
+          output.textContent += `\n[error] ${evt.message}\n`;
+        }
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') output.textContent += '\nError: ' + err.message;
+  } finally {
+    liveWatchBtn.disabled = false;
+    liveStopBtn.disabled = true;
+    liveController = null;
+  }
+};
+liveStopBtn.onclick = () => { if (liveController) liveController.abort(); };
+
+// "Auto-change": instead of clicking "Set" by hand, ask the server to
+// randomize every watched key's value on an interval for N seconds — the
+// already-running /live-watch stream above picks up the resulting pushes
+// on its own, same as it would for a manual SET.
+liveAutoBtn.onclick = async () => {
+  const keys = liveKeys();
+  if (keys.length === 0) { output.textContent += '\n[error] add at least one key first\n'; return; }
+  if (liveAutoController) liveAutoController.abort();
+  liveAutoController = new AbortController();
+  liveAutoBtn.disabled = true;
+  liveAutoStopBtn.disabled = false;
+  const seconds = parseFloat(document.getElementById('liveAutoSeconds').value) || 10;
+  const intervalMs = parseInt(document.getElementById('liveAutoIntervalMs').value, 10) || 1000;
+  const qs = new URLSearchParams({
+    host: document.getElementById('liveHost').value,
+    port: document.getElementById('livePort').value,
+    keys: keys.join(','),
+    duration_ms: Math.round(seconds * 1000),
+    interval_ms: intervalMs,
+  }).toString();
+  try {
+    const resp = await fetch('/live-autoset?' + qs, { signal: liveAutoController.signal });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        if (!line.trim()) continue;
+        let evt;
+        try { evt = JSON.parse(line); } catch { continue; }
+        if (evt.type === 'tick') {
+          output.textContent += `[auto] SET ${evt.key} = ${evt.value}\n`;
+          output.scrollTop = output.scrollHeight;
+        } else if (evt.type === 'error') {
+          output.textContent += `\n[error] ${evt.message}\n`;
+        }
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') output.textContent += '\nError: ' + err.message;
+  } finally {
+    liveAutoBtn.disabled = false;
+    liveAutoStopBtn.disabled = true;
+    liveAutoController = null;
+  }
+};
+liveAutoStopBtn.onclick = () => { if (liveAutoController) liveAutoController.abort(); };
+
+// ---- Tiered storage demo: write real keys to a running server, then show
+// DBSIZE (what's left in RAM) vs. the tiered dir's on-disk size, and time a
+// GET that promotes an evicted key back.
+const tieredRunBtn = document.getElementById('tieredRunBtn');
+
+tieredRunBtn.onclick = async () => {
+  if (tieredController) tieredController.abort();
+  tieredController = new AbortController();
+  output.textContent = '';
+  tieredSummary.style.display = 'none';
+  tieredRunBtn.disabled = true;
+  const qs = new URLSearchParams({
+    host: document.getElementById('tieredHost').value,
+    port: document.getElementById('tieredPort').value,
+    dir: document.getElementById('tieredDir').value,
+    count: document.getElementById('tieredCount').value,
+    size: document.getElementById('tieredSize').value,
+  }).toString();
+  try {
+    const resp = await fetch('/tiered-demo?' + qs, { signal: tieredController.signal });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        if (!line.trim()) continue;
+        let evt;
+        try { evt = JSON.parse(line); } catch { continue; }
+        if (evt.type === 'progress') {
+          output.textContent = `Writing keys: ${evt.written} / ${evt.total}\n`;
+        } else if (evt.type === 'settling') {
+          output.textContent = 'Letting the background eviction tick catch up...\n';
+        } else if (evt.type === 'summary') {
+          document.getElementById('tsWritten').textContent = evt.written.toLocaleString();
+          document.getElementById('tsDbsize').textContent = evt.dbsize.toLocaleString();
+          document.getElementById('tsDisk').textContent = fmtKB(evt.tiered_disk_kb);
+          tieredSummary.style.display = 'grid';
+          output.textContent += `\nWrote ${evt.written} keys. DBSIZE (in RAM) = ${evt.dbsize}. ` +
+            `Tiered dir on disk = ${fmtKB(evt.tiered_disk_kb)}.\n` +
+            (evt.dbsize < evt.written
+              ? `${evt.written - evt.dbsize} key(s) spilled to disk.\n`
+              : evt.tiered_disk_kb === 0
+                ? `Nothing evicted, and the tiered dir is empty — this server almost certainly wasn't ` +
+                  `started with "tiered-storage yes" (or "dir" above points at the wrong path). ` +
+                  `tiered-memory-limit can't be set from here — it only takes effect at server startup.\n`
+                : `Nothing newly evicted since last run, but ${fmtKB(evt.tiered_disk_kb)} is already on disk from before.\n`);
+        } else if (evt.type === 'promote_check') {
+          document.getElementById('tsPromote').textContent = evt.ms + ' ms';
+          output.textContent += `GET ${evt.key}: ${evt.found ? 'found' : 'not found'} in ${evt.ms}ms` +
+            (evt.found ? ` (promoted from disk if it had been evicted) — preview: ${evt.preview}\n` : '\n');
+        } else if (evt.type === 'exists_check') {
+          output.textContent += `EXISTS ${evt.key}: ${evt.exists ? 'true' : 'false'} (answered truthfully without needing to promote it)\n`;
+        } else if (evt.type === 'error') {
+          output.textContent += `\n[error] ${evt.message}\n`;
+        } else if (evt.type === 'done') {
+          output.textContent += '\nDone.\n';
+        }
+        output.scrollTop = output.scrollHeight;
+      }
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError') output.textContent += '\nError: ' + err.message;
+  } finally {
+    tieredRunBtn.disabled = false;
+    tieredController = null;
+  }
+};
 
 bench.onsubmit = async (e) => {
   e.preventDefault();
@@ -969,6 +1310,393 @@ async fn handle_history_status(query: Option<&str>, socket: &mut TcpStream) -> s
     );
     socket.write_all(headers.as_bytes()).await?;
     socket.write_all(body.as_bytes()).await?;
+    Ok(())
+}
+
+/// Converts a parsed RESP `Reply` into a JSON *value* (not an event
+/// wrapper) — recurses for `Array`, matching the general shape of any
+/// reply, not just the ones this file happens to issue today.
+fn reply_to_json_value(r: &Reply) -> String {
+    match r {
+        Reply::Simple(s) => format!("\"{}\"", json_escape(s)),
+        Reply::Error(e) => format!("{{\"error\":\"{}\"}}", json_escape(e)),
+        Reply::Integer(i) => i.to_string(),
+        Reply::Bulk(None) | Reply::Array(None) => "null".to_string(),
+        Reply::Bulk(Some(b)) => format!("\"{}\"", json_escape(&String::from_utf8_lossy(b))),
+        Reply::Array(Some(items)) => {
+            let parts: Vec<String> = items.iter().map(reply_to_json_value).collect();
+            format!("[{}]", parts.join(","))
+        }
+    }
+}
+
+/// A `LIVE`/push reply is the flat array `["live", "fingerprint", <hex>,
+/// "result", <value>]` — pull `fingerprint`/`result` out of those label/value
+/// pairs instead of shipping the raw positional array to the UI.
+fn parse_live_reply(r: &Reply) -> (String, String) {
+    let mut fingerprint = String::new();
+    let mut result = "null".to_string();
+    if let Reply::Array(Some(items)) = r {
+        let mut i = 1; // skip the leading "live" tag
+        while i + 1 < items.len() {
+            if let Reply::Bulk(Some(label)) = &items[i] {
+                match label.as_slice() {
+                    b"fingerprint" => {
+                        if let Reply::Bulk(Some(hex)) = &items[i + 1] {
+                            fingerprint = String::from_utf8_lossy(hex).into_owned();
+                        }
+                    }
+                    b"result" => result = reply_to_json_value(&items[i + 1]),
+                    _ => {}
+                }
+            }
+            i += 2;
+        }
+    }
+    (fingerprint, result)
+}
+
+/// Subscribes to `LIVE GET <key>` for every key in `keys` (comma-separated)
+/// on the target server, all over one connection, and streams every pushed
+/// update from any of them (ndjson, chunked — same wire shape as
+/// `/run-profiled`) until the browser disconnects. A 2s idle timeout
+/// between reads doubles as a heartbeat: without it, idle keys with no
+/// writes would never notice the client went away, since nothing would
+/// ever reach the `write_chunk` call that'd surface the broken pipe.
+async fn handle_live_watch(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
+    let params = query.map(parse_query).unwrap_or_default();
+    let host = params
+        .get("host")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = params.get("port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(7379);
+    let keys: Vec<String> = params
+        .get("keys")
+        .map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect())
+        .unwrap_or_default();
+    let keys = if keys.is_empty() { vec!["live:demo".to_string()] } else { keys };
+
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    socket.write_all(headers.as_bytes()).await?;
+
+    let mut client = match RespClient::connect(&host, port).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = write_chunk(
+                socket,
+                &format!("{{\"type\":\"error\",\"message\":\"{}\"}}\n", json_escape(&e.to_string())),
+            )
+            .await;
+            socket.write_all(b"0\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
+
+    let t0 = Instant::now();
+    // `fingerprint`s are unique per distinct `LIVE GET <key>` (CRC-64 of
+    // the inner command), so this is enough to label every later push with
+    // which row/key it belongs to, even though the push itself only
+    // carries its fingerprint, not the key.
+    let mut fingerprint_to_key: HashMap<String, String> = HashMap::new();
+    for key in &keys {
+        let subscribed = match client.call(&["LIVE", "GET", key]).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = write_chunk(
+                    socket,
+                    &format!(
+                        "{{\"type\":\"error\",\"message\":\"subscribing to {}: {}\"}}\n",
+                        json_escape(key),
+                        json_escape(&e.to_string())
+                    ),
+                )
+                .await;
+                continue;
+            }
+        };
+        let (fingerprint, result) = parse_live_reply(&subscribed);
+        fingerprint_to_key.insert(fingerprint.clone(), key.clone());
+        let line = format!(
+            "{{\"type\":\"update\",\"event\":\"subscribed\",\"t_ms\":0,\"key\":\"{}\",\"fingerprint\":\"{}\",\"result\":{}}}\n",
+            json_escape(key),
+            json_escape(&fingerprint),
+            result
+        );
+        if write_chunk(socket, &line).await.is_err() {
+            return Ok(());
+        }
+    }
+
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), client.read_next()).await {
+            Ok(Ok(reply)) => {
+                let (fingerprint, result) = parse_live_reply(&reply);
+                let key = fingerprint_to_key.get(&fingerprint).cloned().unwrap_or_default();
+                let line = format!(
+                    "{{\"type\":\"update\",\"event\":\"push\",\"t_ms\":{},\"key\":\"{}\",\"fingerprint\":\"{}\",\"result\":{}}}\n",
+                    t0.elapsed().as_millis(),
+                    json_escape(&key),
+                    json_escape(&fingerprint),
+                    result
+                );
+                if write_chunk(socket, &line).await.is_err() {
+                    break;
+                }
+            }
+            Ok(Err(_)) => break, // connection to the target server died
+            Err(_) => {
+                // Idle timeout tick: no push happened, just confirm the
+                // browser's still there so a dead client doesn't leak these
+                // LIVE subscriptions forever.
+                let line = format!("{{\"type\":\"heartbeat\",\"t_ms\":{}}}\n", t0.elapsed().as_millis());
+                if write_chunk(socket, &line).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = socket.write_all(b"0\r\n\r\n").await;
+    Ok(())
+}
+
+/// One-shot `SET <key> <value>` against the target server — the "other
+/// connection" that triggers a push to whatever's watching via
+/// `/live-watch`, issued from the browser's "Set value" button instead of a
+/// second terminal.
+async fn handle_live_set(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
+    let params = query.map(parse_query).unwrap_or_default();
+    let host = params
+        .get("host")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = params.get("port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(7379);
+    let key = params.get("key").cloned().unwrap_or_default();
+    let value = params.get("value").cloned().unwrap_or_default();
+
+    let result = async {
+        let mut client = RespClient::connect(&host, port).await?;
+        client.call(&["SET", &key, &value]).await
+    }
+    .await;
+
+    let body = match result {
+        Ok(Reply::Error(e)) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&e)),
+        Ok(other) => format!("{{\"ok\":true,\"reply\":{}}}", reply_to_json_value(&other)),
+        Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_escape(&e.to_string())),
+    };
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(headers.as_bytes()).await?;
+    socket.write_all(body.as_bytes()).await?;
+    Ok(())
+}
+
+/// Generates an `n`-byte random alphanumeric value — used by
+/// `/live-autoset` so repeated ticks actually produce a visibly different
+/// pushed result each time, not just the same string over and over.
+fn random_value(n: usize) -> String {
+    use rand::Rng;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..n).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+}
+
+/// Repeatedly `SET`s every key in `keys` to a fresh random value on
+/// `interval_ms`, for `duration_ms` total, streaming a `tick` event (ndjson,
+/// chunked) per `SET` — the "auto-change" button's backend, so the already
+/// running `/live-watch` stream picks up the resulting pushes the same way
+/// it would for a manual `SET` from another terminal.
+async fn handle_live_autoset(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
+    let params = query.map(parse_query).unwrap_or_default();
+    let host = params
+        .get("host")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = params.get("port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(7379);
+    let keys: Vec<String> = params
+        .get("keys")
+        .map(|s| s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect())
+        .unwrap_or_default();
+    let duration_ms =
+        params.get("duration_ms").and_then(|s| s.parse::<u64>().ok()).unwrap_or(10_000).clamp(100, 600_000);
+    let interval_ms =
+        params.get("interval_ms").and_then(|s| s.parse::<u64>().ok()).unwrap_or(1_000).clamp(50, 60_000);
+
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    socket.write_all(headers.as_bytes()).await?;
+
+    if keys.is_empty() {
+        let _ = write_chunk(socket, "{\"type\":\"error\",\"message\":\"no keys given\"}\n").await;
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    let mut client = match RespClient::connect(&host, port).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = write_chunk(
+                socket,
+                &format!("{{\"type\":\"error\",\"message\":\"{}\"}}\n", json_escape(&e.to_string())),
+            )
+            .await;
+            socket.write_all(b"0\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(duration_ms);
+    let mut tick = tokio::time::interval(Duration::from_millis(interval_ms));
+    tick.tick().await; // first tick fires immediately
+    while Instant::now() < deadline {
+        for key in &keys {
+            let value = random_value(8);
+            if client.call(&["SET", key, &value]).await.is_err() {
+                let _ = write_chunk(
+                    socket,
+                    &format!("{{\"type\":\"error\",\"message\":\"SET {} failed\"}}\n", json_escape(key)),
+                )
+                .await;
+                socket.write_all(b"0\r\n\r\n").await?;
+                return Ok(());
+            }
+            let line = format!(
+                "{{\"type\":\"tick\",\"key\":\"{}\",\"value\":\"{}\"}}\n",
+                json_escape(key),
+                json_escape(&value)
+            );
+            if write_chunk(socket, &line).await.is_err() {
+                return Ok(());
+            }
+        }
+        tick.tick().await;
+    }
+    let _ = write_chunk(socket, "{\"type\":\"done\"}\n").await;
+    socket.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+/// Writes `count` real keys of `size` bytes each to the target server, then
+/// reports `DBSIZE` (what's left in RAM) against the tiered directory's
+/// on-disk size, and times a `GET`/`EXISTS` against early keys to
+/// demonstrate promotion-on-read and `EXISTS` staying truthful without one.
+/// Only actually shows eviction if the target server was started with
+/// `tiered-storage yes` and a `tiered-memory-limit` small enough for this
+/// workload to exceed — this issues real commands, it doesn't simulate.
+async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
+    let params = query.map(parse_query).unwrap_or_default();
+    let host = params
+        .get("host")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = params.get("port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(7379);
+    let dir = params
+        .get("dir")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "tiered".to_string());
+    let count = params.get("count").and_then(|s| s.parse::<usize>().ok()).unwrap_or(2000).clamp(1, 1_000_000);
+    let size = params.get("size").and_then(|s| s.parse::<usize>().ok()).unwrap_or(2000).clamp(1, 10_000_000);
+    let prefix = "tiered:demo:";
+
+    let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    socket.write_all(headers.as_bytes()).await?;
+
+    let mut client = match RespClient::connect(&host, port).await {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = write_chunk(
+                socket,
+                &format!("{{\"type\":\"error\",\"message\":\"{}\"}}\n", json_escape(&e.to_string())),
+            )
+            .await;
+            socket.write_all(b"0\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
+
+    let value = "x".repeat(size);
+    for i in 0..count {
+        let key = format!("{prefix}{i}");
+        if client.call(&["SET", &key, &value]).await.is_err() {
+            let _ = write_chunk(socket, "{\"type\":\"error\",\"message\":\"SET failed mid-run\"}\n").await;
+            socket.write_all(b"0\r\n\r\n").await?;
+            return Ok(());
+        }
+        if i % 50 == 0 || i + 1 == count {
+            let line = format!("{{\"type\":\"progress\",\"written\":{},\"total\":{}}}\n", i + 1, count);
+            if write_chunk(socket, &line).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+
+    // The background eviction tick (100ms interval, capped batch size —
+    // see `ServerContext::run_eviction_tick`) runs concurrently with the
+    // writes above, not synchronously on every `SET`; give it a moment to
+    // actually catch up on a big burst before reading `DBSIZE`, or this
+    // would often read a stale "nothing evicted yet" count.
+    if write_chunk(socket, "{\"type\":\"settling\"}\n").await.is_err() {
+        return Ok(());
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let dbsize = match client.call(&["DBSIZE"]).await {
+        Ok(Reply::Integer(n)) => n,
+        _ => -1,
+    };
+    let disk_kb = get_dir_disk_kb(&dir).await;
+    let line = format!(
+        "{{\"type\":\"summary\",\"written\":{count},\"dbsize\":{dbsize},\"tiered_disk_kb\":{disk_kb}}}\n"
+    );
+    if write_chunk(socket, &line).await.is_err() {
+        return Ok(());
+    }
+
+    // The very first key written is the one most likely to have already
+    // been evicted by the time `count` more keys have gone in — GET-ing it
+    // exercises the promote-on-read path (or just confirms it's still
+    // in RAM, if the server isn't tiered or the limit wasn't exceeded).
+    let first_key = format!("{prefix}0");
+    let t0 = Instant::now();
+    let got = client.call(&["GET", &first_key]).await;
+    let get_ms = t0.elapsed().as_millis();
+    let (found, preview) = match &got {
+        Ok(Reply::Bulk(Some(b))) => (true, String::from_utf8_lossy(&b[..b.len().min(40)]).into_owned()),
+        _ => (false, String::new()),
+    };
+    let line = format!(
+        "{{\"type\":\"promote_check\",\"key\":\"{}\",\"found\":{},\"ms\":{},\"preview\":\"{}\"}}\n",
+        json_escape(&first_key),
+        found,
+        get_ms,
+        json_escape(&preview)
+    );
+    if write_chunk(socket, &line).await.is_err() {
+        return Ok(());
+    }
+
+    // `EXISTS` on a later key — answers truthfully for tiered keys without
+    // needing to actually read/promote from disk.
+    let mid_key = format!("{prefix}{}", count / 2);
+    let exists = match client.call(&["EXISTS", &mid_key]).await {
+        Ok(Reply::Integer(n)) => n,
+        _ => -1,
+    };
+    let line = format!(
+        "{{\"type\":\"exists_check\",\"key\":\"{}\",\"exists\":{}}}\n",
+        json_escape(&mid_key),
+        exists
+    );
+    let _ = write_chunk(socket, &line).await;
+
+    let _ = write_chunk(socket, "{\"type\":\"done\"}\n").await;
+    socket.write_all(b"0\r\n\r\n").await?;
     Ok(())
 }
 
@@ -1410,6 +2138,10 @@ async fn handle_connection(socket: &mut TcpStream) -> std::io::Result<()> {
         ("GET", "/run-profiled") => handle_run_profiled(query, socket).await,
         ("GET", "/run-history-profiled") => handle_run_history_profiled(query, socket).await,
         ("GET", "/history-status") => handle_history_status(query, socket).await,
+        ("GET", "/live-watch") => handle_live_watch(query, socket).await,
+        ("GET", "/live-set") => handle_live_set(query, socket).await,
+        ("GET", "/live-autoset") => handle_live_autoset(query, socket).await,
+        ("GET", "/tiered-demo") => handle_tiered_demo(query, socket).await,
         ("GET", "/stats") => handle_stats(socket).await,
         _ => {
             socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await?;
