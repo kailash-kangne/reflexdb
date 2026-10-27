@@ -238,6 +238,18 @@ const HTML: &str = r###"<!DOCTYPE html>
   <span class="live-ticker" id="liveTicker" style="display:none;"></span>
 </div>
 
+<div id="liveStats" class="hero-row" style="display:none;">
+  <div class="hero-card"><div class="k">Subscribe requests sent</div><div class="v purple" id="liveSubCount">0</div></div>
+  <div class="hero-card"><div class="k">Updates pushed to us</div><div class="v cyan" id="livePushCount">0</div></div>
+  <div class="hero-card"><div class="k">If this were polling</div><div class="v red" id="livePollEquivalent">0 requests</div></div>
+</div>
+<p id="liveExplain" style="display:none; color:#8a8a99; font-size:.85rem; margin:-.5rem 0 1rem;">
+  "Subscribe requests" only grows when you click "Start watching" — it's one <code>LIVE GET</code>
+  per key, sent once. "Updates pushed to us" grows every time a value changes below, with zero
+  extra requests from this browser. A polling client doing the same job would need one
+  <code>GET</code> per key for <em>every</em> check, found-a-change or not — that's the number on
+  the right, and it only goes up.
+</p>
 <div id="liveFeed"></div>
 
 <div id="tieredSummary" class="hero-row" style="display:none;">
@@ -319,6 +331,11 @@ const benchResults = document.getElementById('benchResults');
 const liveDemoPanel = document.getElementById('liveDemoPanel');
 const tieredDemoPanel = document.getElementById('tieredDemoPanel');
 const liveFeed = document.getElementById('liveFeed');
+const liveStats = document.getElementById('liveStats');
+const liveExplain = document.getElementById('liveExplain');
+const liveSubCount = document.getElementById('liveSubCount');
+const livePushCount = document.getElementById('livePushCount');
+const livePollEquivalent = document.getElementById('livePollEquivalent');
 const tieredSummary = document.getElementById('tieredSummary');
 
 let controller = null;
@@ -326,6 +343,8 @@ let liveController = null;
 let liveAutoController = null;
 let tieredController = null;
 let currentTab = 'sequential';
+let liveStartedAt = 0;
+let liveWatchedKeyCount = 0;
 
 for (const name of Object.keys(PRESETS)) {
   const btn = document.createElement('button');
@@ -361,6 +380,8 @@ function setTab(tab) {
   liveDemoPanel.style.display = isLive ? 'grid' : 'none';
   tieredDemoPanel.style.display = isTiered ? 'grid' : 'none';
   liveFeed.style.display = isLive ? '' : 'none';
+  liveStats.style.display = isLive ? 'grid' : 'none';
+  liveExplain.style.display = isLive ? '' : 'none';
   if (!isLive && liveController) { liveController.abort(); liveController = null; }
   if (!isLive && liveAutoController) { liveAutoController.abort(); liveAutoController = null; }
   if (!isTiered && tieredController) { tieredController.abort(); tieredController = null; }
@@ -735,6 +756,17 @@ function addLiveFeedRow(label, key, fingerprint, result, tMs) {
   while (liveFeed.children.length > 200) liveFeed.lastElementChild.remove();
 }
 
+function updateLiveStats() {
+  const elapsedSec = liveStartedAt ? (Date.now() - liveStartedAt) / 1000 : 0;
+  // What a client polling once/sec per key (a typical, not even
+  // aggressive, polling interval) would have had to send by now, found a
+  // change or not — contrast with "subscribe requests", which never grows
+  // past one-per-key no matter how long this runs or how many pushes
+  // arrive.
+  const pollEquivalent = Math.ceil(elapsedSec) * liveWatchedKeyCount;
+  livePollEquivalent.textContent = pollEquivalent.toLocaleString() + ' requests';
+}
+
 liveWatchBtn.onclick = async () => {
   if (liveController) liveController.abort();
   const keys = liveKeys();
@@ -744,6 +776,13 @@ liveWatchBtn.onclick = async () => {
   output.textContent = '';
   liveWatchBtn.disabled = true;
   liveStopBtn.disabled = false;
+  liveStats.style.display = 'grid';
+  liveSubCount.textContent = '0';
+  livePushCount.textContent = '0';
+  liveStartedAt = Date.now();
+  liveWatchedKeyCount = keys.length;
+  updateLiveStats();
+  const statsTimer = setInterval(updateLiveStats, 500);
   const qs = new URLSearchParams({
     host: document.getElementById('liveHost').value,
     port: document.getElementById('livePort').value,
@@ -767,6 +806,11 @@ liveWatchBtn.onclick = async () => {
         try { evt = JSON.parse(line); } catch { continue; }
         if (evt.type === 'update') {
           const label = evt.event === 'subscribed' ? 'Subscribed' : 'Pushed update';
+          if (evt.event === 'subscribed') {
+            liveSubCount.textContent = (parseInt(liveSubCount.textContent, 10) + 1).toString();
+          } else {
+            livePushCount.textContent = (parseInt(livePushCount.textContent, 10) + 1).toString();
+          }
           addLiveFeedRow(label, evt.key, evt.fingerprint, evt.result, evt.t_ms);
           output.textContent += `[t+${evt.t_ms}ms] ${label} (${evt.key}): fingerprint=${evt.fingerprint} result=${JSON.stringify(evt.result)}\n`;
           output.scrollTop = output.scrollHeight;
@@ -778,6 +822,7 @@ liveWatchBtn.onclick = async () => {
   } catch (err) {
     if (err.name !== 'AbortError') output.textContent += '\nError: ' + err.message;
   } finally {
+    clearInterval(statsTimer);
     liveWatchBtn.disabled = false;
     liveStopBtn.disabled = true;
     liveController = null;
