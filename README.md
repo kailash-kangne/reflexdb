@@ -13,6 +13,50 @@ the box.
 
 Everything is original Rust code.
 
+## Quick start
+
+Build and run the server (requires the Rust toolchain — [rustup.rs](https://rustup.rs)):
+
+```sh
+git clone <this-repo>
+cd reflexdb
+cargo build --release
+./target/release/reflexdb-server reflexdb.conf
+```
+
+By default it listens on `127.0.0.1:7379`. Talk to it with `redis-cli` or any Redis client:
+
+```sh
+redis-cli -p 7379 set foo bar
+redis-cli -p 7379 get foo
+```
+
+Or use the bundled CLI instead of `redis-cli`:
+
+```sh
+cargo run --release --bin reflexdb-cli -- -p 7379
+```
+
+Try the two features that aren't in Redis:
+
+```sh
+# LIVE: subscribe to a command's result, get pushed the new result on every change
+> LIVE GET foo
+1) "live"  2) "fingerprint"  3) "<hex crc64>"  4) "result"  5) "bar"
+# (from another connection) SET foo baz  →  pushes an updated result automatically
+
+# Tiered storage: evicted keys spill to disk instead of being dropped, and
+# come back transparently on the next read. Turn it on in reflexdb.conf:
+#   tiered-storage yes
+#   tiered-memory-limit 250mb
+```
+
+See `reflexdb.conf` in the repo root for all config directives (passwords, persistence,
+replication, TLS, etc.), and [docs/COMMANDS.md](docs/COMMANDS.md) for the full command list.
+
+Run the test suite with `cargo test`, or build the production Docker image with
+`docker build -t reflexdb .`.
+
 ## Who this might be for (unproven — read this as a hypothesis, not a claim)
 
 AI agent memory is hot, short-lived, and high-churn — the shape reflexdb is already built for.
