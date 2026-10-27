@@ -1,0 +1,34 @@
+[package]
+name = "reflexdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Its own workspace so cargo doesn't try to fold it into the parent
+# reflexdb workspace (the usual cargo-fuzz layout).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bincode = "1"
+bytes = "1"
+keyspace = { path = "../crates/keyspace" }
+libfuzzer-sys = "0.4"
+resp = { path = "../crates/resp" }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[[bin]]
+name = "resp_decode"
+path = "fuzz_targets/resp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "restore_deserialize"
+path = "fuzz_targets/restore_deserialize.rs"
+test = false
+doc = false
+bench = false

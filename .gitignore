@@ -1,0 +1,26 @@
+.DS_Store
+/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+.devin/config.local.json
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# Server data / runtime artifacts (RDB/AOF/tiered-storage/history files, logs)
+*.rdb
+*.aof
+appendonly.aof
+/data/
+/tiered/
+*.log
+
+# Secrets / local env overrides — never commit these
+.env
+.env.*
+*.pem
+*.key
+secrets.toml

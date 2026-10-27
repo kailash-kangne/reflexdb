@@ -1,0 +1,15 @@
+# Throwaway image for benchmarking reflexdb against another engine in the
+# same Docker environment (removes the "native host vs Docker VM networking"
+# confound from an earlier cross-environment comparison). Not meant as a
+# production image — no attempt at minimal layers/size.
+FROM rust:1-bookworm AS builder
+# mlua's "vendored" feature compiles PUC Lua's C sources at build time.
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY . .
+RUN cargo build --release --bin reflexdb-server
+
+FROM debian:bookworm-slim
+COPY --from=builder /build/target/release/reflexdb-server /usr/local/bin/reflexdb-server
+EXPOSE 6379
+ENTRYPOINT ["/usr/local/bin/reflexdb-server", "--port", "6379", "--bind", "0.0.0.0", "--dir", "/data", "--appendonly", "no"]

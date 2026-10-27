@@ -1,0 +1,47 @@
+[package]
+name = "reflexdb-server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "reflexdb_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "reflexdb-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "reflexdb-sentinel"
+path = "src/bin/reflexdb-sentinel.rs"
+
+[[bin]]
+name = "reflexdb-cli"
+path = "src/bin/reflexdb-cli.rs"
+
+[[bin]]
+name = "reflexdb-proxy"
+path = "src/bin/reflexdb-proxy.rs"
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+resp = { path = "../resp" }
+keyspace = { path = "../keyspace" }
+commands = { path = "../commands" }
+persistence = { path = "../persistence" }
+tiered = { path = "../tiered" }
+# "ring" instead of the default "aws-lc-rs" crypto provider: ring doesn't
+# need cmake/a C++ toolchain to build, consistent with preferring lighter
+# builds elsewhere in this project (fjall over rocksdb, vendored PUC Lua
+# over LuaJIT).
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2.2.0"
+rustyline = "14.0.0"

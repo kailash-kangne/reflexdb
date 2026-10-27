@@ -1,0 +1,13 @@
+[package]
+name = "tiered"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+fjall = "3.1.13"
+bytes.workspace = true
+serde.workspace = true
+bincode.workspace = true
+tracing.workspace = true
+keyspace = { path = "../keyspace" }

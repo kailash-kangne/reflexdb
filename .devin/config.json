@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Write(**)",
+      "Exec(cargo)",
+      "Exec(rustc)",
+      "Exec(rustfmt)",
+      "Exec(rustup)",
+      "Exec(git)",
+      "Exec(redis-cli)",
+      "Exec(ls)",
+      "Exec(cat)",
+      "Exec(mkdir)"
+    ],
+    "deny": [
+      "Exec(rm -rf)",
+      "Exec(sudo)",
+      "Write(.env*)"
+    ]
+  }
+}

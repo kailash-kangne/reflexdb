@@ -1,0 +1,15 @@
+[package]
+name = "persistence"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+serde.workspace = true
+bincode.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+fjall = "3.1.13"
+keyspace = { path = "../keyspace" }
+resp = { path = "../resp" }
