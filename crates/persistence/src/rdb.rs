@@ -182,7 +182,7 @@ mod tests {
         stream.read_group(b"g", B::from("c"), None, None, 0, false);
 
         let store = Store::new(1);
-        store.db(0).unwrap().set(B::from("s"), Value::Stream(stream), None);
+        store.db(0).unwrap().set(B::from("s"), Value::Stream(Box::new(stream)), None);
         save(&path, &store).unwrap();
 
         let restored = Store::new(1);

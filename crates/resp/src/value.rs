@@ -32,6 +32,32 @@ pub enum Value {
     Null,
 }
 
+/// Appends `n`'s decimal digits straight into `buf` with no intermediate
+/// heap allocation. `n.to_string()` would allocate a disposable `String`
+/// just to copy its bytes out and drop it again — on the hottest path in
+/// this crate, since every integer reply and every bulk/array/map/set
+/// length goes through this.
+fn put_u64(buf: &mut BytesMut, mut n: u64) {
+    let mut tmp = [0u8; 20]; // u64::MAX is 20 digits
+    let mut i = tmp.len();
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(&tmp[i..]);
+}
+
+fn put_i64(buf: &mut BytesMut, n: i64) {
+    if n < 0 {
+        buf.put_u8(b'-');
+    }
+    put_u64(buf, n.unsigned_abs());
+}
+
 impl Value {
     pub fn ok() -> Self {
         Value::Simple("OK".into())
@@ -59,12 +85,12 @@ impl Value {
             }
             Value::Integer(i) => {
                 buf.put_u8(b':');
-                buf.extend_from_slice(i.to_string().as_bytes());
+                put_i64(buf, *i);
                 buf.extend_from_slice(b"\r\n");
             }
             Value::Bulk(data) => {
                 buf.put_u8(b'$');
-                buf.extend_from_slice(data.len().to_string().as_bytes());
+                put_u64(buf, data.len() as u64);
                 buf.extend_from_slice(b"\r\n");
                 buf.extend_from_slice(data);
                 buf.extend_from_slice(b"\r\n");
@@ -83,7 +109,7 @@ impl Value {
             },
             Value::Array(items) => {
                 buf.put_u8(b'*');
-                buf.extend_from_slice(items.len().to_string().as_bytes());
+                put_u64(buf, items.len() as u64);
                 buf.extend_from_slice(b"\r\n");
                 for item in items {
                     item.encode(buf, proto);
@@ -120,46 +146,60 @@ impl Value {
             Value::Map(pairs) => match proto {
                 Protocol::Resp3 => {
                     buf.put_u8(b'%');
-                    buf.extend_from_slice(pairs.len().to_string().as_bytes());
+                    put_u64(buf, pairs.len() as u64);
                     buf.extend_from_slice(b"\r\n");
                     for (k, v) in pairs {
                         k.encode(buf, proto);
                         v.encode(buf, proto);
                     }
                 }
+                // Flattened `[k1, v1, k2, v2, ...]` array, same wire shape as
+                // `Value::Array` — written directly instead of cloning every
+                // key/value into a throwaway `Vec<Value>` first.
                 Protocol::Resp2 => {
-                    let mut flat = Vec::with_capacity(pairs.len() * 2);
+                    buf.put_u8(b'*');
+                    put_u64(buf, (pairs.len() * 2) as u64);
+                    buf.extend_from_slice(b"\r\n");
                     for (k, v) in pairs {
-                        flat.push(k.clone());
-                        flat.push(v.clone());
+                        k.encode(buf, proto);
+                        v.encode(buf, proto);
                     }
-                    Value::Array(flat).encode(buf, proto);
                 }
             },
             Value::Set(items) => match proto {
                 Protocol::Resp3 => {
                     buf.put_u8(b'~');
-                    buf.extend_from_slice(items.len().to_string().as_bytes());
+                    put_u64(buf, items.len() as u64);
                     buf.extend_from_slice(b"\r\n");
                     for item in items {
                         item.encode(buf, proto);
                     }
                 }
                 Protocol::Resp2 => {
-                    Value::Array(items.clone()).encode(buf, proto);
+                    buf.put_u8(b'*');
+                    put_u64(buf, items.len() as u64);
+                    buf.extend_from_slice(b"\r\n");
+                    for item in items {
+                        item.encode(buf, proto);
+                    }
                 }
             },
             Value::Push(items) => match proto {
                 Protocol::Resp3 => {
                     buf.put_u8(b'>');
-                    buf.extend_from_slice(items.len().to_string().as_bytes());
+                    put_u64(buf, items.len() as u64);
                     buf.extend_from_slice(b"\r\n");
                     for item in items {
                         item.encode(buf, proto);
                     }
                 }
                 Protocol::Resp2 => {
-                    Value::Array(items.clone()).encode(buf, proto);
+                    buf.put_u8(b'*');
+                    put_u64(buf, items.len() as u64);
+                    buf.extend_from_slice(b"\r\n");
+                    for item in items {
+                        item.encode(buf, proto);
+                    }
                 }
             },
         }

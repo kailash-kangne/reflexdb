@@ -129,7 +129,7 @@ pub fn cmd_xadd(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     let now = now_ms();
     let result = db.with_entry_mut(
         key.clone(),
-        || KVal::Stream(Stream::new()),
+        || KVal::Stream(Box::new(Stream::new())),
         |v| match v {
             KVal::Stream(s) => s.add(spec, now, fields).inspect(|_| {
                 if let Some(n) = maxlen {
@@ -276,7 +276,7 @@ pub fn cmd_xgroup(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         let id_arg = id_arg.clone();
         let result = db.with_entry_mut(
             key.clone(),
-            || KVal::Stream(Stream::new()),
+            || KVal::Stream(Box::new(Stream::new())),
             |v| match v {
                 KVal::Stream(s) => match resolve_group_start(&id_arg, s.last_id()) {
                     Some(start) => Ok(s.create_group(group.clone(), start)),

@@ -1,12 +1,13 @@
 //! In-memory keyspace: sharded-by-DB storage with TTL semantics.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use indexmap::IndexSet;
 use papaya::HashMap as PapayaMap;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 mod stream;
@@ -16,7 +17,11 @@ pub use zset::ZSet;
 
 pub type List = VecDeque<Bytes>;
 pub type Hash = HashMap<Bytes, Bytes>;
-pub type Set = HashSet<Bytes>;
+/// Insertion-order-preserving set, not a plain `HashSet`: `SPOP` needs O(1)
+/// "pick a random element and remove it" (pick a random index, then
+/// `swap_remove_index`), which a `HashSet` can't do without an O(n) scan —
+/// see `commands::set::cmd_spop`.
+pub type Set = IndexSet<Bytes>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -25,7 +30,14 @@ pub enum Value {
     Hash(Hash),
     Set(Set),
     ZSet(ZSet),
-    Stream(Stream),
+    /// Boxed, unlike every other variant: `Stream` is by far the largest
+    /// (consumer groups, PELs, ...) and by far the least common value type
+    /// in practice, so leaving it unboxed would make `Value` itself as big
+    /// as a `Stream` — paid on every `String`/`List`/`Hash`/`Set`/`ZSet`
+    /// stored, not just on actual streams. Serde treats `Box<T>` exactly
+    /// like `T` on the wire, so this doesn't change the RDB/tiered-storage
+    /// format.
+    Stream(Box<Stream>),
 }
 
 impl Value {
@@ -172,12 +184,18 @@ pub trait TieringHandler: Send + Sync {
 /// than `DashMap` on a realistic mostly-unique-key workload in
 /// benchmarking before this change. Mutating a value in place still needs
 /// *some* synchronization (papaya only hands out shared references), so
-/// each entry is individually wrapped in a `Mutex` — contention on that
-/// per-key lock only happens when the exact same key is hit concurrently,
+/// each entry is individually wrapped in a `parking_lot::RwLock` —
+/// contention only happens when the exact same key is hit concurrently,
 /// same as `DashMap`'s per-key behavior once you're past its shard lock.
+/// `RwLock`, not `Mutex`: reads (`GET`/`LRANGE`/`HGETALL`/.../type checks)
+/// take a shared read lock, so N concurrent readers of the *same* key run
+/// in parallel instead of fully serializing the way they would behind a
+/// plain `Mutex` — see `with_value`'s and `get`'s docs for how the
+/// LRU/LFU/sliding-TTL bookkeeping (which does need exclusive access)
+/// avoids forcing every reader back onto the slow path.
 #[derive(Default)]
 pub struct Db {
-    map: PapayaMap<Bytes, Mutex<Entry>>,
+    map: PapayaMap<Bytes, RwLock<Entry>>,
     tiering: Option<Arc<dyn TieringHandler>>,
 }
 
@@ -195,9 +213,21 @@ impl Db {
     /// Set a key to a value, optionally with an absolute expiry instant.
     /// Passing `None` clears any existing TTL (matches `SET` semantics).
     /// Always clears sliding-TTL mode — a plain `SET` is a fresh value.
+    ///
+    /// Also drops any stale copy of `key` from the disk tier first: unlike
+    /// `with_entry_mut` (which promotes before mutating), this writes
+    /// straight into RAM, so without this it would be possible for a
+    /// `SET`/`RENAME`/`RESTORE` on a currently-tiered key to leave RAM and
+    /// the tier both holding a copy — breaking the "never coexist"
+    /// invariant `DEL`/`EXISTS`/`GET` rely on (a later `DEL` would only
+    /// clear the RAM copy, leaving the stale tiered value to resurrect on
+    /// the next `GET`).
     pub fn set(&self, key: Bytes, value: Value, expires_at: Option<Instant>) {
+        if let Some(handler) = &self.tiering {
+            handler.remove(&key);
+        }
         let guard = self.map.guard();
-        self.map.insert(key, Mutex::new(Entry::new(value, expires_at, None)), &guard);
+        self.map.insert(key, RwLock::new(Entry::new(value, expires_at, None)), &guard);
     }
 
     /// On a RAM miss, ask the tiering handler (if any) for the key and, if
@@ -208,30 +238,59 @@ impl Db {
         let Some((value, ttl)) = handler.promote(key) else { return false };
         let expires_at = ttl.map(saturating_deadline);
         let guard = self.map.guard();
-        self.map.insert(Bytes::copy_from_slice(key), Mutex::new(Entry::new(value, expires_at, None)), &guard);
+        self.map.insert(
+            Bytes::copy_from_slice(key),
+            RwLock::new(Entry::new(value, expires_at, None)),
+            &guard,
+        );
         true
+    }
+
+    /// Bumps LRU/LFU bookkeeping and, for a sliding-TTL key, resets the
+    /// expiry countdown — called after a read already dropped its shared
+    /// lock. A sliding-TTL key always takes the exclusive lock: missing a
+    /// reset could let an actively-read key expire early, which the LRU/LFU
+    /// counters (already a documented approximation, not exact
+    /// Redis-compatible tracking) don't need to guarantee. For the common
+    /// case (no sliding TTL), this is best-effort: skipped outright if the
+    /// lock is contended, instead of making every concurrent reader of the
+    /// same key fall back to serializing on an exclusive lock just to bump
+    /// a counter.
+    fn touch_entry(lock: &RwLock<Entry>, sliding: Option<Duration>) {
+        if sliding.is_some() {
+            lock.write().touch();
+        } else if let Some(mut entry) = lock.try_write() {
+            entry.touch();
+        }
     }
 
     /// Passive expiry: look up a key, evicting it first if its TTL has
     /// elapsed. Falls back to the disk tier (if configured) on a RAM miss.
-    /// Resets a sliding TTL (if any) on this access. Returns `None` for
-    /// missing-or-expired keys.
+    /// Resets a sliding TTL (if any) on this access.
+    ///
+    /// Takes only a shared read lock for the actual value clone, so N
+    /// concurrent `GET`s of the same key run in parallel instead of
+    /// serializing behind each other — see `touch_entry`'s docs for how the
+    /// LRU/LFU/sliding-TTL bookkeeping is kept out of that hot path.
     pub fn get(&self, key: &[u8]) -> Option<Value> {
         let guard = self.map.guard();
         if let Some(lock) = self.map.get(key, &guard) {
-            let mut entry = lock.lock();
+            let entry = lock.read();
             if entry.is_expired() {
                 drop(entry);
                 self.map.remove(key, &guard);
                 return None;
             }
-            entry.touch();
-            return Some(entry.value.clone());
+            let value = entry.value.clone();
+            let sliding = entry.sliding;
+            drop(entry);
+            Self::touch_entry(lock, sliding);
+            return Some(value);
         }
         drop(guard);
         if self.try_promote(key) {
             let guard = self.map.guard();
-            return self.map.get(key, &guard).map(|lock| lock.lock().value.clone());
+            return self.map.get(key, &guard).map(|lock| lock.read().value.clone());
         }
         None
     }
@@ -271,7 +330,7 @@ impl Db {
         keys.iter()
             .filter(|k| {
                 let in_ram =
-                    self.map.get(k.as_ref(), &guard).map(|lock| !lock.lock().is_expired()).unwrap_or(false);
+                    self.map.get(k.as_ref(), &guard).map(|lock| !lock.read().is_expired()).unwrap_or(false);
                 in_ram || self.tiering.as_ref().is_some_and(|h| h.contains(k))
             })
             .count()
@@ -282,7 +341,7 @@ impl Db {
         match self.map.get(key, &guard) {
             None => Ttl::NoKey,
             Some(lock) => {
-                let entry = lock.lock();
+                let entry = lock.read();
                 if entry.is_expired() {
                     drop(entry);
                     self.map.remove(key, &guard);
@@ -304,7 +363,7 @@ impl Db {
         let guard = self.map.guard();
         match self.map.get(key, &guard) {
             Some(lock) => {
-                let mut entry = lock.lock();
+                let mut entry = lock.write();
                 if entry.is_expired() {
                     false
                 } else {
@@ -325,7 +384,7 @@ impl Db {
         let guard = self.map.guard();
         match self.map.get(key, &guard) {
             Some(lock) => {
-                let mut entry = lock.lock();
+                let mut entry = lock.write();
                 if entry.is_expired() {
                     false
                 } else {
@@ -345,7 +404,7 @@ impl Db {
         let guard = self.map.guard();
         match self.map.get(key, &guard) {
             Some(lock) => {
-                let entry = lock.lock();
+                let entry = lock.read();
                 if entry.is_expired() {
                     None
                 } else {
@@ -359,22 +418,31 @@ impl Db {
     /// Read-only access to a key's value, with passive expiry applied first
     /// and a tiered-storage promotion attempt on a RAM miss. Resets a
     /// sliding TTL (if any) on this access.
+    ///
+    /// `f` runs under only a shared read lock, so concurrent callers reading
+    /// the *same* key (e.g. many clients running `LRANGE`/`HGETALL`/
+    /// `SMEMBERS`/`TYPE` against one hot key) run in parallel instead of
+    /// fully serializing on an exclusive lock — see `touch_entry`'s docs for
+    /// how the LRU/LFU/sliding-TTL bookkeeping stays out of that path.
     pub fn with_value<R>(&self, key: &[u8], f: impl FnOnce(&Value) -> R) -> Option<R> {
         let guard = self.map.guard();
         if let Some(lock) = self.map.get(key, &guard) {
-            let mut entry = lock.lock();
+            let entry = lock.read();
             if entry.is_expired() {
                 drop(entry);
                 self.map.remove(key, &guard);
                 return None;
             }
-            entry.touch();
-            return Some(f(&entry.value));
+            let result = f(&entry.value);
+            let sliding = entry.sliding;
+            drop(entry);
+            Self::touch_entry(lock, sliding);
+            return Some(result);
         }
         drop(guard);
         if self.try_promote(key) {
             let guard = self.map.guard();
-            return self.map.get(key, &guard).map(|lock| f(&lock.lock().value));
+            return self.map.get(key, &guard).map(|lock| f(&lock.read().value));
         }
         None
     }
@@ -385,7 +453,7 @@ impl Db {
     pub fn with_value_mut<R>(&self, key: &[u8], f: impl FnOnce(&mut Value) -> R) -> Option<R> {
         let guard = self.map.guard();
         if let Some(lock) = self.map.get(key, &guard) {
-            let mut entry = lock.lock();
+            let mut entry = lock.write();
             if entry.is_expired() {
                 drop(entry);
                 self.map.remove(key, &guard);
@@ -397,7 +465,7 @@ impl Db {
         drop(guard);
         if self.try_promote(key) {
             let guard = self.map.guard();
-            return self.map.get(key, &guard).map(|lock| f(&mut lock.lock().value));
+            return self.map.get(key, &guard).map(|lock| f(&mut lock.write().value));
         }
         None
     }
@@ -420,7 +488,7 @@ impl Db {
         // `contains_key` call right after.
         let mut present = false;
         if let Some(lock) = self.map.get(&key, &guard) {
-            let entry = lock.lock();
+            let entry = lock.read();
             if entry.is_expired() {
                 drop(entry);
                 self.map.remove(&key, &guard);
@@ -431,8 +499,9 @@ impl Db {
         if !present {
             self.try_promote(&key);
         }
-        let lock = self.map.get_or_insert_with(key, || Mutex::new(Entry::new(default(), None, None)), &guard);
-        let mut entry = lock.lock();
+        let lock =
+            self.map.get_or_insert_with(key, || RwLock::new(Entry::new(default(), None, None)), &guard);
+        let mut entry = lock.write();
         entry.touch();
         f(&mut entry.value)
     }
@@ -444,7 +513,7 @@ impl Db {
         let Some(handler) = &self.tiering else { return false };
         let guard = self.map.guard();
         let Some(lock) = self.map.get(key, &guard) else { return false };
-        let entry = lock.lock();
+        let entry = lock.read();
         if entry.is_expired() {
             drop(entry);
             self.map.remove(key, &guard);
@@ -462,7 +531,7 @@ impl Db {
     pub fn remove_if_empty(&self, key: &[u8]) {
         let guard = self.map.guard();
         let empty =
-            self.map.get(key, &guard).map(|lock| lock.lock().value.is_empty_container()).unwrap_or(false);
+            self.map.get(key, &guard).map(|lock| lock.read().value.is_empty_container()).unwrap_or(false);
         if empty {
             self.map.remove(key, &guard);
         }
@@ -484,7 +553,7 @@ impl Db {
     pub fn access_stats(&self, key: &[u8]) -> Option<(Instant, u64)> {
         let guard = self.map.guard();
         self.map.get(key, &guard).map(|lock| {
-            let entry = lock.lock();
+            let entry = lock.read();
             (entry.last_access, entry.access_count)
         })
     }
@@ -507,7 +576,7 @@ impl Db {
             .map
             .iter(&guard)
             .take(sample_size)
-            .filter(|(_, lock)| lock.lock().is_expired())
+            .filter(|(_, lock)| lock.read().is_expired())
             .map(|(k, _)| k.clone())
             .collect();
         let removed = expired.len();
@@ -522,7 +591,7 @@ impl Db {
     /// a background tick, not on every write.
     pub fn approx_bytes(&self) -> usize {
         let guard = self.map.guard();
-        self.map.iter(&guard).map(|(k, lock)| k.len() + 48 + lock.lock().value.approx_bytes()).sum()
+        self.map.iter(&guard).map(|(k, lock)| k.len() + 48 + lock.read().value.approx_bytes()).sum()
     }
 
     /// Every live (non-expired) entry plus its remaining TTL, for `SAVE`/
@@ -534,7 +603,7 @@ impl Db {
         self.map
             .iter(&guard)
             .filter_map(|(k, lock)| {
-                let entry = lock.lock();
+                let entry = lock.read();
                 if entry.is_expired() {
                     return None;
                 }
@@ -550,7 +619,7 @@ impl Db {
     pub fn load_entry(&self, key: Bytes, value: Value, ttl: Option<Duration>) {
         let expires_at = ttl.map(saturating_deadline);
         let guard = self.map.guard();
-        self.map.insert(key, Mutex::new(Entry::new(value, expires_at, None)), &guard);
+        self.map.insert(key, RwLock::new(Entry::new(value, expires_at, None)), &guard);
     }
 }
 
@@ -616,6 +685,44 @@ mod tests {
         assert_eq!(db.get(b"missing"), None);
     }
 
+    /// Regression test for the `Mutex` -> `RwLock` change: many threads
+    /// doing `with_value`/`get` reads against the *same* key concurrently
+    /// must all see the correct value and must not deadlock or panic (e.g.
+    /// from a reentrant `read()` call while a `write()` guard from
+    /// `touch_entry` is still held somewhere on the same thread).
+    #[test]
+    fn concurrent_reads_of_the_same_key_see_the_correct_value_and_dont_deadlock() {
+        let db = Arc::new(Db::new());
+        db.set(Bytes::from("hot"), Value::List(List::from(vec![Bytes::from("a"), Bytes::from("b")])), None);
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..500 {
+                        let len = db.with_value(b"hot", |v| match v {
+                            Value::List(l) => l.len(),
+                            _ => unreachable!(),
+                        });
+                        assert_eq!(len, Some(2));
+                        assert_eq!(
+                            db.get(b"hot"),
+                            Some(Value::List(List::from(vec![Bytes::from("a"), Bytes::from("b"),])))
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Uncontended afterward, so the best-effort LRU bookkeeping in
+        // `touch_entry` should have landed at least once.
+        let (_, access_count) = db.access_stats(b"hot").unwrap();
+        assert!(access_count > 0);
+    }
+
     #[test]
     fn expired_key_is_evicted_on_read() {
         let db = Db::new();
@@ -649,7 +756,7 @@ mod tests {
         {
             let guard = db.map.guard();
             if let Some(lock) = db.map.get(b"k".as_slice(), &guard) {
-                lock.lock().expires_at = Some(Instant::now() + Duration::from_millis(10));
+                lock.write().expires_at = Some(Instant::now() + Duration::from_millis(10));
             }
         }
         assert!(matches!(db.ttl(b"k"), Ttl::Expires(d) if d.as_millis() <= 10));
@@ -667,7 +774,7 @@ mod tests {
         {
             let guard = db.map.guard();
             if let Some(lock) = db.map.get(b"k".as_slice(), &guard) {
-                lock.lock().expires_at = Some(Instant::now() + Duration::from_millis(10));
+                lock.write().expires_at = Some(Instant::now() + Duration::from_millis(10));
             }
         }
         db.get(b"k");
@@ -796,6 +903,29 @@ mod tests {
 
         assert_eq!(db.del(&[Bytes::from("k")]), 1);
         assert!(!tier.store.contains_key(b"k".as_slice()));
+        assert_eq!(db.exists(&[Bytes::from("k")]), 0);
+    }
+
+    /// Regression test: `set()` on a key that's currently tiered-only must
+    /// drop the stale tier copy instead of leaving it to coexist with the
+    /// fresh RAM value — otherwise a later `DEL` (which skips the tier once
+    /// it found the key in RAM) leaves the old value on disk to resurrect
+    /// on the next `GET`.
+    #[test]
+    fn set_on_a_tiered_key_drops_the_stale_tier_copy() {
+        let tier = Arc::new(MockTier::default());
+        let db = Db::with_tiering(tier.clone());
+        db.set(Bytes::from("k"), Value::String(Bytes::from("old")), None);
+        db.evict_to_tier(b"k");
+        assert!(tier.store.contains_key(b"k".as_slice()));
+
+        db.set(Bytes::from("k"), Value::String(Bytes::from("new")), None);
+        assert!(!tier.store.contains_key(b"k".as_slice()));
+
+        // DEL only needs to clear RAM now — no ghost left in the tier to
+        // resurrect afterward.
+        assert_eq!(db.del(&[Bytes::from("k")]), 1);
+        assert_eq!(db.get(b"k"), None);
         assert_eq!(db.exists(&[Bytes::from("k")]), 0);
     }
 

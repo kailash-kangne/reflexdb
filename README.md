@@ -13,6 +13,10 @@ the box.
 
 Everything is original Rust code.
 
+## Demo
+
+[▶ Watch the demo recording](docs/assets/demo.mov)
+
 ## Quick start
 
 Build and run the server (requires the Rust toolchain — [rustup.rs](https://rustup.rs)):
@@ -80,6 +84,7 @@ positioning is unvalidated — see [docs/ROADMAP.md](docs/ROADMAP.md).
 | `reflexdb-proxy` | A pass-through relay (`--listen`/`--upstream`) that sits in front of an *existing* RESP-compatible server — pure byte splice, no RESP parsing, zero data migration required to try. Doesn't add any feature on its own yet — it's the foundation a future `LIVE`/single-flight-at-the-proxy layer would sit on top of. |
 | `reflexdb-sentinel` | Automatic failover watcher for a monitored primary/replica group. |
 | `reflexdb-cli` | Interactive CLI client. |
+| `reflexdb-bench-ui` | Local web UI for running `redis-benchmark` against a running server with live RPS/latency/RAM/disk charts. |
 
 ## Documentation Index
 

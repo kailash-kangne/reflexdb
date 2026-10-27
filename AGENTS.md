@@ -62,6 +62,10 @@ shipped vs. planned. Facts not covered there, or worth re-stating for quick refe
   `git commit -F <file>` — inline heredocs with quotes/apostrophes break the shell here.
 - `Db::get(key)` deep-clones the stored `Value` — O(1) for `String`, O(n) for collections. Use
   `Db::with_value`/`with_value_mut` instead when you only need existence/type checking.
+- Keyspace entries are `parking_lot::RwLock<Entry>` (reads of the same key run concurrently,
+  writes are exclusive). LRU/LFU/sliding-TTL touch-ups go through `Db::touch_entry`, called after
+  the read lock is dropped.
+- `keyspace::Value::Stream` is `Box<Stream>`.
 - `RESTORE`/RDB deserialization must use
   `bincode::DefaultOptions::new().with_fixint_encoding().with_limit(payload.len())` —
   `with_fixint_encoding()` is mandatory alongside `with_limit()` or it silently misreads
@@ -76,7 +80,8 @@ shipped vs. planned. Facts not covered there, or worth re-stating for quick refe
   `HKEYS`/`HVALS`/`HGETALL`/`SMEMBERS` in tests; sort first.
 - `ZSet` keeps a `BTreeSet<(score, member)>` index alongside its `HashMap` so `ZPOPMIN`/
   `ZPOPMAX` are O(log n) and range scans are O(n) — see `docs/ARCHITECTURE.md` and
-  `docs/BENCHMARKS.md` for the numbers behind this. `SPOP` stays O(n)-per-call on purpose
-  (no equivalent win for uniformly-random sampling from an unordered set).
+  `docs/BENCHMARKS.md` for the numbers behind this.
+- `keyspace::Set` is `indexmap::IndexSet<Bytes>`, not `HashSet` — `SPOP` picks a random index
+  and `swap_remove_index`s it, O(1) per pop.
 - `docs/BENCHMARKS.md` is one measurement pass on one dev machine — re-measure before quoting
   numbers externally.

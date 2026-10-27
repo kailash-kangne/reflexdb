@@ -21,12 +21,16 @@ Multithreaded: `tokio` multi-thread runtime, one spawned task per TCP connection
 (`crates/server/src/main.rs`).
 
 **Keyspace** (`keyspace::Db`, `crates/keyspace/src/lib.rs`): `papaya::HashMap<Bytes,
-Mutex<Entry>>`. `papaya` instead of `DashMap` for the hot-path keyspace — it's lock-free with no
+RwLock<Entry>>`. `papaya` instead of `DashMap` for the hot-path keyspace — it's lock-free with no
 shard-wide locks, so two unrelated keys never contend just because they land in the same
 internal shard (measured 3-5x higher throughput than `DashMap` on a mostly-unique-key
 workload). `DashMap` is still used for lower-contention registries: pub/sub channel maps,
 LIVE/WATCH subscriptions, ACL users. Each keyspace entry is wrapped in its own
-`parking_lot::Mutex<Entry>` so contention only happens when the *same key* is hit concurrently.
+`parking_lot::RwLock<Entry>` (not a `Mutex`) so concurrent reads (`GET`/`LRANGE`/`HGETALL`/type
+checks/...) of the *same* key run in parallel instead of serializing; writes still take the
+exclusive lock, and LRU/LFU/sliding-TTL bookkeeping is kept off the read path (best-effort,
+skipped if contended, except sliding TTL which always takes the write lock to avoid expiring an
+actively-read key early).
 
 ```rust
 struct Entry {
@@ -39,8 +43,11 @@ struct Entry {
 ```
 
 `Value` is a tagged enum of owned collections (`VecDeque<Bytes>`, `HashMap<Bytes,Bytes>`,
-`HashSet<Bytes>`, `ZSet`) — always the "full" representation, no small-collection compact
-encodings. `Db::get` deep-clones the value (O(1) for `String` via `Bytes`' refcount, O(n) for
+`IndexSet<Bytes>`, `ZSet`) — always the "full" representation, no small-collection compact
+encodings. `Stream` (by far the largest variant — consumer groups, PELs, ...) is boxed
+(`Box<Stream>`) so its size doesn't get paid by every `String`/`List`/`Hash`/`Set`/`ZSet` stored;
+serde treats `Box<T>` like `T` on the wire, so this doesn't touch the RDB/tiered-storage format.
+`Db::get` deep-clones the value (O(1) for `String` via `Bytes`' refcount, O(n) for
 collections); anything that only needs existence/type checking uses
 `Db::with_value`/`with_value_mut` instead to avoid an unnecessary clone.
 
@@ -114,6 +121,11 @@ becomes one syscall instead of N (with `TCP_NODELAY`). Protocol limits in
 lengths before any allocation happens, so a bare `*99999999999\r\n` can't make the decoder try
 to allocate gigabytes.
 
+`Value::encode` (`crates/resp/src/value.rs`) writes every integer/length with a hand-rolled,
+allocation-free digit writer (`put_i64`/`put_u64`) instead of `n.to_string()` — this runs on
+every single reply. RESP2 downgrades of `Map`/`Set`/`Push` write items directly instead of
+cloning into a throwaway `Value::Array` first.
+
 `RESTORE`/RDB deserialization uses
 `bincode::DefaultOptions::new().with_fixint_encoding().with_limit(payload.len())` — size-bounded
 against untrusted payloads; `with_fixint_encoding()` is mandatory because every other
@@ -127,7 +139,8 @@ misreads length-prefixed fields instead of erroring.
 | `tokio` | async runtime, one task per connection |
 | `papaya` | lock-free keyspace map — no shard-wide lock |
 | `dashmap` | lower-contention registries (pub/sub, LIVE, WATCH, ACL) |
-| `parking_lot::Mutex` | per-entry keyspace lock |
+| `parking_lot::RwLock` | per-entry keyspace lock (shared for reads, exclusive for writes) |
+| `indexmap` | `Set` backing store — insertion-ordered, `swap_remove_index` gives O(1) `SPOP` |
 | `bytes::Bytes` | zero-copy-clone keys/values (refcounted) |
 | `fjall` | pure-Rust LSM store (tiered storage + `GETAT`/`HISTORY`) — no C/C++ toolchain needed |
 | `bincode` + `serde` | RDB snapshot and tiered-entry wire format |

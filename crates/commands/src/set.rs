@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use keyspace::{Set, Value as KVal};
 use rand::seq::SliceRandom;
+use rand::Rng;
 use resp::Value;
 
 use crate::dispatch::{err, reply, wrong_args, wrong_type, ClientState, Outcome, ServerContext};
@@ -44,7 +45,10 @@ pub fn cmd_srem(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     let members = &args[1..];
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let removed = db.with_value_mut(key, |v| match v {
-        KVal::Set(s) => Ok(members.iter().filter(|m| s.remove(m.as_ref())).count()),
+        // `swap_remove` instead of plain `remove`: set member order is
+        // never observable (matches Redis), and it's O(1) vs. the
+        // order-preserving `shift_remove`'s O(n).
+        KVal::Set(s) => Ok(members.iter().filter(|m| s.swap_remove(m.as_ref())).count()),
         _ => Err(()),
     });
     let removed = match removed {
@@ -135,7 +139,7 @@ pub fn cmd_sintercard(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) 
     let mut sets: Vec<HashSet<Bytes>> = Vec::with_capacity(keys.len());
     for key in keys {
         match db.with_value(key, |v| match v {
-            KVal::Set(s) => Ok(s.clone()),
+            KVal::Set(s) => Ok(s.iter().cloned().collect::<HashSet<Bytes>>()),
             _ => Err(()),
         }) {
             None => return reply(Value::Integer(0)),
@@ -160,6 +164,11 @@ pub fn cmd_sintercard(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) 
 /// member(s). With no `count`, replies with a single bulk string (or
 /// `NullBulk`); with `count`, always replies with a set (possibly empty),
 /// matching Redis.
+///
+/// Picks each member by random index and `swap_remove_index`s it — O(1) per
+/// pop (backed by `IndexSet`, not a plain `HashSet`) instead of cloning
+/// every member into a `Vec` just to throw most of it away, which used to
+/// make `SPOP` on a large set O(n) per call regardless of `count`.
 pub fn cmd_spop(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let (key, count) = match args {
         [key] => (key, None),
@@ -175,12 +184,14 @@ pub fn cmd_spop(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let popped = db.with_value_mut(key, |v| match v {
         KVal::Set(s) => {
-            let members: Vec<Bytes> = s.iter().cloned().collect();
-            let n = count.unwrap_or(1).min(members.len());
+            let n = count.unwrap_or(1).min(s.len());
             let mut rng = rand::thread_rng();
-            let chosen: Vec<Bytes> = members.choose_multiple(&mut rng, n).cloned().collect();
-            for m in &chosen {
-                s.remove(m.as_ref());
+            let mut chosen = Vec::with_capacity(n);
+            for _ in 0..n {
+                let idx = rng.gen_range(0..s.len());
+                if let Some(member) = s.swap_remove_index(idx) {
+                    chosen.push(member);
+                }
             }
             Ok(chosen)
         }
@@ -281,7 +292,7 @@ fn set_algebra(
     let mut sets: Vec<HashSet<Bytes>> = Vec::with_capacity(args.len());
     for key in args {
         match db.with_value(key, |v| match v {
-            KVal::Set(s) => Ok(s.clone()),
+            KVal::Set(s) => Ok(s.iter().cloned().collect::<HashSet<Bytes>>()),
             _ => Err(()),
         }) {
             None => sets.push(HashSet::new()),

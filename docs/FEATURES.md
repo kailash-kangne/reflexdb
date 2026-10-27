@@ -12,7 +12,7 @@ See [ROADMAP.md](ROADMAP.md) for what's designed but not built yet, and
 | String (incl. Bitmap) | `int`/`raw` representation; `INCR` is O(1) |
 | List | `VecDeque<Bytes>` |
 | Hash | `HashMap<Bytes, Bytes>` |
-| Set | `HashSet<Bytes>` |
+| Set | `IndexSet<Bytes>` — insertion-ordered, enables O(1) `SPOP` via `swap_remove_index` |
 | Sorted Set (ZSET) | `HashMap<Bytes, f64>` + a `BTreeSet<(score, member)>` index — O(log n) `ZPOPMIN`/`ZPOPMAX`, O(n) range scans |
 | Stream | `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/`XGROUP`/`XREADGROUP`/`XACK`/`XPENDING`/`XREAD`. Not implemented: `XCLAIM`/`XAUTOCLAIM`, `XINFO`, `BLOCK`ing reads, `MINID` trimming, exclusive range bounds |
 
@@ -159,3 +159,4 @@ MVCC snapshot reads (`SNAPSHOT BEGIN`/`END`) and dependency-tracked invalidation
 | `reflexdb-cli` | Interactive client. |
 | `reflexdb-sentinel` | Failover watcher for a monitored primary/replica group. |
 | `reflexdb-proxy` | Dumb `--listen`/`--upstream` byte-splice pass-through in front of an existing RESP-compatible server — no RESP parsing, no feature on its own, foundation for a future proxy-side `LIVE`/single-flight layer. |
+| `reflexdb-bench-ui` | Local web UI (`BENCH_UI_BIND`, default `127.0.0.1:8080`) that drives `redis-benchmark` against a running server and charts RPS/latency/RAM/disk live, one card per command. |

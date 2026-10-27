@@ -30,3 +30,4 @@ thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 rand = "0.8"
+indexmap = { version = "2", features = ["serde"] }

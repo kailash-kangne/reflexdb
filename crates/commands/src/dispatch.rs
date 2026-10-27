@@ -1377,7 +1377,7 @@ fn cmd_set(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome 
         Err(ParseError::Syntax) => return err("ERR syntax error"),
     };
 
-    let exists = db.get(&key).is_some();
+    let exists = db.exists(std::slice::from_ref(&key)) != 0;
     if opts.nx && exists {
         return reply(Value::NullBulk);
     }

@@ -52,9 +52,9 @@ Re-measure before treating these percentages as fixed — they've drifted betwee
 
 129x faster than the original. `ZSet` now keeps `by_score: BTreeSet<(score, member)>` alongside
 the `HashMap`, kept in sync on every insert/remove; `sorted()` (backing `ZRANGE`/etc.) is `O(n)`
-instead of `O(n log n)` as a side effect. `SPOP` has the same O(n)-per-call shape but wasn't
-changed — picking a uniformly random element from an unordered `HashSet` doesn't benefit from
-an ordered index the way popping an extreme does.
+instead of `O(n log n)` as a side effect. `SPOP` got its own separate fix: `Set` is backed by
+`indexmap::IndexSet` (not `HashSet`), so picking a random index and `swap_remove_index`ing it is
+O(1) per pop, instead of cloning every member into a `Vec` just to throw most of it away.
 
 ## vs. another RESP-compatible engine (single-threaded, Valkey-based) — same machine
 

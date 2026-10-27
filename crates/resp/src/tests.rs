@@ -123,3 +123,44 @@ fn encodes_boolean_downgrades_on_resp2() {
     Value::Boolean(true).encode(&mut out, Protocol::Resp3);
     assert_eq!(&out[..], b"#t\r\n");
 }
+
+/// `encode`'s integer/length writer is a hand-rolled, allocation-free
+/// digit writer (replacing `n.to_string()`) — exercise the edge cases
+/// that kind of code tends to get wrong: zero, a negative value, and
+/// `i64::MIN` (whose magnitude doesn't fit in an `i64`, only a `u64`).
+#[test]
+fn encodes_integer_edge_cases_without_the_to_string_helper() {
+    let mut out = BytesMut::new();
+    Value::Integer(0).encode(&mut out, Protocol::Resp2);
+    assert_eq!(&out[..], b":0\r\n");
+
+    out.clear();
+    Value::Integer(-42).encode(&mut out, Protocol::Resp2);
+    assert_eq!(&out[..], b":-42\r\n");
+
+    out.clear();
+    Value::Integer(i64::MIN).encode(&mut out, Protocol::Resp2);
+    assert_eq!(&out[..], format!(":{}\r\n", i64::MIN).as_bytes());
+
+    out.clear();
+    Value::Integer(i64::MAX).encode(&mut out, Protocol::Resp2);
+    assert_eq!(&out[..], format!(":{}\r\n", i64::MAX).as_bytes());
+}
+
+/// `Map`/`Set`/`Push` downgrade to a plain RESP2 array by writing items
+/// directly instead of cloning into a throwaway `Value::Array` — check the
+/// wire output still matches what that clone-based path used to produce.
+#[test]
+fn map_set_push_downgrade_to_the_same_resp2_array_shape() {
+    let mut out = BytesMut::new();
+    Value::Map(vec![(Value::bulk(&b"a"[..]), Value::Integer(1))]).encode(&mut out, Protocol::Resp2);
+    assert_eq!(&out[..], b"*2\r\n$1\r\na\r\n:1\r\n");
+
+    out.clear();
+    Value::Set(vec![Value::Integer(1), Value::Integer(2)]).encode(&mut out, Protocol::Resp2);
+    assert_eq!(&out[..], b"*2\r\n:1\r\n:2\r\n");
+
+    out.clear();
+    Value::Push(vec![Value::bulk(&b"msg"[..])]).encode(&mut out, Protocol::Resp2);
+    assert_eq!(&out[..], b"*1\r\n$3\r\nmsg\r\n");
+}
