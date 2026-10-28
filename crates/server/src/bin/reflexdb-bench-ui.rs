@@ -1166,7 +1166,7 @@ async fn get_memory_kb() -> std::io::Result<(u64, u64)> {
             }
         }
     }
-    Err(std::io::Error::new(std::io::ErrorKind::Other, "could not parse free output"))
+    Err(std::io::Error::other("could not parse free output"))
 }
 
 #[cfg(target_os = "macos")]
@@ -1213,7 +1213,7 @@ async fn get_memory_kb() -> std::io::Result<(u64, u64)> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 async fn get_memory_kb() -> std::io::Result<(u64, u64)> {
-    Err(std::io::Error::new(std::io::ErrorKind::Other, "memory stats not supported on this OS"))
+    Err(std::io::Error::other("memory stats not supported on this OS"))
 }
 
 /// Finds a RESP bulk-string reply (`$<len>\r\n<data>\r\n`) at the start of
