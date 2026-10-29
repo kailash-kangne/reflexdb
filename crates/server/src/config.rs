@@ -1,6 +1,5 @@
-//! Minimal config: accepts a `redis.conf`-style file as the first
-//! positional argument, plus the same directives as `--flags`, which take
-//! precedence over the file (mirrors `redis-server`'s own precedence).
+//! Minimal line-based config file, plus the same directives as `--flags`,
+//! which take precedence over file values.
 
 use std::fs;
 use std::path::PathBuf;
@@ -16,7 +15,7 @@ pub struct Config {
     pub requirepass: Option<String>,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
-    /// Directory RDB/AOF files are written to (`dir` in redis.conf terms).
+    /// Directory RDB/AOF files are written to.
     pub dir: PathBuf,
     /// RDB snapshot filename within `dir`.
     pub dbfilename: String,
@@ -41,7 +40,7 @@ pub struct Config {
     pub replicaof: Option<(String, u16)>,
     /// `tls-port`: 0 disables TLS. When set, a second listener accepts TLS
     /// connections on this port alongside the plain-text one on `port`
-    /// (real Redis lets you run TLS-only by also disabling `port`, but we
+    /// (TLS-only operation by also disabling `port` is not supported here; we
     /// always keep the plain listener for simplicity).
     pub tls_port: u16,
     pub tls_cert_file: Option<PathBuf>,
@@ -50,8 +49,7 @@ pub struct Config {
     /// `NotifyFlags` once, in `main.rs`, when building `ServerContext`).
     pub notify_keyspace_events: String,
     /// `history-enabled yes/no` — turns on `GETAT`/`HISTORY` (see
-    /// `persistence::history`'s docs). Off by default, same as real Redis
-    /// has no equivalent at all.
+    /// `persistence::history`'s docs). Off by default to avoid extra disk I/O.
     pub history_enabled: bool,
     /// `history-dir`: where the disk-backed history store's files land,
     /// relative to `dir` if not absolute.

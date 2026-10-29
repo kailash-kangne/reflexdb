@@ -174,6 +174,83 @@ pub fn cmd_llen(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     }
 }
 
+pub fn cmd_lpos(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    if args.len() < 2 {
+        return wrong_args("lpos");
+    }
+    let key = &args[0];
+    let needle = &args[1];
+    let mut rank = 1i64;
+    let mut count = None;
+    let mut maxlen = None;
+    let mut i = 2;
+    while i < args.len() {
+        if args[i].eq_ignore_ascii_case(b"RANK") && i + 1 < args.len() {
+            rank = match parse_i64(&args[i + 1]) {
+                Some(n) if n != 0 => n,
+                _ => return err(
+                    "ERR RANK can't be zero: use 1 to start from the beginning or -1 to start from the end",
+                ),
+            };
+            i += 2;
+        } else if args[i].eq_ignore_ascii_case(b"COUNT") && i + 1 < args.len() {
+            let n = match parse_i64(&args[i + 1]) {
+                Some(n) if n >= 0 => n as usize,
+                _ => return err("ERR COUNT can't be negative"),
+            };
+            count = Some(n);
+            i += 2;
+        } else if args[i].eq_ignore_ascii_case(b"MAXLEN") && i + 1 < args.len() {
+            maxlen = match parse_i64(&args[i + 1]) {
+                Some(n) if n >= 0 => Some(n as usize),
+                _ => return err("ERR MAXLEN can't be negative"),
+            };
+            i += 2;
+        } else {
+            return err("ERR syntax error");
+        }
+    }
+
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    let indices = match db.with_value(key, |v| match v {
+        KVal::List(list) => {
+            let len = list.len();
+            let reverse = rank < 0;
+            let scan_limit = maxlen.unwrap_or(len).min(len);
+            let wanted_rank = usize::try_from(rank.unsigned_abs()).unwrap_or(usize::MAX);
+            let mut result = Vec::new();
+            let mut matches_seen = 0usize;
+            for offset in 0..scan_limit {
+                let index = if reverse { len - 1 - offset } else { offset };
+                if list[index] == *needle {
+                    matches_seen += 1;
+                    if matches_seen >= wanted_rank {
+                        result.push(index);
+                    }
+                    if count.is_none() && matches_seen >= wanted_rank {
+                        break;
+                    }
+                    if count.is_some_and(|n| n > 0 && result.len() >= n) {
+                        break;
+                    }
+                }
+            }
+            Ok(result)
+        }
+        _ => Err(()),
+    }) {
+        None => Vec::new(),
+        Some(Ok(indices)) => indices,
+        Some(Err(())) => return wrong_type(),
+    };
+
+    if count.is_some() {
+        reply(Value::Array(indices.into_iter().map(|n| Value::Integer(n as i64)).collect()))
+    } else {
+        reply(indices.first().map_or(Value::NullBulk, |n| Value::Integer(*n as i64)))
+    }
+}
+
 pub fn cmd_lrange(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let [key, start, stop] = args else { return wrong_args("lrange") };
     let (start, stop) = match (parse_i64(start), parse_i64(stop)) {
@@ -477,6 +554,114 @@ fn lmove(
 
 pub fn cmd_blpop(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Outcome {
     bpop(ctx, state, args, "blpop", true)
+}
+
+pub fn cmd_lmpop(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes], blocking: bool) -> Outcome {
+    let (timeout, offset) = if blocking {
+        if args.len() < 4 {
+            return wrong_args("blmpop");
+        }
+        (Some(&args[0]), 1)
+    } else {
+        (None, 0)
+    };
+    if args.len() < offset + 3 {
+        return wrong_args(if blocking { "blmpop" } else { "lmpop" });
+    }
+    let numkeys = match std::str::from_utf8(&args[offset]).ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) if n > 0 && args.len() >= offset + n + 2 => n,
+        _ => return err("ERR numkeys should be greater than 0"),
+    };
+    let keys = &args[offset + 1..offset + 1 + numkeys];
+    let dir_index = offset + 1 + numkeys;
+    let from_left = if args[dir_index].eq_ignore_ascii_case(b"LEFT") {
+        true
+    } else if args[dir_index].eq_ignore_ascii_case(b"RIGHT") {
+        false
+    } else {
+        return err("ERR syntax error");
+    };
+    let mut count = 1usize;
+    let cursor = dir_index + 1;
+    if cursor < args.len() {
+        if cursor + 2 != args.len() || !args[cursor].eq_ignore_ascii_case(b"COUNT") {
+            return err("ERR syntax error");
+        }
+        count = match std::str::from_utf8(&args[cursor + 1]).ok().and_then(|s| s.parse::<usize>().ok()) {
+            Some(n) if n > 0 => n,
+            _ => return err("ERR count should be greater than 0"),
+        };
+    }
+    let deadline = if let Some(timeout) = timeout {
+        match blocking_deadline(state, timeout) {
+            Ok(d) => Some(d),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
+    // Not in `WRITE_COMMANDS` (see `check_write_allowed`'s module docs): the
+    // raw LMPOP/BLMPOP request is never logged/replicated, only the
+    // resolved LPOP/RPOP effect below, so the replica-read-only/`maxmemory`
+    // guard has to be applied by hand here instead.
+    if let Some(e) = check_write_allowed(ctx, state) {
+        if blocking {
+            clear_blocking_deadline(state);
+        }
+        return e;
+    }
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    for key in keys {
+        let popped = db.with_value_mut(key, |v| match v {
+            KVal::List(list) => {
+                let n = count.min(list.len());
+                let mut out = Vec::with_capacity(n);
+                for _ in 0..n {
+                    out.push(
+                        if from_left { list.pop_front() } else { list.pop_back() }
+                            .expect("count bounded by len"),
+                    );
+                }
+                Ok(out)
+            }
+            _ => Err(()),
+        });
+        match popped {
+            None => continue,
+            Some(Ok(values)) if values.is_empty() => continue,
+            Some(Err(())) => {
+                if blocking {
+                    clear_blocking_deadline(state);
+                }
+                return wrong_type();
+            }
+            Some(Ok(values)) => {
+                db.remove_if_empty(key);
+                on_key_changed(ctx, state.db_index, key.clone());
+                let event = if from_left { "lpop" } else { "rpop" };
+                notify_keyspace_event(ctx, state.db_index, 'l', event, key);
+                let mut effect =
+                    vec![Bytes::from_static(if from_left { b"LPOP" } else { b"RPOP" }), key.clone()];
+                if values.len() > 1 {
+                    effect.push(Bytes::from(values.len().to_string()));
+                }
+                ctx.append_aof(state.db_index, &effect);
+                ctx.replicate(state.db_index, &effect);
+                if blocking {
+                    clear_blocking_deadline(state);
+                }
+                return reply(Value::Array(vec![
+                    Value::bulk(key.clone()),
+                    Value::Array(values.into_iter().map(Value::bulk).collect()),
+                ]));
+            }
+        }
+    }
+    if blocking {
+        Outcome::BlockWait { deadline: deadline.flatten(), on_timeout: Value::NullArray }
+    } else {
+        reply(Value::NullArray)
+    }
 }
 
 pub fn cmd_brpop(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Outcome {

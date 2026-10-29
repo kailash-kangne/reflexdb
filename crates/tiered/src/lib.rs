@@ -113,7 +113,7 @@ impl TieringHandler for FjallTier {
             _ => return false,
         };
         match decode_entry(payload.as_ref()) {
-            Ok(entry) if entry.expires_at_ms.map_or(true, |expiry| expiry > now_ms()) => true,
+            Ok(entry) if entry.expires_at_ms.is_none_or(|expiry| expiry > now_ms()) => true,
             _ => {
                 let _ = self.keyspace.remove(key);
                 false

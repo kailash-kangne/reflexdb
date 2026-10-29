@@ -15,7 +15,7 @@
 //! single-key commands (`KEY_COMMANDS` below), not every command that
 //! happens to take a key as an argument.
 //!
-//! This is a real subset of Redis/Valkey ACL, not "full ACL" — see
+//! This is a subset of the ACL command surface, not "full ACL" — see
 //! `docs/07-security.md` for the honest scope.
 
 use std::collections::HashSet;
@@ -242,7 +242,7 @@ pub fn command_keys<'a>(name: &str, args: &'a [Bytes]) -> Vec<&'a [u8]> {
         "MEMORY" if args.first().is_some_and(|b| b.eq_ignore_ascii_case(b"USAGE")) => {
             args.get(1).map(|b| vec![b.as_ref()]).unwrap_or_default()
         }
-        "BITOP" => all(args),
+        "BITOP" => args.iter().skip(1).map(Bytes::as_ref).collect(),
         "BLPOP" | "BRPOP" | "BZPOPMAX" | "BZPOPMIN" => {
             args.iter().take(args.len().saturating_sub(1)).map(Bytes::as_ref).collect()
         }

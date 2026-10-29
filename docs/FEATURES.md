@@ -1,7 +1,7 @@
 # Features — what reflexdb has today
 
-Wire-compatible with the Redis command set (RESP2/RESP3, `redis-cli`/any Redis SDK works
-unmodified). Two features of its own: **`LIVE` query subscriptions** and **tiered storage**.
+Implements a subset of the Redis command protocol over RESP2/RESP3. Client compatibility depends
+on the commands used. Two features of its own: **`LIVE` query subscriptions** and **tiered storage**.
 See [ROADMAP.md](ROADMAP.md) for what's designed but not built yet, and
 [COMMANDS.md](COMMANDS.md) for the full command list.
 
@@ -65,7 +65,7 @@ underlying key changes.
 - **AOF**: per-command log, replayed at startup. `appendfsync always/everysec/no`. Writes are
   fire-and-forget to a dedicated writer thread that batches everything queued into one
   `write`/`fsync` ("group commit") — a crash can lose the last few acked commands under
-  `everysec`, same trade-off most Redis-likes make. `WAITAOF` is the one call that genuinely
+  `everysec`; `WAITAOF` is the call that explicitly
   blocks for a real fsync. `BGREWRITEAOF` compacts to one command per live key (manual trigger
   only — no automatic rewrite-on-growth yet).
 
@@ -159,4 +159,4 @@ MVCC snapshot reads (`SNAPSHOT BEGIN`/`END`) and dependency-tracked invalidation
 | `reflexdb-cli` | Interactive client. |
 | `reflexdb-sentinel` | Failover watcher for a monitored primary/replica group. |
 | `reflexdb-proxy` | Dumb `--listen`/`--upstream` byte-splice pass-through in front of an existing RESP-compatible server — no RESP parsing, no feature on its own, foundation for a future proxy-side `LIVE`/single-flight layer. |
-| `reflexdb-bench-ui` | Local web UI (`BENCH_UI_BIND`, default `127.0.0.1:8080`) that drives `redis-benchmark` against a running server and charts RPS/latency/RAM/disk live, one card per command — plus standalone tabs to watch `LIVE`/`UNLIVE` pushes (multi-key, optional auto-randomized values) and to demo tiered storage eviction/promotion against a real server. |
+| `reflexdb-bench-ui` | Local web UI (`BENCH_UI_BIND`, default `127.0.0.1:8080`) that drives `redis-benchmark` against a running server and charts RPS/latency/RAM/disk live, one card per command — plus standalone tabs to watch `LIVE`/`UNLIVE` pushes (multi-key, optional auto-randomized values) and to demo tiered storage eviction/promotion. |

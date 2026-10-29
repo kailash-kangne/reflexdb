@@ -5,7 +5,7 @@
 //! Scope, deliberately: server-side TLS only. No mutual TLS (client
 //! certificate verification, `tls-auth-clients`), no `tls-ca-cert-file`,
 //! no `tls-replication` (wrapping the replication link in TLS). Both are
-//! real Redis features not implemented here.
+//! optional TLS transport features not implemented here.
 
 use std::fs::File;
 use std::io::{self, BufReader};

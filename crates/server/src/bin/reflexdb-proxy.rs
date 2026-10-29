@@ -7,7 +7,7 @@
 //! simplest and the fastest thing that can do it correctly for every
 //! command, including ones this project hasn't implemented yet.
 //!
-//! Adoption cost for whoever puts this in front of their existing Redis is
+//! Adoption cost for whoever puts this in front of an existing RESP server is
 //! "change a port number," not "migrate your data" — nothing here touches
 //! the upstream's protocol or data at all. Follow-up work (handling `LIVE`
 //! locally, coalescing concurrent cache-miss reads, etc.) means actually

@@ -36,14 +36,14 @@ pub fn cmd_info(ctx: &ServerContext, _args: &[Bytes]) -> Outcome {
     let used = ctx.store.approx_bytes();
     out.push_str(&format!("used_memory:{used}\r\n"));
     out.push_str(&format!("used_memory_human:{}\r\n", human_bytes(used as u64)));
-    match ctx.maxmemory {
+    match ctx.effective_maxmemory() {
         Some(limit) => {
             out.push_str(&format!("maxmemory:{limit}\r\n"));
             out.push_str(&format!("maxmemory_human:{}\r\n", human_bytes(limit)));
         }
         None => out.push_str("maxmemory:0\r\n"),
     }
-    let policy = match ctx.maxmemory_policy {
+    let policy = match ctx.effective_maxmemory_policy() {
         MaxMemoryPolicy::NoEviction => "noeviction",
         MaxMemoryPolicy::AllKeysRandom => "allkeys-random",
         MaxMemoryPolicy::VolatileRandom => "volatile-random",
