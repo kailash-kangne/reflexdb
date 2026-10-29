@@ -117,6 +117,9 @@ pub struct ServerContext {
     pub(crate) patterns: DashMap<Bytes, HashSet<u64>>,
     /// fingerprint -> subscription (one per distinct `LIVE <cmd> <args>`).
     pub(crate) live_subs: DashMap<u64, LiveSub>,
+    /// Serializes LIVE's initial read plus registration against post-write
+    /// notifications, so a mutation cannot slip into the subscription gap.
+    pub(crate) live_sync: std::sync::Mutex<()>,
     /// (db, key) -> fingerprints of LIVE subscriptions that depend on that key.
     pub(crate) key_watchers: DashMap<(usize, Bytes), HashSet<u64>>,
     /// Mirrors `key_watchers.len()`, but as a single atomic instead of a
@@ -265,6 +268,7 @@ impl ServerContext {
             channels: DashMap::new(),
             patterns: DashMap::new(),
             live_subs: DashMap::new(),
+            live_sync: std::sync::Mutex::new(()),
             key_watchers: DashMap::new(),
             key_watchers_len: AtomicUsize::new(0),
             watchers: DashMap::new(),
@@ -496,7 +500,7 @@ impl ServerContext {
         let mut rng = rand::thread_rng();
         for db_index in 0..self.store.len() {
             let db = self.store.db(db_index).expect("index within store.len()");
-            let keys = db.keys_snapshot();
+            let keys = db.ram_keys_snapshot();
             if let Some(victim) = keys.choose(&mut rng) {
                 if db.evict_to_tier(victim) {
                     return true;
@@ -512,7 +516,7 @@ impl ServerContext {
         let mut rng = rand::thread_rng();
         for db_index in 0..self.store.len() {
             let db = self.store.db(db_index).expect("index within store.len()");
-            let keys = db.keys_snapshot();
+            let keys = db.ram_keys_snapshot();
             let candidates: Vec<Bytes> = if self.maxmemory_policy == MaxMemoryPolicy::NoEviction {
                 return false;
             } else if self.maxmemory_policy.volatile_only() {
@@ -983,27 +987,11 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         && !state.is_replication_link
         && !matches!(name.as_str(), "AUTH" | "HELLO" | "QUIT" | "RESET")
     {
-        if let Some(user) = ctx.acl_users.get(&state.acl_user) {
-            if !user.enabled {
-                return err("NOAUTH Authentication required.");
-            }
-            if !user.can_run(&name) {
-                return err(format!(
-                    "NOPERM User {} has no permissions to run the '{}' command",
-                    state.acl_user,
-                    name.to_ascii_lowercase()
-                ));
-            }
-            if crate::acl::is_key_command(&name) {
-                if let Some(key) = args.first() {
-                    if !user.can_access_key(key) {
-                        return err(format!(
-                            "NOPERM No permissions to access a key for user {}",
-                            state.acl_user
-                        ));
-                    }
-                }
-            }
+        let Some(user) = ctx.acl_users.get(&state.acl_user) else {
+            return err("NOAUTH Authentication required.");
+        };
+        if let Err(message) = crate::acl::authorize(user.value(), &name, args) {
+            return err(message);
         }
     }
 
@@ -3498,8 +3486,9 @@ mod tests {
     }
 
     impl keyspace::TieringHandler for MockTier {
-        fn evict(&self, key: &Bytes, value: &keyspace::Value, ttl: Option<Duration>) {
+        fn evict(&self, key: &Bytes, value: &keyspace::Value, ttl: Option<Duration>) -> Result<(), String> {
             self.disk.insert(key.clone(), (value.clone(), ttl));
+            Ok(())
         }
         fn promote(&self, key: &[u8]) -> Option<(keyspace::Value, Option<Duration>)> {
             self.disk.remove(key).map(|(_, v)| v)
@@ -3509,6 +3498,9 @@ mod tests {
         }
         fn remove(&self, key: &[u8]) {
             self.disk.remove(key);
+        }
+        fn keys_snapshot(&self) -> Vec<Bytes> {
+            self.disk.iter().map(|entry| entry.key().clone()).collect()
         }
     }
 
@@ -3526,7 +3518,7 @@ mod tests {
         let moved = ctx.run_eviction_tick();
         assert!(moved > 0, "expected at least one key to be tiered to disk");
         assert!(!tier.disk.is_empty());
-        let ram_count = ctx.store.db(0).unwrap().dbsize();
+        let ram_count = ctx.store.db(0).unwrap().ram_keys_snapshot().len();
         assert!(ram_count < 20);
 
         // EXISTS must stay truthful for a tiered key without reading it off
@@ -3538,6 +3530,6 @@ mod tests {
             run(&ctx, &mut st, &["GET", &tiered_key_str]),
             Value::bulk(&b"some reasonably sized value here"[..])
         );
-        assert_eq!(ctx.store.db(0).unwrap().dbsize(), ram_count + 1);
+        assert_eq!(ctx.store.db(0).unwrap().ram_keys_snapshot().len(), ram_count + 1);
     }
 }

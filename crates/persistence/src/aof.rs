@@ -472,7 +472,17 @@ pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
     loop {
         match decoder.decode(&mut buf) {
             Ok(Some(req)) => requests.push(req),
-            Ok(None) => break,
+            Ok(None) if buf.is_empty() => break,
+            // A crash can leave the last RESP frame only partially written.
+            // Keep the complete prefix and truncate the torn tail before the
+            // writer reopens this file in append mode; otherwise future
+            // commands would be appended inside the incomplete frame.
+            Ok(None) => {
+                let complete_len = data.len() - buf.len();
+                drop(buf);
+                OpenOptions::new().write(true).open(path)?.set_len(complete_len as u64)?;
+                break;
+            }
             Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
         }
     }

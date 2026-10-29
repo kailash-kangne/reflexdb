@@ -406,6 +406,7 @@ dependencies = [
  "papaya",
  "parking_lot",
  "serde",
+ "tracing",
 ]
 
 [[package]]
