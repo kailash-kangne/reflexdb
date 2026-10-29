@@ -387,6 +387,23 @@ impl Db {
             .count()
     }
 
+    /// Update access metadata for a live key without cloning its value or
+    /// promoting a disk-tiered key into RAM. Used by the `TOUCH` command.
+    pub fn touch_key(&self, key: &[u8]) -> bool {
+        let guard = self.map.guard();
+        let Some(lock) = self.map.get(key, &guard) else {
+            return self.tiering.as_ref().is_some_and(|handler| handler.contains(key));
+        };
+        let mut entry = lock.write();
+        if entry.is_expired() {
+            drop(entry);
+            self.remove_if_same(key, lock, &guard);
+            return false;
+        }
+        entry.touch();
+        true
+    }
+
     pub fn ttl(&self, key: &[u8]) -> Ttl {
         let guard = self.map.guard();
         match self.map.get(key, &guard) {
@@ -559,6 +576,45 @@ impl Db {
         None
     }
 
+    /// Mutable access to an existing value and its expiry under one lock.
+    /// Returns `None` for a missing or expired key; unlike `with_entry_mut_expiry`,
+    /// this never creates a value.
+    pub fn with_existing_entry_mut_expiry<R>(
+        &self,
+        key: &[u8],
+        f: impl FnOnce(&mut Value, &mut Option<Instant>) -> R,
+    ) -> Option<R> {
+        let _tier_guard = self.tier_ops.lock();
+        let guard = self.map.guard();
+        if let Some(lock) = self.map.get(key, &guard) {
+            let mut entry = lock.write();
+            if entry.is_expired() {
+                drop(entry);
+                self.remove_if_same(key, lock, &guard);
+                return None;
+            }
+            entry.touch();
+            let Entry { value, expires_at, .. } = &mut *entry;
+            return Some(f(value, expires_at));
+        }
+        drop(guard);
+        if self.try_promote_locked(key) {
+            let guard = self.map.guard();
+            if let Some(lock) = self.map.get(key, &guard) {
+                let mut entry = lock.write();
+                if entry.is_expired() {
+                    drop(entry);
+                    self.remove_if_same(key, lock, &guard);
+                    return None;
+                }
+                entry.touch();
+                let Entry { value, expires_at, .. } = &mut *entry;
+                return Some(f(value, expires_at));
+            }
+        }
+        None
+    }
+
     /// Mutable access to a key's value, inserting `default()` (with no TTL)
     /// if the key is missing (after trying to promote it from the tier
     /// first) or has expired. Used by collection commands like
@@ -568,6 +624,17 @@ impl Db {
         key: Bytes,
         default: impl FnOnce() -> Value,
         f: impl FnOnce(&mut Value) -> R,
+    ) -> R {
+        self.with_entry_mut_expiry(key, default, |value, _, _| f(value))
+    }
+
+    /// Mutable access to a value and its absolute expiry under the same
+    /// entry lock. Use this for commands that must change both atomically.
+    pub fn with_entry_mut_expiry<R>(
+        &self,
+        key: Bytes,
+        default: impl FnOnce() -> Value,
+        f: impl FnOnce(&mut Value, &mut Option<Instant>, bool) -> R,
     ) -> R {
         let _tier_guard = self.tier_ops.lock();
         let guard = self.map.guard();
@@ -587,13 +654,14 @@ impl Db {
             }
         }
         if !present {
-            self.try_promote_locked(&key);
+            present = self.try_promote_locked(&key);
         }
         let lock =
             self.map.get_or_insert_with(key, || RwLock::new(Entry::new(default(), None, None)), &guard);
         let mut entry = lock.write();
         entry.touch();
-        f(&mut entry.value)
+        let Entry { value, expires_at, .. } = &mut *entry;
+        f(value, expires_at, present)
     }
 
     /// Move a key out of RAM and into the disk tier (if configured).

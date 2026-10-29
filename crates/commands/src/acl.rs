@@ -242,7 +242,7 @@ pub fn command_keys<'a>(name: &str, args: &'a [Bytes]) -> Vec<&'a [u8]> {
         "MEMORY" if args.first().is_some_and(|b| b.eq_ignore_ascii_case(b"USAGE")) => {
             args.get(1).map(|b| vec![b.as_ref()]).unwrap_or_default()
         }
-        "BITOP" => all(args),
+        "BITOP" => args.iter().skip(1).map(Bytes::as_ref).collect(),
         "BLPOP" | "BRPOP" | "BZPOPMAX" | "BZPOPMIN" => {
             args.iter().take(args.len().saturating_sub(1)).map(Bytes::as_ref).collect()
         }

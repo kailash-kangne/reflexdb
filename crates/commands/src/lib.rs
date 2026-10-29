@@ -7,6 +7,7 @@
 mod acl;
 mod client;
 mod dispatch;
+mod extended;
 mod hash;
 mod history;
 mod info;

@@ -90,6 +90,23 @@ pub fn cmd_sismember(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -
     }
 }
 
+pub fn cmd_smismember(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    if args.len() < 2 {
+        return wrong_args("smismember");
+    }
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    match db.with_value(&args[0], |v| match v {
+        KVal::Set(set) => {
+            Ok(args[1..].iter().map(|member| Value::Integer(set.contains(member.as_ref()) as i64)).collect())
+        }
+        _ => Err(()),
+    }) {
+        None => reply(Value::Array(args[1..].iter().map(|_| Value::Integer(0)).collect())),
+        Some(Ok(values)) => reply(Value::Array(values)),
+        Some(Err(())) => wrong_type(),
+    }
+}
+
 pub fn cmd_scard(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let [key] = args else { return wrong_args("scard") };
     let db = ctx.store.db(state.db_index).expect("valid db index");
@@ -258,7 +275,7 @@ pub fn cmd_srandmember(ctx: &ServerContext, state: &ClientState, args: &[Bytes])
     }
 }
 
-enum SetAlgebra {
+pub(crate) enum SetAlgebra {
     Union,
     Inter,
     Diff,
@@ -274,6 +291,53 @@ pub fn cmd_sinter(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
 
 pub fn cmd_sdiff(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     set_algebra(ctx, state, args, "sdiff", SetAlgebra::Diff)
+}
+
+pub fn cmd_store(ctx: &ServerContext, state: &ClientState, args: &[Bytes], op: SetAlgebra) -> Outcome {
+    if args.len() < 2 {
+        return wrong_args(match op {
+            SetAlgebra::Union => "sunionstore",
+            SetAlgebra::Inter => "sinterstore",
+            SetAlgebra::Diff => "sdiffstore",
+        });
+    }
+    let destination = args[0].clone();
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    let mut sets: Vec<HashSet<Bytes>> = Vec::with_capacity(args.len() - 1);
+    for key in &args[1..] {
+        match db.with_value(key, |v| match v {
+            KVal::Set(s) => Ok(s.iter().cloned().collect()),
+            _ => Err(()),
+        }) {
+            None => sets.push(HashSet::new()),
+            Some(Ok(s)) => sets.push(s),
+            Some(Err(())) => return wrong_type(),
+        }
+    }
+    let mut sets = sets.into_iter();
+    let first = sets.next().unwrap_or_default();
+    let result: HashSet<Bytes> = match op {
+        SetAlgebra::Union => sets.fold(first, |mut acc, s| {
+            acc.extend(s);
+            acc
+        }),
+        SetAlgebra::Inter => sets.fold(first, |acc, s| acc.intersection(&s).cloned().collect()),
+        SetAlgebra::Diff => sets.fold(first, |acc, s| acc.difference(&s).cloned().collect()),
+    };
+    if result.is_empty() {
+        db.del(std::slice::from_ref(&destination));
+    } else {
+        db.set(destination.clone(), KVal::Set(result.into_iter().collect()), None);
+    }
+    on_key_changed(ctx, state.db_index, destination.clone());
+    notify_keyspace_event(ctx, state.db_index, 's', "store", &destination);
+    reply(Value::Integer(
+        db.with_value(&destination, |v| match v {
+            KVal::Set(s) => s.len(),
+            _ => 0,
+        })
+        .unwrap_or(0) as i64,
+    ))
 }
 
 /// Shared `SUNION`/`SINTER`/`SDIFF` implementation — a missing key is

@@ -1,5 +1,7 @@
 use bytes::Bytes;
 use keyspace::{Hash, Value as KVal};
+use rand::seq::SliceRandom;
+use rand::Rng;
 use resp::Value;
 
 use crate::dispatch::{err, reply, wrong_args, wrong_type, ClientState, Outcome, ServerContext};
@@ -38,6 +40,157 @@ pub fn cmd_hset(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
             reply(Value::Integer(added as i64))
         }
         Err(()) => wrong_type(),
+    }
+}
+
+pub fn cmd_hsetnx(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    let [key, field, value] = args else { return wrong_args("hsetnx") };
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    let result = db.with_entry_mut(
+        key.clone(),
+        || KVal::Hash(Hash::new()),
+        |v| match v {
+            KVal::Hash(h) => {
+                if h.contains_key(field.as_ref()) {
+                    Ok(false)
+                } else {
+                    h.insert(field.clone(), value.clone());
+                    Ok(true)
+                }
+            }
+            _ => Err(()),
+        },
+    );
+    match result {
+        Ok(true) => {
+            on_key_changed(ctx, state.db_index, key.clone());
+            notify_keyspace_event(ctx, state.db_index, 'h', "hset", key);
+            reply(Value::Integer(1))
+        }
+        Ok(false) => reply(Value::Integer(0)),
+        Err(()) => wrong_type(),
+    }
+}
+
+enum HIncrFloatError {
+    NotAFloat,
+    WrongType,
+}
+
+pub fn cmd_hincrbyfloat(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    let [key, field, increment] = args else { return wrong_args("hincrbyfloat") };
+    let delta: f64 = match std::str::from_utf8(increment).ok().and_then(|s| s.parse::<f64>().ok()) {
+        Some(n) if n.is_finite() => n,
+        _ => return err("ERR value is not a valid float"),
+    };
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    let result = db.with_entry_mut(
+        key.clone(),
+        || KVal::Hash(Hash::new()),
+        |v| match v {
+            KVal::Hash(h) => {
+                let current = match h.get(field.as_ref()) {
+                    Some(value) => {
+                        match std::str::from_utf8(value).ok().and_then(|s| s.parse::<f64>().ok()) {
+                            Some(n) if n.is_finite() => n,
+                            _ => return Err(HIncrFloatError::NotAFloat),
+                        }
+                    }
+                    None => 0.0,
+                };
+                let next = current + delta;
+                if !next.is_finite() {
+                    return Err(HIncrFloatError::NotAFloat);
+                }
+                let formatted = crate::string::format_float(next);
+                h.insert(field.clone(), Bytes::from(formatted.clone()));
+                Ok(formatted)
+            }
+            _ => Err(HIncrFloatError::WrongType),
+        },
+    );
+    match result {
+        Ok(formatted) => {
+            on_key_changed(ctx, state.db_index, key.clone());
+            notify_keyspace_event(ctx, state.db_index, 'h', "hincrbyfloat", key);
+            reply(Value::bulk(formatted))
+        }
+        Err(HIncrFloatError::NotAFloat) => err("ERR hash value is not a valid float"),
+        Err(HIncrFloatError::WrongType) => wrong_type(),
+    }
+}
+
+pub fn cmd_hstrlen(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    let [key, field] = args else { return wrong_args("hstrlen") };
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    match db.with_value(key, |v| match v {
+        KVal::Hash(h) => Ok(h.get(field.as_ref()).map_or(0, Bytes::len)),
+        _ => Err(()),
+    }) {
+        None => reply(Value::Integer(0)),
+        Some(Ok(len)) => reply(Value::Integer(len as i64)),
+        Some(Err(())) => wrong_type(),
+    }
+}
+
+pub fn cmd_hrandfield(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    if args.is_empty() || args.len() > 3 {
+        return wrong_args("hrandfield");
+    }
+    let count = if args.len() >= 2 {
+        match std::str::from_utf8(&args[1]).ok().and_then(|s| s.parse::<i64>().ok()) {
+            Some(n) => Some(n),
+            None => return err("ERR value is not an integer or out of range"),
+        }
+    } else {
+        None
+    };
+    let with_values = match args.get(2) {
+        Some(option) if count.is_some() && option.eq_ignore_ascii_case(b"WITHVALUES") => true,
+        Some(_) => return err("ERR syntax error"),
+        None => false,
+    };
+    let max_count = 1_000_000i64;
+    if count.is_some_and(|n| n.unsigned_abs() > max_count as u64) {
+        return err("ERR count is out of range");
+    }
+
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    let fields = match db.with_value(&args[0], |v| match v {
+        KVal::Hash(hash) => {
+            Ok(hash.iter().map(|(field, value)| (field.clone(), value.clone())).collect::<Vec<_>>())
+        }
+        _ => Err(()),
+    }) {
+        None => Vec::new(),
+        Some(Ok(fields)) => fields,
+        Some(Err(())) => return wrong_type(),
+    };
+
+    if let Some(count) = count {
+        let requested = count.unsigned_abs() as usize;
+        let selected = if count < 0 {
+            let mut rng = rand::thread_rng();
+            (0..requested)
+                .filter_map(|_| fields.get(rng.gen_range(0..fields.len().max(1))).cloned())
+                .collect::<Vec<_>>()
+        } else {
+            let mut sample = fields;
+            sample.shuffle(&mut rand::thread_rng());
+            sample.truncate(requested);
+            sample
+        };
+        let mut values = Vec::with_capacity(selected.len() * if with_values { 2 } else { 1 });
+        for (field, value) in selected {
+            values.push(Value::bulk(field));
+            if with_values {
+                values.push(Value::bulk(value));
+            }
+        }
+        reply(Value::Array(values))
+    } else {
+        let mut rng = rand::thread_rng();
+        reply(fields.choose(&mut rng).map_or(Value::NullBulk, |(field, _)| Value::bulk(field.clone())))
     }
 }
 

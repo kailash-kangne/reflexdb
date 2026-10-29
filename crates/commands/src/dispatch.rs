@@ -16,8 +16,8 @@ use crate::schedule::Scheduler;
 use crate::set_opts::{self, ParseError};
 use crate::singleflight::SingleFlightLease;
 use crate::{
-    client, hash, history, info, keys, list, live, pubsub, replication, schedule, script, set, singleflight,
-    snapshot, stream, string, txn, zset,
+    client, extended, hash, history, info, keys, list, live, pubsub, replication, schedule, script, set,
+    singleflight, snapshot, stream, string, txn, zset,
 };
 
 /// `maxmemory-policy` — which keys are candidates for eviction once
@@ -171,6 +171,9 @@ pub struct ServerContext {
     pub(crate) aof_path: Option<PathBuf>,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
+    /// Runtime overrides exposed by CONFIG. The startup configuration remains
+    /// immutable; only explicitly supported live settings are stored here.
+    pub(crate) config_overrides: DashMap<String, String>,
     /// Updated periodically (not on every write) by a background tick —
     /// see `ServerContext::run_eviction_tick`.
     approx_memory: AtomicUsize,
@@ -284,6 +287,7 @@ impl ServerContext {
             aof_path: None,
             maxmemory: None,
             maxmemory_policy: MaxMemoryPolicy::NoEviction,
+            config_overrides: DashMap::new(),
             approx_memory: AtomicUsize::new(0),
             tiered_limit: None,
             scheduler: Scheduler::default(),
@@ -443,10 +447,25 @@ impl ServerContext {
     }
 
     pub fn maxmemory_exceeded(&self) -> bool {
-        match self.maxmemory {
+        match self.effective_maxmemory() {
             Some(limit) => self.approx_memory.load(Ordering::Relaxed) as u64 > limit,
             None => false,
         }
+    }
+
+    pub(crate) fn effective_maxmemory(&self) -> Option<u64> {
+        self.config_overrides
+            .get("maxmemory")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|n| (n != 0).then_some(n))
+            .unwrap_or(self.maxmemory)
+    }
+
+    pub(crate) fn effective_maxmemory_policy(&self) -> MaxMemoryPolicy {
+        self.config_overrides
+            .get("maxmemory-policy")
+            .and_then(|v| MaxMemoryPolicy::parse(&v))
+            .unwrap_or(self.maxmemory_policy)
     }
 
     /// Refresh the memory estimate and run both eviction mechanisms,
@@ -472,13 +491,13 @@ impl ServerContext {
             }
         }
 
-        if let Some(limit) = self.maxmemory {
+        if let Some(limit) = self.effective_maxmemory() {
             for _ in 0..64 {
                 let used = self.refresh_memory_usage();
                 if used as u64 <= limit {
                     break;
                 }
-                if self.maxmemory_policy == MaxMemoryPolicy::NoEviction || !self.delete_one() {
+                if self.effective_maxmemory_policy() == MaxMemoryPolicy::NoEviction || !self.delete_one() {
                     break;
                 }
                 evicted += 1;
@@ -513,13 +532,14 @@ impl ServerContext {
     /// Delete one key chosen per `maxmemory_policy`. Returns `false` if
     /// there's no eligible key left (or the policy is `NoEviction`).
     fn delete_one(&self) -> bool {
+        let policy = self.effective_maxmemory_policy();
         let mut rng = rand::thread_rng();
         for db_index in 0..self.store.len() {
             let db = self.store.db(db_index).expect("index within store.len()");
             let keys = db.ram_keys_snapshot();
-            let candidates: Vec<Bytes> = if self.maxmemory_policy == MaxMemoryPolicy::NoEviction {
+            let candidates: Vec<Bytes> = if policy == MaxMemoryPolicy::NoEviction {
                 return false;
-            } else if self.maxmemory_policy.volatile_only() {
+            } else if policy.volatile_only() {
                 keys.into_iter().filter(|k| matches!(db.ttl(k), Ttl::Expires(_))).collect()
             } else {
                 keys
@@ -527,7 +547,7 @@ impl ServerContext {
             if candidates.is_empty() {
                 continue;
             }
-            let victim = match self.maxmemory_policy {
+            let victim = match policy {
                 MaxMemoryPolicy::AllKeysRandom | MaxMemoryPolicy::VolatileRandom => {
                     candidates.choose(&mut rng).cloned()
                 }
@@ -902,16 +922,18 @@ pub(crate) fn notify_keyspace_event(
     }
 }
 
-/// `BLPOP`/`BRPOP`/`BLMOVE`/`BZPOPMIN`/`BZPOPMAX` aren't in `WRITE_COMMANDS`
-/// (see their module docs for why — the raw blocking command is never
-/// itself logged to the AOF or replicated), so they need to run the same
-/// replica-read-only / `maxmemory` guards `dispatch()` applies to ordinary
+/// `BLPOP`/`BRPOP`/`BLMOVE`/`BZPOPMIN`/`BZPOPMAX`/`LMPOP`/`BLMPOP`/`ZMPOP`/
+/// `BZMPOP` aren't in `WRITE_COMMANDS` (see their module docs for why — the
+/// raw command is never itself logged to the AOF or replicated, only its
+/// resolved `LPOP`/`RPOP`/`ZPOPMIN`/`ZPOPMAX` effect is), so they need to
+/// run the same replica-read-only / `maxmemory` guards `dispatch()` applies
+/// to ordinary
 /// write commands by hand, before touching the keyspace.
 pub(crate) fn check_write_allowed(ctx: &ServerContext, state: &ClientState) -> Option<Outcome> {
     if ctx.is_replica() && !state.is_replication_link {
         return Some(err("READONLY You can't write against a read only replica."));
     }
-    if ctx.maxmemory_exceeded() && ctx.maxmemory_policy == MaxMemoryPolicy::NoEviction {
+    if ctx.maxmemory_exceeded() && ctx.effective_maxmemory_policy() == MaxMemoryPolicy::NoEviction {
         return Some(err("OOM command not allowed when used memory > 'maxmemory'."));
     }
     None
@@ -1032,11 +1054,13 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         return reply(Value::Simple("QUEUED".into()));
     }
 
-    let is_write = WRITE_COMMANDS.contains(name.as_str());
+    let is_write = WRITE_COMMANDS.contains(name.as_str())
+        || (name == "SORT" && args.iter().any(|arg| arg.eq_ignore_ascii_case(b"STORE")));
     if is_write && ctx.is_replica() && !state.is_replication_link {
         return err("READONLY You can't write against a read only replica.");
     }
-    if is_write && ctx.maxmemory_exceeded() && ctx.maxmemory_policy == MaxMemoryPolicy::NoEviction {
+    if is_write && ctx.maxmemory_exceeded() && ctx.effective_maxmemory_policy() == MaxMemoryPolicy::NoEviction
+    {
         return err("OOM command not allowed when used memory > 'maxmemory'.");
     }
     // Snapshot the request for the AOF before it's consumed by the match
@@ -1069,6 +1093,8 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
             reply(Value::Simple("RESET".into()))
         }
         "SELECT" => cmd_select(ctx, state, args),
+        "TIME" => extended::cmd_time(args),
+        "CONFIG" => extended::cmd_config(ctx, args),
         "DBSIZE" => match ctx.store.db(state.db_index) {
             Some(db) => reply(Value::Integer(db.dbsize() as i64)),
             None => err("ERR DB index is out of range"),
@@ -1103,6 +1129,8 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "EVALSHA_RO" => script::cmd_evalsha_ro(ctx, state, args),
         "SCRIPT" => script::cmd_script(ctx, args),
         "SET" => cmd_set(ctx, state, args),
+        "SETEX" => string::cmd_setex(ctx, state, args, false),
+        "PSETEX" => string::cmd_setex(ctx, state, args, true),
         "GET" => singleflight::cmd_get(ctx, state, args),
         "APPEND" => string::cmd_append(ctx, state, args),
         "INCR" => string::cmd_incr(ctx, state, args),
@@ -1111,6 +1139,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "DECRBY" => string::cmd_decrby(ctx, state, args),
         "SETNX" => string::cmd_setnx(ctx, state, args),
         "MSET" => string::cmd_mset(ctx, state, args),
+        "MSETNX" => extended::cmd_msetnx(ctx, state, args),
         "MGET" => string::cmd_mget(ctx, state, args),
         "STRLEN" => string::cmd_strlen(ctx, state, args),
         "GETRANGE" => string::cmd_getrange(ctx, state, args),
@@ -1119,6 +1148,8 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "EXISTS" => cmd_exists(ctx, state, args),
         "TTL" => cmd_ttl(ctx, state, args, false),
         "PTTL" => cmd_ttl(ctx, state, args, true),
+        "EXPIRETIME" => cmd_expiretime(ctx, state, args, false),
+        "PEXPIRETIME" => cmd_expiretime(ctx, state, args, true),
         "EXPIRE" => cmd_expire(ctx, state, args, false),
         "PEXPIRE" => cmd_expire(ctx, state, args, true),
         "EXPIREAT" => cmd_expireat(ctx, state, args, false),
@@ -1127,7 +1158,13 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "RENAME" => cmd_rename(ctx, state, args),
         "RENAMENX" => cmd_renamenx(ctx, state, args),
         "GETDEL" => string::cmd_getdel(ctx, state, args),
+        "GETSET" => string::cmd_getset(ctx, state, args),
+        "GETEX" => string::cmd_getex(ctx, state, args),
         "INCRBYFLOAT" => string::cmd_incrbyfloat(ctx, state, args),
+        "SETRANGE" => string::cmd_setrange(ctx, state, args),
+        "GETBIT" => string::cmd_getbit(ctx, state, args),
+        "SETBIT" => string::cmd_setbit(ctx, state, args),
+        "BITCOUNT" => string::cmd_bitcount(ctx, state, args),
         "GETAT" => history::cmd_getat(ctx, state, args),
         "HISTORY" => history::cmd_history(ctx, state, args),
         "TYPE" => cmd_type(ctx, state, args),
@@ -1140,12 +1177,23 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "SLOWLOG" => info::cmd_slowlog(ctx, args),
         "LATENCY" => info::cmd_latency(ctx, args),
         "MEMORY" => info::cmd_memory(ctx, state, args),
+        "SORT" => extended::cmd_sort(ctx, state, args, false),
+        "SORT_RO" => extended::cmd_sort(ctx, state, args, true),
+        "RANDOMKEY" => extended::cmd_randomkey(ctx, state, args),
+        "TOUCH" => extended::cmd_touch(ctx, state, args),
+        "COPY" => extended::cmd_copy(ctx, state, args),
+        "MOVE" => extended::cmd_move(ctx, state, args),
+        "BITOP" => extended::cmd_bitop(ctx, state, args),
+        "BITPOS" => extended::cmd_bitpos(ctx, state, args),
+        "BITFIELD" => extended::cmd_bitfield(ctx, state, args, false),
+        "BITFIELD_RO" => extended::cmd_bitfield(ctx, state, args, true),
 
         "LPUSH" => list::cmd_lpush(ctx, state, args),
         "RPUSH" => list::cmd_rpush(ctx, state, args),
         "LPOP" => list::cmd_lpop(ctx, state, args),
         "RPOP" => list::cmd_rpop(ctx, state, args),
         "LLEN" => list::cmd_llen(ctx, state, args),
+        "LPOS" => list::cmd_lpos(ctx, state, args),
         "LRANGE" => list::cmd_lrange(ctx, state, args),
         "LTRIM" => list::cmd_ltrim(ctx, state, args),
         "LSET" => list::cmd_lset(ctx, state, args),
@@ -1157,9 +1205,17 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "RPUSHX" => list::cmd_rpushx(ctx, state, args),
         "BLPOP" => list::cmd_blpop(ctx, state, args),
         "BRPOP" => list::cmd_brpop(ctx, state, args),
+        "LMPOP" => list::cmd_lmpop(ctx, state, args, false),
+        "BLMPOP" => list::cmd_lmpop(ctx, state, args, true),
         "BLMOVE" => list::cmd_blmove(ctx, state, args),
 
         "HSET" => hash::cmd_hset(ctx, state, args),
+        "HMSET" => match hash::cmd_hset(ctx, state, args) {
+            Outcome::Reply(Value::Integer(_)) => reply(Value::ok()),
+            other => other,
+        },
+        "HSETNX" => hash::cmd_hsetnx(ctx, state, args),
+        "HRANDFIELD" => hash::cmd_hrandfield(ctx, state, args),
         "HGET" => hash::cmd_hget(ctx, state, args),
         "HDEL" => hash::cmd_hdel(ctx, state, args),
         "HEXISTS" => hash::cmd_hexists(ctx, state, args),
@@ -1167,6 +1223,8 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "HGETALL" => hash::cmd_hgetall(ctx, state, args),
         "HMGET" => hash::cmd_hmget(ctx, state, args),
         "HINCRBY" => hash::cmd_hincrby(ctx, state, args),
+        "HINCRBYFLOAT" => hash::cmd_hincrbyfloat(ctx, state, args),
+        "HSTRLEN" => hash::cmd_hstrlen(ctx, state, args),
         "HKEYS" => hash::cmd_hkeys(ctx, state, args),
         "HVALS" => hash::cmd_hvals(ctx, state, args),
         "HSCAN" => hash::cmd_hscan(ctx, state, args),
@@ -1175,6 +1233,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "SREM" => set::cmd_srem(ctx, state, args),
         "SMEMBERS" => set::cmd_smembers(ctx, state, args),
         "SISMEMBER" => set::cmd_sismember(ctx, state, args),
+        "SMISMEMBER" => set::cmd_smismember(ctx, state, args),
         "SCARD" => set::cmd_scard(ctx, state, args),
         "SINTERCARD" => set::cmd_sintercard(ctx, state, args),
         "SPOP" => set::cmd_spop(ctx, state, args),
@@ -1182,11 +1241,16 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "SUNION" => set::cmd_sunion(ctx, state, args),
         "SINTER" => set::cmd_sinter(ctx, state, args),
         "SDIFF" => set::cmd_sdiff(ctx, state, args),
+        "SUNIONSTORE" => set::cmd_store(ctx, state, args, set::SetAlgebra::Union),
+        "SINTERSTORE" => set::cmd_store(ctx, state, args, set::SetAlgebra::Inter),
+        "SDIFFSTORE" => set::cmd_store(ctx, state, args, set::SetAlgebra::Diff),
         "SSCAN" => set::cmd_sscan(ctx, state, args),
 
         "ZADD" => zset::cmd_zadd(ctx, state, args),
         "ZINCRBY" => zset::cmd_zincrby(ctx, state, args),
         "ZSCORE" => zset::cmd_zscore(ctx, state, args),
+        "ZMSCORE" => zset::cmd_zmscore(ctx, state, args),
+        "ZRANDMEMBER" => zset::cmd_zrandmember(ctx, state, args),
         "ZREM" => zset::cmd_zrem(ctx, state, args),
         "ZCARD" => zset::cmd_zcard(ctx, state, args),
         "ZRANGE" => zset::cmd_zrange(ctx, state, args),
@@ -1201,8 +1265,22 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "ZSCAN" => zset::cmd_zscan(ctx, state, args),
         "ZPOPMIN" => zset::cmd_zpopmin(ctx, state, args),
         "ZPOPMAX" => zset::cmd_zpopmax(ctx, state, args),
+        "ZUNION" => zset::cmd_algebra(ctx, state, args, zset::ZAlgebra::Union, false, false),
+        "ZINTER" => zset::cmd_algebra(ctx, state, args, zset::ZAlgebra::Inter, false, false),
+        "ZDIFF" => zset::cmd_algebra(ctx, state, args, zset::ZAlgebra::Diff, false, false),
+        "ZINTERCARD" => zset::cmd_zintercard(ctx, state, args),
+        "ZUNIONSTORE" => zset::cmd_algebra(ctx, state, args, zset::ZAlgebra::Union, true, false),
+        "ZINTERSTORE" => zset::cmd_algebra(ctx, state, args, zset::ZAlgebra::Inter, true, false),
+        "ZDIFFSTORE" => zset::cmd_algebra(ctx, state, args, zset::ZAlgebra::Diff, true, false),
+        "ZRANGEBYLEX" => zset::cmd_lex(ctx, state, args, false, false),
+        "ZREVRANGEBYLEX" => zset::cmd_lex(ctx, state, args, true, false),
+        "ZREMRANGEBYLEX" => zset::cmd_lex(ctx, state, args, false, true),
+        "ZLEXCOUNT" => zset::cmd_lexcount(ctx, state, args),
+        "ZRANGESTORE" => zset::cmd_zrangestore(ctx, state, args),
         "BZPOPMIN" => zset::cmd_bzpopmin(ctx, state, args),
         "BZPOPMAX" => zset::cmd_bzpopmax(ctx, state, args),
+        "ZMPOP" => zset::cmd_zmpop(ctx, state, args, false),
+        "BZMPOP" => zset::cmd_zmpop(ctx, state, args, true),
 
         "XADD" => stream::cmd_xadd(ctx, state, args),
         "XLEN" => stream::cmd_xlen(ctx, state, args),
@@ -1450,6 +1528,30 @@ fn cmd_ttl(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: boo
     reply(Value::Integer(n))
 }
 
+fn cmd_expiretime(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: bool) -> Outcome {
+    let [key] = args else { return wrong_args(if millis { "pexpiretime" } else { "expiretime" }) };
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    let value = match db.ttl(key) {
+        Ttl::NoKey => -2,
+        Ttl::Persistent => -1,
+        Ttl::Expires(remaining) => {
+            let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                Ok(now) => now,
+                Err(_) => return err("ERR system clock is before the Unix epoch"),
+            };
+            let now_ms = now.as_millis().min(i64::MAX as u128) as i64;
+            let remaining_ms = remaining.as_millis().min(i64::MAX as u128) as i64;
+            let expires_ms = now_ms.saturating_add(remaining_ms);
+            if millis {
+                expires_ms
+            } else {
+                expires_ms.div_euclid(1000)
+            }
+        }
+    };
+    reply(Value::Integer(value))
+}
+
 fn cmd_expire(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: bool) -> Outcome {
     let (key, amount, sliding) = match args {
         [key, amount] => (key, amount, false),
@@ -1675,6 +1777,10 @@ const KNOWN_COMMANDS: &[&str] = &[
     "HELLO",
     "RESET",
     "SELECT",
+    "TIME",
+    "CONFIG",
+    "SORT",
+    "SORT_RO",
     "DBSIZE",
     "FLUSHDB",
     "FLUSHALL",
@@ -1686,16 +1792,33 @@ const KNOWN_COMMANDS: &[&str] = &[
     "DECR",
     "DECRBY",
     "SETNX",
+    "MSETNX",
+    "SETEX",
+    "PSETEX",
+    "SETRANGE",
     "MSET",
     "MGET",
     "STRLEN",
     "GETRANGE",
+    "GETBIT",
+    "SETBIT",
+    "BITCOUNT",
+    "BITOP",
+    "BITPOS",
+    "BITFIELD",
+    "BITFIELD_RO",
     "KEYS",
+    "RANDOMKEY",
+    "TOUCH",
+    "COPY",
+    "MOVE",
     "DEL",
     "UNLINK",
     "EXISTS",
     "TTL",
     "PTTL",
+    "EXPIRETIME",
+    "PEXPIRETIME",
     "EXPIRE",
     "PEXPIRE",
     "EXPIREAT",
@@ -1704,6 +1827,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "RENAME",
     "RENAMENX",
     "GETDEL",
+    "GETSET",
+    "GETEX",
     "INCRBYFLOAT",
     "GETAT",
     "HISTORY",
@@ -1719,6 +1844,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "LPOP",
     "RPOP",
     "LLEN",
+    "LPOS",
     "LRANGE",
     "LTRIM",
     "LSET",
@@ -1728,8 +1854,13 @@ const KNOWN_COMMANDS: &[&str] = &[
     "LMOVE",
     "BLPOP",
     "BRPOP",
+    "LMPOP",
+    "BLMPOP",
     "BLMOVE",
     "HSET",
+    "HMSET",
+    "HSETNX",
+    "HRANDFIELD",
     "HGET",
     "HDEL",
     "HEXISTS",
@@ -1737,6 +1868,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "HGETALL",
     "HMGET",
     "HINCRBY",
+    "HINCRBYFLOAT",
+    "HSTRLEN",
     "HKEYS",
     "HVALS",
     "HSCAN",
@@ -1744,6 +1877,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "SREM",
     "SMEMBERS",
     "SISMEMBER",
+    "SMISMEMBER",
     "SCARD",
     "SINTERCARD",
     "SPOP",
@@ -1751,9 +1885,14 @@ const KNOWN_COMMANDS: &[&str] = &[
     "SUNION",
     "SINTER",
     "SDIFF",
+    "SUNIONSTORE",
+    "SINTERSTORE",
+    "SDIFFSTORE",
     "SSCAN",
     "ZADD",
     "ZSCORE",
+    "ZMSCORE",
+    "ZRANDMEMBER",
     "ZREM",
     "ZCARD",
     "ZRANGE",
@@ -1770,6 +1909,20 @@ const KNOWN_COMMANDS: &[&str] = &[
     "ZPOPMAX",
     "BZPOPMIN",
     "BZPOPMAX",
+    "ZMPOP",
+    "BZMPOP",
+    "ZUNION",
+    "ZINTER",
+    "ZDIFF",
+    "ZINTERCARD",
+    "ZUNIONSTORE",
+    "ZINTERSTORE",
+    "ZDIFFSTORE",
+    "ZRANGEBYLEX",
+    "ZREVRANGEBYLEX",
+    "ZREMRANGEBYLEX",
+    "ZLEXCOUNT",
+    "ZRANGESTORE",
     "XADD",
     "XLEN",
     "XRANGE",
@@ -1833,12 +1986,22 @@ const KNOWN_COMMANDS: &[&str] = &[
 /// `check_write_allowed` rather than through the `is_write` check below.
 const WRITE_COMMAND_NAMES: &[&str] = &[
     "SET",
+    "SETEX",
+    "PSETEX",
+    "SETRANGE",
+    "SETBIT",
     "APPEND",
     "INCR",
     "INCRBY",
     "DECR",
     "DECRBY",
     "SETNX",
+    "MSETNX",
+    "BITOP",
+    "SETBIT",
+    "BITFIELD",
+    "COPY",
+    "MOVE",
     "MSET",
     "DEL",
     "UNLINK",
@@ -1850,6 +2013,8 @@ const WRITE_COMMAND_NAMES: &[&str] = &[
     "RENAME",
     "RENAMENX",
     "GETDEL",
+    "GETSET",
+    "GETEX",
     "INCRBYFLOAT",
     "FLUSHDB",
     "FLUSHALL",
@@ -1866,15 +2031,26 @@ const WRITE_COMMAND_NAMES: &[&str] = &[
     "RPOPLPUSH",
     "LMOVE",
     "HSET",
+    "HMSET",
+    "HSETNX",
     "HDEL",
     "HINCRBY",
+    "HINCRBYFLOAT",
     "SADD",
+    "SUNIONSTORE",
+    "SINTERSTORE",
+    "SDIFFSTORE",
     "SREM",
     "SPOP",
     "ZADD",
     "ZINCRBY",
     "ZREM",
     "ZPOPMIN",
+    "ZUNIONSTORE",
+    "ZINTERSTORE",
+    "ZDIFFSTORE",
+    "ZREMRANGEBYLEX",
+    "ZRANGESTORE",
     "ZPOPMAX",
     "ZREMRANGEBYSCORE",
     "ZREMRANGEBYRANK",
@@ -3531,5 +3707,125 @@ mod tests {
             Value::bulk(&b"some reasonably sized value here"[..])
         );
         assert_eq!(ctx.store.db(0).unwrap().ram_keys_snapshot().len(), ram_count + 1);
+    }
+
+    #[test]
+    fn multi_pop_variants_round_trip_through_aof() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("reflexdb-multipop-{}-{n}.aof", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let writer = persistence::aof::AofWriter::open(&path, persistence::aof::Fsync::Always).unwrap();
+        let ctx = ServerContext::new(16, None).with_aof(writer, path.clone());
+        let (id, _rx) = ctx.register_client();
+        let mut state = ClientState::with_id(id, false);
+
+        run(&ctx, &mut state, &["RPUSH", "list-a", "a1", "a2"]);
+        run(&ctx, &mut state, &["RPUSH", "list-b", "b1", "b2"]);
+        run(&ctx, &mut state, &["ZADD", "zset-a", "1", "a1", "2", "a2"]);
+        run(&ctx, &mut state, &["ZADD", "zset-b", "1", "b1", "2", "b2"]);
+        assert!(matches!(
+            run(&ctx, &mut state, &["LMPOP", "2", "list-a", "list-b", "LEFT", "COUNT", "1"]),
+            Value::Array(_)
+        ));
+        assert!(matches!(
+            run(&ctx, &mut state, &["BLMPOP", "0", "2", "list-a", "list-b", "RIGHT", "COUNT", "1"]),
+            Value::Array(_)
+        ));
+        assert!(matches!(
+            run(&ctx, &mut state, &["ZMPOP", "2", "zset-a", "zset-b", "MIN", "COUNT", "1"]),
+            Value::Array(_)
+        ));
+        assert!(matches!(
+            run(&ctx, &mut state, &["BZMPOP", "0", "2", "zset-a", "zset-b", "MAX", "COUNT", "1"]),
+            Value::Array(_)
+        ));
+        ctx.flush_aof().expect("AOF enabled").unwrap();
+
+        let records = persistence::aof::replay(&path).unwrap();
+        let records: Vec<Vec<String>> = records
+            .iter()
+            .map(|record| {
+                record.iter().map(|part| String::from_utf8_lossy(part).to_ascii_uppercase()).collect()
+            })
+            .collect();
+        for raw in ["LMPOP", "BLMPOP", "ZMPOP", "BZMPOP"] {
+            assert!(
+                !records.iter().any(|record| record.first().is_some_and(|word| word == raw)),
+                "raw {raw} must not be persisted"
+            );
+        }
+        for effect in ["LPOP", "RPOP", "ZPOPMIN", "ZPOPMAX"] {
+            assert_eq!(
+                records.iter().filter(|record| record.first().is_some_and(|word| word == effect)).count(),
+                1,
+                "expected one {effect} effect"
+            );
+        }
+
+        let restored = ServerContext::new(16, None);
+        let (restored_id, _rx) = restored.register_client();
+        let mut restored_state = ClientState::with_id(restored_id, false);
+        for record in persistence::aof::replay(&path).unwrap() {
+            match dispatch(&restored, &mut restored_state, record) {
+                Outcome::Reply(_) | Outcome::CloseConnection(_) => {}
+                _ => panic!("AOF record did not replay as a normal command"),
+            }
+        }
+        for key in ["list-a", "list-b", "zset-a", "zset-b"] {
+            assert_eq!(
+                ctx.store.db(0).unwrap().get(key.as_bytes()),
+                restored.store.db(0).unwrap().get(key.as_bytes()),
+                "AOF replay diverged for {key}"
+            );
+        }
+        drop(ctx);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn added_command_families_have_basic_happy_paths() {
+        let (ctx, mut state) = fresh();
+        assert!(matches!(run(&ctx, &mut state, &["TIME"]), Value::Array(_)));
+        assert!(matches!(run(&ctx, &mut state, &["CONFIG", "GET", "maxmemory"]), Value::Array(_)));
+        assert_eq!(run(&ctx, &mut state, &["CONFIG", "SET", "maxmemory", "0"]), Value::ok());
+        assert_eq!(run(&ctx, &mut state, &["MSETNX", "a", "1", "b", "2"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut state, &["MSETNX", "a", "x", "c", "3"]), Value::Integer(0));
+        assert!(matches!(run(&ctx, &mut state, &["RANDOMKEY"]), Value::Bulk(_)));
+        assert_eq!(run(&ctx, &mut state, &["TOUCH", "a", "missing"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut state, &["COPY", "a", "copy"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut state, &["GET", "copy"]), Value::bulk(&b"1"[..]));
+        assert_eq!(run(&ctx, &mut state, &["BITOP", "NOT", "bits", "copy"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut state, &["BITPOS", "bits", "1"]), Value::Integer(0));
+        assert!(matches!(run(&ctx, &mut state, &["BITFIELD", "bits", "GET", "u8", "0"]), Value::Array(_)));
+
+        run(&ctx, &mut state, &["RPUSH", "sort", "3", "1", "2"]);
+        assert_eq!(
+            run(&ctx, &mut state, &["SORT", "sort"]),
+            Value::Array(vec![Value::bulk(&b"1"[..]), Value::bulk(&b"2"[..]), Value::bulk(&b"3"[..])])
+        );
+        assert!(matches!(run(&ctx, &mut state, &["SORT_RO", "sort", "DESC"]), Value::Array(_)));
+        assert!(matches!(run(&ctx, &mut state, &["SORT", "sort", "STORE", "sorted"]), Value::Integer(3)));
+
+        run(&ctx, &mut state, &["SADD", "s1", "a", "b"]);
+        run(&ctx, &mut state, &["SADD", "s2", "b", "c"]);
+        assert_eq!(run(&ctx, &mut state, &["SDIFFSTORE", "sd", "s1", "s2"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut state, &["SINTERSTORE", "si", "s1", "s2"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut state, &["SUNIONSTORE", "su", "s1", "s2"]), Value::Integer(3));
+
+        run(&ctx, &mut state, &["ZADD", "za", "1", "a", "2", "b"]);
+        run(&ctx, &mut state, &["ZADD", "zb", "2", "b", "3", "c"]);
+        assert_eq!(run(&ctx, &mut state, &["ZINTERCARD", "2", "za", "zb", "LIMIT", "0"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut state, &["ZINTERSTORE", "zi", "2", "za", "zb"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut state, &["ZUNIONSTORE", "zu", "2", "za", "zb"]), Value::Integer(3));
+        assert_eq!(run(&ctx, &mut state, &["ZDIFFSTORE", "zd", "2", "za", "zb"]), Value::Integer(1));
+        assert!(matches!(run(&ctx, &mut state, &["ZUNION", "2", "za", "zb", "WITHSCORES"]), Value::Array(_)));
+        assert!(matches!(run(&ctx, &mut state, &["ZINTER", "2", "za", "zb"]), Value::Array(_)));
+        assert!(matches!(run(&ctx, &mut state, &["ZDIFF", "2", "za", "zb"]), Value::Array(_)));
+        assert!(matches!(run(&ctx, &mut state, &["ZRANGEBYLEX", "za", "[a", "[b"]), Value::Array(_)));
+        assert!(matches!(run(&ctx, &mut state, &["ZREVRANGEBYLEX", "za", "[b", "[a"]), Value::Array(_)));
+        assert_eq!(run(&ctx, &mut state, &["ZLEXCOUNT", "za", "[a", "[b"]), Value::Integer(2));
+        assert_eq!(run(&ctx, &mut state, &["ZRANGESTORE", "zr", "za", "0", "-1"]), Value::Integer(2));
+        assert_eq!(run(&ctx, &mut state, &["ZREMRANGEBYLEX", "za", "[a", "[a"]), Value::Integer(1));
     }
 }
