@@ -125,12 +125,30 @@ async fn read_fullresync_line(reader: &mut (impl AsyncBufReadExt + Unpin)) -> io
 async fn read_bulk_payload(
     reader: &mut (impl AsyncBufReadExt + AsyncReadExt + Unpin),
 ) -> io::Result<Vec<u8>> {
-    let mut header = String::new();
-    reader.read_line(&mut header).await?;
-    let header = header.trim_end();
-    let len: usize = header.strip_prefix('$').and_then(|n| n.parse().ok()).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("expected bulk length, got: {header}"))
-    })?;
+    const MAX_RDB_SIZE: u64 = 512 * 1024 * 1024;
+    const MAX_HEADER_LEN: usize = 64;
+    let mut header = Vec::with_capacity(16);
+    loop {
+        if header.len() >= MAX_HEADER_LEN {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "RDB bulk header too long"));
+        }
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).await?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        header.push(byte[0]);
+    }
+    let header = std::str::from_utf8(&header)
+        .ok()
+        .and_then(|s| s.strip_suffix('\r'))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid RDB bulk header"))?;
+    let len: usize = header
+        .strip_prefix('$')
+        .and_then(|n| n.parse::<u64>().ok())
+        .filter(|n| *n <= MAX_RDB_SIZE)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid or oversized RDB bulk length"))?;
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload).await?;
     Ok(payload)

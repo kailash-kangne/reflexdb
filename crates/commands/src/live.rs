@@ -28,8 +28,6 @@ pub struct LiveSub {
 const READONLY_HANDLERS: &[&str] = &[
     "GET",
     "EXISTS",
-    "TTL",
-    "PTTL",
     "TYPE",
     "LLEN",
     "LRANGE",
@@ -76,6 +74,17 @@ pub fn cmd_live(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) ->
             inner_name.to_ascii_lowercase()
         ));
     }
+    // EXISTS accepts multiple keys, but a LIVE registration currently
+    // indexes one watched key. Reject the multi-key form rather than
+    // silently missing changes to every key after the first.
+    if inner_name == "EXISTS" && args.len() != 2 {
+        return err("ERR LIVE EXISTS currently requires exactly one key");
+    }
+
+    // Keep the initial snapshot and registration atomic with respect to
+    // on_key_changed notifications. A writer that mutates during this
+    // section will issue its notification after this registration exists.
+    let _registration_guard = ctx.live_sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let inner_req: Request = args.to_vec();
     let fp = fingerprint(&inner_req);
@@ -115,6 +124,7 @@ pub fn cmd_unlive(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) 
 /// Called after a successful write to `key` in `db_index`: re-evaluates and
 /// pushes every LIVE subscription watching that key.
 pub fn notify_key_change(ctx: &ServerContext, db_index: usize, key: Bytes) {
+    let _notification_guard = ctx.live_sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Fast path: LIVE is opt-in and `key_watchers` is empty unless some
     // client has actually subscribed — skip hashing `key` and locking a
     // `key_watchers` shard on every single write when nobody ever has.
@@ -131,6 +141,7 @@ pub fn notify_key_change(ctx: &ServerContext, db_index: usize, key: Bytes) {
 /// Called after `FLUSHDB`: re-evaluates every LIVE subscription scoped to
 /// that database (every watched key's result just became empty/nil).
 pub fn notify_flush(ctx: &ServerContext, db_index: usize) {
+    let _notification_guard = ctx.live_sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let fingerprints: Vec<u64> = ctx
         .key_watchers
         .iter()

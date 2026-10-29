@@ -1,13 +1,14 @@
 //! In-memory keyspace: sharded-by-DB storage with TTL semantics.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use indexmap::IndexSet;
 use papaya::HashMap as PapayaMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 mod stream;
@@ -163,7 +164,7 @@ pub enum Ttl {
 /// engine.
 pub trait TieringHandler: Send + Sync {
     /// Persist a key being dropped from RAM.
-    fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>);
+    fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String>;
     /// Fetch (and remove from the tier — promotion is a one-way move back
     /// into RAM, not a cache copy) a previously evicted key.
     fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)>;
@@ -173,6 +174,18 @@ pub trait TieringHandler: Send + Sync {
     fn contains(&self, key: &[u8]) -> bool;
     /// Drop a key from the tier outright (`DEL` on a tiered-only key).
     fn remove(&self, key: &[u8]);
+    /// Snapshot the keys held in the disk tier. Implementations that cannot
+    /// enumerate their keys may retain the empty default, but then database
+    /// enumeration cannot expose tiered keys.
+    fn keys_snapshot(&self) -> Vec<Bytes> {
+        Vec::new()
+    }
+    /// Remove every key held in the tier.
+    fn clear(&self) {
+        for key in self.keys_snapshot() {
+            self.remove(&key);
+        }
+    }
 }
 
 /// A single logical database (what Redis calls `SELECT 0..N`).
@@ -197,17 +210,31 @@ pub trait TieringHandler: Send + Sync {
 pub struct Db {
     map: PapayaMap<Bytes, RwLock<Entry>>,
     tiering: Option<Arc<dyn TieringHandler>>,
+    // Serialize tier moves with key mutations so a delayed promotion or
+    // eviction cannot overwrite/remove a newer value for the same key.
+    tier_ops: Mutex<()>,
+    expire_cursor: std::sync::atomic::AtomicUsize,
 }
 
 impl Db {
     pub fn new() -> Self {
-        Self { map: PapayaMap::new(), tiering: None }
+        Self {
+            map: PapayaMap::new(),
+            tiering: None,
+            tier_ops: Mutex::new(()),
+            expire_cursor: Default::default(),
+        }
     }
 
     /// Like `new`, but keys evicted via `evict_to_tier` land in `handler`
     /// instead of being dropped, and reads transparently promote them back.
     pub fn with_tiering(handler: Arc<dyn TieringHandler>) -> Self {
-        Self { map: PapayaMap::new(), tiering: Some(handler) }
+        Self {
+            map: PapayaMap::new(),
+            tiering: Some(handler),
+            tier_ops: Mutex::new(()),
+            expire_cursor: Default::default(),
+        }
     }
 
     /// Set a key to a value, optionally with an absolute expiry instant.
@@ -223,6 +250,7 @@ impl Db {
     /// clear the RAM copy, leaving the stale tiered value to resurrect on
     /// the next `GET`).
     pub fn set(&self, key: Bytes, value: Value, expires_at: Option<Instant>) {
+        let _tier_guard = self.tier_ops.lock();
         if let Some(handler) = &self.tiering {
             handler.remove(&key);
         }
@@ -234,6 +262,11 @@ impl Db {
     /// found, rehydrate it into RAM. Returns whether a promotion happened.
     /// Sliding TTLs don't currently survive a trip through the disk tier.
     fn try_promote(&self, key: &[u8]) -> bool {
+        let _tier_guard = self.tier_ops.lock();
+        self.try_promote_locked(key)
+    }
+
+    fn try_promote_locked(&self, key: &[u8]) -> bool {
         let Some(handler) = &self.tiering else { return false };
         let Some((value, ttl)) = handler.promote(key) else { return false };
         let expires_at = ttl.map(saturating_deadline);
@@ -244,6 +277,15 @@ impl Db {
             &guard,
         );
         true
+    }
+
+    /// Remove an expired entry only if it is still the same map entry that
+    /// was inspected. A concurrent SET may have replaced it after the
+    /// reader dropped its lock.
+    fn remove_if_same(&self, key: &[u8], inspected: &RwLock<Entry>, guard: &impl papaya::Guard) {
+        if self.map.get(key, guard).is_some_and(|current| std::ptr::eq(current, inspected)) {
+            self.map.remove(key, guard);
+        }
     }
 
     /// Bumps LRU/LFU bookkeeping and, for a sliding-TTL key, resets the
@@ -278,7 +320,7 @@ impl Db {
             let entry = lock.read();
             if entry.is_expired() {
                 drop(entry);
-                self.map.remove(key, &guard);
+                self.remove_if_same(key, lock, &guard);
                 return None;
             }
             let value = entry.value.clone();
@@ -290,12 +332,21 @@ impl Db {
         drop(guard);
         if self.try_promote(key) {
             let guard = self.map.guard();
-            return self.map.get(key, &guard).map(|lock| lock.read().value.clone());
+            if let Some(lock) = self.map.get(key, &guard) {
+                let entry = lock.read();
+                if entry.is_expired() {
+                    drop(entry);
+                    self.remove_if_same(key, lock, &guard);
+                    return None;
+                }
+                return Some(entry.value.clone());
+            }
         }
         None
     }
 
     pub fn del(&self, keys: &[Bytes]) -> usize {
+        let _tier_guard = self.tier_ops.lock();
         let guard = self.map.guard();
         let mut removed = 0;
         for key in keys {
@@ -339,12 +390,19 @@ impl Db {
     pub fn ttl(&self, key: &[u8]) -> Ttl {
         let guard = self.map.guard();
         match self.map.get(key, &guard) {
-            None => Ttl::NoKey,
+            None => {
+                drop(guard);
+                if self.try_promote(key) {
+                    self.ttl(key)
+                } else {
+                    Ttl::NoKey
+                }
+            }
             Some(lock) => {
                 let entry = lock.read();
                 if entry.is_expired() {
                     drop(entry);
-                    self.map.remove(key, &guard);
+                    self.remove_if_same(key, lock, &guard);
                     Ttl::NoKey
                 } else {
                     match entry.expires_at {
@@ -372,7 +430,10 @@ impl Db {
                     true
                 }
             }
-            None => false,
+            None => {
+                drop(guard);
+                self.try_promote(key) && self.expire(key, expires_at)
+            }
         }
     }
 
@@ -393,7 +454,10 @@ impl Db {
                     true
                 }
             }
-            None => false,
+            None => {
+                drop(guard);
+                self.try_promote(key) && self.expire_sliding(key, duration)
+            }
         }
     }
 
@@ -411,7 +475,14 @@ impl Db {
                     Some(entry.expires_at)
                 }
             }
-            None => None,
+            None => {
+                drop(guard);
+                if self.try_promote(key) {
+                    self.current_expiry(key)
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -430,7 +501,7 @@ impl Db {
             let entry = lock.read();
             if entry.is_expired() {
                 drop(entry);
-                self.map.remove(key, &guard);
+                self.remove_if_same(key, lock, &guard);
                 return None;
             }
             let result = f(&entry.value);
@@ -442,7 +513,15 @@ impl Db {
         drop(guard);
         if self.try_promote(key) {
             let guard = self.map.guard();
-            return self.map.get(key, &guard).map(|lock| f(&lock.read().value));
+            if let Some(lock) = self.map.get(key, &guard) {
+                let entry = lock.read();
+                if entry.is_expired() {
+                    drop(entry);
+                    self.remove_if_same(key, lock, &guard);
+                    return None;
+                }
+                return Some(f(&entry.value));
+            }
         }
         None
     }
@@ -451,21 +530,31 @@ impl Db {
     /// promotion applied the same way as `with_value`. Does *not* create the
     /// key if it's missing from both RAM and the tier — see `with_entry_mut`.
     pub fn with_value_mut<R>(&self, key: &[u8], f: impl FnOnce(&mut Value) -> R) -> Option<R> {
+        let _tier_guard = self.tier_ops.lock();
         let guard = self.map.guard();
         if let Some(lock) = self.map.get(key, &guard) {
             let mut entry = lock.write();
             if entry.is_expired() {
                 drop(entry);
-                self.map.remove(key, &guard);
+                self.remove_if_same(key, lock, &guard);
                 return None;
             }
             entry.touch();
             return Some(f(&mut entry.value));
         }
         drop(guard);
-        if self.try_promote(key) {
+        if self.try_promote_locked(key) {
             let guard = self.map.guard();
-            return self.map.get(key, &guard).map(|lock| f(&mut lock.write().value));
+            if let Some(lock) = self.map.get(key, &guard) {
+                let mut entry = lock.write();
+                if entry.is_expired() {
+                    drop(entry);
+                    self.remove_if_same(key, lock, &guard);
+                    return None;
+                }
+                entry.touch();
+                return Some(f(&mut entry.value));
+            }
         }
         None
     }
@@ -480,6 +569,7 @@ impl Db {
         default: impl FnOnce() -> Value,
         f: impl FnOnce(&mut Value) -> R,
     ) -> R {
+        let _tier_guard = self.tier_ops.lock();
         let guard = self.map.guard();
         // Hot path (key already present and live, which is the common case
         // once a collection key has been created) only needs this one
@@ -497,7 +587,7 @@ impl Db {
             }
         }
         if !present {
-            self.try_promote(&key);
+            self.try_promote_locked(&key);
         }
         let lock =
             self.map.get_or_insert_with(key, || RwLock::new(Entry::new(default(), None, None)), &guard);
@@ -510,17 +600,21 @@ impl Db {
     /// Returns `false` if there's no tiering handler, the key doesn't
     /// exist, or it had already expired.
     pub fn evict_to_tier(&self, key: &[u8]) -> bool {
+        let _tier_guard = self.tier_ops.lock();
         let Some(handler) = &self.tiering else { return false };
         let guard = self.map.guard();
         let Some(lock) = self.map.get(key, &guard) else { return false };
-        let entry = lock.read();
+        let entry = lock.write();
         if entry.is_expired() {
             drop(entry);
             self.map.remove(key, &guard);
             return false;
         }
         let ttl = entry.expires_at.map(|at| at.saturating_duration_since(Instant::now()));
-        handler.evict(&Bytes::copy_from_slice(key), &entry.value, ttl);
+        if let Err(error) = handler.evict(&Bytes::copy_from_slice(key), &entry.value, ttl) {
+            tracing::warn!(?key, %error, "failed to persist evicted key; keeping it in RAM");
+            return false;
+        }
         drop(entry);
         self.map.remove(key, &guard);
         true
@@ -529,11 +623,16 @@ impl Db {
     /// Drop a key if its container value has become empty (see
     /// `Value::is_empty_container`). Call after pop/remove-style mutations.
     pub fn remove_if_empty(&self, key: &[u8]) {
+        let _tier_guard = self.tier_ops.lock();
         let guard = self.map.guard();
         let empty =
             self.map.get(key, &guard).map(|lock| lock.read().value.is_empty_container()).unwrap_or(false);
         if empty {
             self.map.remove(key, &guard);
+        } else if self.map.get(key, &guard).is_none() {
+            if let Some(handler) = &self.tiering {
+                handler.remove(key);
+            }
         }
     }
 
@@ -541,6 +640,17 @@ impl Db {
     /// commands. Phase 2's scan is a simple single-pass snapshot rather than
     /// a true resumable cursor over a resizing hash table.
     pub fn keys_snapshot(&self) -> Vec<Bytes> {
+        let _tier_guard = self.tier_ops.lock();
+        let guard = self.map.guard();
+        let mut keys: std::collections::HashSet<Bytes> = self.map.keys(&guard).cloned().collect();
+        if let Some(handler) = &self.tiering {
+            keys.extend(handler.keys_snapshot());
+        }
+        keys.into_iter().collect()
+    }
+
+    /// Keys currently resident in RAM, used by eviction selection.
+    pub fn ram_keys_snapshot(&self) -> Vec<Bytes> {
         let guard = self.map.guard();
         self.map.keys(&guard).cloned().collect()
     }
@@ -559,22 +669,33 @@ impl Db {
     }
 
     pub fn dbsize(&self) -> usize {
-        self.map.len()
+        self.keys_snapshot().into_iter().filter(|key| self.exists(std::slice::from_ref(key)) > 0).count()
     }
 
     pub fn flush(&self) {
+        let _tier_guard = self.tier_ops.lock();
         let guard = self.map.guard();
         self.map.clear(&guard);
+        if let Some(handler) = &self.tiering {
+            handler.clear();
+        }
     }
 
     /// Active expire cycle: sample up to `sample_size` entries and evict any
     /// that have expired. Returns the number of keys removed. Intended to be
     /// called periodically from a background tick.
     pub fn active_expire_cycle(&self, sample_size: usize) -> usize {
+        let _tier_guard = self.tier_ops.lock();
         let guard = self.map.guard();
+        let len = self.map.len();
+        if len == 0 || sample_size == 0 {
+            return 0;
+        }
+        let start = self.expire_cursor.fetch_add(sample_size, Ordering::Relaxed) % len;
         let expired: Vec<Bytes> = self
             .map
             .iter(&guard)
+            .skip(start)
             .take(sample_size)
             .filter(|(_, lock)| lock.read().is_expired())
             .map(|(k, _)| k.clone())
@@ -617,6 +738,10 @@ impl Db {
     /// (if any) to `Instant::now()`. Sliding-TTL mode doesn't currently
     /// survive a save/load round trip.
     pub fn load_entry(&self, key: Bytes, value: Value, ttl: Option<Duration>) {
+        let _tier_guard = self.tier_ops.lock();
+        if let Some(handler) = &self.tiering {
+            handler.remove(&key);
+        }
         let expires_at = ttl.map(saturating_deadline);
         let guard = self.map.guard();
         self.map.insert(key, RwLock::new(Entry::new(value, expires_at, None)), &guard);
@@ -851,8 +976,9 @@ mod tests {
     }
 
     impl TieringHandler for MockTier {
-        fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) {
+        fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String> {
             self.store.insert(key.clone(), (value.clone(), ttl));
+            Ok(())
         }
         fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
             self.store.remove(key).map(|(_, v)| v)
@@ -863,6 +989,9 @@ mod tests {
         fn remove(&self, key: &[u8]) {
             self.store.remove(key);
         }
+        fn keys_snapshot(&self) -> Vec<Bytes> {
+            self.store.iter().map(|entry| entry.key().clone()).collect()
+        }
     }
 
     #[test]
@@ -872,7 +1001,7 @@ mod tests {
         db.set(Bytes::from("k"), Value::String(Bytes::from("v")), None);
 
         assert!(db.evict_to_tier(b"k"));
-        assert_eq!(db.dbsize(), 0);
+        assert_eq!(db.dbsize(), 1);
         assert!(tier.store.contains_key(b"k".as_slice()));
 
         // GET transparently rehydrates it from the tier.
@@ -890,7 +1019,7 @@ mod tests {
 
         assert_eq!(db.exists(&[Bytes::from("k")]), 1);
         // Still on disk, not pulled back into RAM just to answer EXISTS.
-        assert_eq!(db.dbsize(), 0);
+        assert_eq!(db.dbsize(), 1);
         assert!(tier.store.contains_key(b"k".as_slice()));
     }
 

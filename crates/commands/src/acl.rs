@@ -77,14 +77,114 @@ pub fn sha256_hex(data: &[u8]) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Commands that take a single key as their first argument — the only ones
-/// `~pattern` key restrictions are checked against (see module docs).
+/// Commands whose key operand is in the first argument position. Multi-key
+/// and non-leading-key layouts are handled explicitly by `command_keys`.
 const KEY_COMMANDS: &[&str] = &[
+    "APPEND",
+    "BITCOUNT",
+    "BITFIELD",
+    "BITFIELD_RO",
+    "BITPOS",
+    "DECR",
+    "DECRBY",
+    "EXPIRETIME",
+    "GETDEL",
+    "GETEX",
+    "GETRANGE",
+    "GETSET",
+    "GETAT",
+    "HISTORY",
+    "INCR",
+    "INCRBY",
+    "INCRBYFLOAT",
+    "PEXPIRETIME",
+    "PEXPIREAT",
+    "RENAME",
+    "RENAMENX",
+    "SETRANGE",
+    "SETEX",
+    "SETNX",
+    "PSETEX",
+    "STRLEN",
+    "SUBSTR",
+    "TOUCH",
+    "UNLINK",
+    "WATCH",
+    "XACK",
+    "XADD",
+    "XDEL",
+    "XGROUP",
+    "XLEN",
+    "XPENDING",
+    "XRANGE",
+    "XREVRANGE",
+    "XTRIM",
+    "ZCOUNT",
+    "ZINCRBY",
+    "ZLEXCOUNT",
+    "ZMSCORE",
+    "ZPOPMAX",
+    "ZPOPMIN",
+    "ZRANK",
+    "ZREVRANK",
+    "ZSCORE",
+    "BLPOP",
+    "BRPOP",
+    "BRPOPLPUSH",
+    "EXPIREAT",
+    "HINCRBY",
+    "HINCRBYFLOAT",
+    "HKEYS",
+    "HMGET",
+    "HMSET",
+    "HRANDFIELD",
+    "HSTRLEN",
+    "HVALS",
+    "LINSERT",
+    "LINDEX",
+    "LPOS",
+    "LREM",
+    "LSET",
+    "LTRIM",
+    "PEXPIREAT",
+    "RPOPLPUSH",
+    "SETBIT",
+    "GETBIT",
+    "GETAT",
+    "HISTORY",
+    "LPUSHX",
+    "RPUSHX",
+    "LMOVE",
+    "LMPOP",
+    "LMPOP",
+    "ZUNION",
+    "ZINTER",
+    "ZDIFF",
+    "ZINTERCARD",
+    "ZUNIONSTORE",
+    "ZINTERSTORE",
+    "ZDIFFSTORE",
+    "ZRANDMEMBER",
+    "SRANDMEMBER",
+    "SPOP",
+    "SDIFFSTORE",
+    "SINTERSTORE",
+    "SUNIONSTORE",
+    "MEMORY",
+    "MOVE",
+    "XREAD",
+    "XREADGROUP",
+    "XINFO",
+    "ZREVRANGE",
+    "ZREVRANGEBYSCORE",
+    "ZREVRANGEBYLEX",
+    "ZRANGEBYLEX",
+    "ZRANGESTORE",
+    "ZREMRANGEBYLEX",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
     "GET",
     "SET",
-    "DEL",
-    "UNLINK",
-    "EXISTS",
     "TTL",
     "PTTL",
     "EXPIRE",
@@ -122,8 +222,92 @@ const KEY_COMMANDS: &[&str] = &[
     "ZSCAN",
 ];
 
-pub fn is_key_command(name: &str) -> bool {
-    KEY_COMMANDS.contains(&name)
+/// Return every key operand understood by the ACL key-pattern checks.
+/// Commands whose key positions depend on a count are decoded from their
+/// own argument layout; option/value operands are never treated as keys.
+pub fn command_keys<'a>(name: &str, args: &'a [Bytes]) -> Vec<&'a [u8]> {
+    let all = |args: &'a [Bytes]| args.iter().map(Bytes::as_ref).collect();
+    match name {
+        "DEL" | "UNLINK" | "EXISTS" | "MGET" | "SDIFF" | "SINTER" | "SUNION" | "WATCH" | "TOUCH" => all(args),
+        "SINTERCARD" => {
+            let count =
+                args.first().and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
+            args.iter().skip(1).take(count).map(Bytes::as_ref).collect()
+        }
+        "MSET" | "MSETNX" => args.iter().step_by(2).map(Bytes::as_ref).collect(),
+        "RENAME" | "RENAMENX" | "COPY" | "RPOPLPUSH" | "BRPOPLPUSH" | "LMOVE" | "BLMOVE" | "SMOVE" => {
+            args.iter().take(2).map(Bytes::as_ref).collect()
+        }
+        "OBJECT" | "XGROUP" | "XINFO" => args.get(1).map(|b| vec![b.as_ref()]).unwrap_or_default(),
+        "MEMORY" if args.first().is_some_and(|b| b.eq_ignore_ascii_case(b"USAGE")) => {
+            args.get(1).map(|b| vec![b.as_ref()]).unwrap_or_default()
+        }
+        "BITOP" => all(args),
+        "BLPOP" | "BRPOP" | "BZPOPMAX" | "BZPOPMIN" => {
+            args.iter().take(args.len().saturating_sub(1)).map(Bytes::as_ref).collect()
+        }
+        "LMPOP" | "ZMPOP" => {
+            let count =
+                args.first().and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
+            args.iter().skip(1).take(count).map(Bytes::as_ref).collect()
+        }
+        "BZMPOP" | "BLMPOP" => {
+            let count =
+                args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
+            args.iter().skip(2).take(count).map(Bytes::as_ref).collect()
+        }
+        "SORT" | "SORT_RO" => {
+            let mut keys = args.first().map(|b| vec![b.as_ref()]).unwrap_or_default();
+            for pair in args.windows(2) {
+                if pair[0].eq_ignore_ascii_case(b"STORE") {
+                    keys.push(pair[1].as_ref());
+                }
+            }
+            keys
+        }
+        "SDIFFSTORE" | "SINTERSTORE" | "SUNIONSTORE" => all(args),
+        "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" => {
+            let count =
+                args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
+            args.iter().skip(2).take(count).map(Bytes::as_ref).collect()
+        }
+        "ZINTER" | "ZUNION" | "ZDIFF" | "ZINTERCARD" => {
+            let count =
+                args.first().and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
+            args.iter().skip(1).take(count).map(Bytes::as_ref).collect()
+        }
+        "ZINTERSTORE" | "ZUNIONSTORE" | "ZDIFFSTORE" => {
+            let count =
+                args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
+            args.iter().take(1).chain(args.iter().skip(2).take(count)).map(Bytes::as_ref).collect()
+        }
+        "XREAD" | "XREADGROUP" => {
+            let Some(streams) = args.iter().position(|b| b.eq_ignore_ascii_case(b"STREAMS")) else {
+                return Vec::new();
+            };
+            let tail = &args[streams + 1..];
+            let count = tail.len() / 2;
+            tail.iter().take(count).map(Bytes::as_ref).collect()
+        }
+        _ if KEY_COMMANDS.contains(&name) => args.first().map(|b| vec![b.as_ref()]).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+pub fn authorize(user: &AclUser, name: &str, args: &[Bytes]) -> Result<(), String> {
+    if !user.enabled {
+        return Err("NOAUTH Authentication required.".into());
+    }
+    if !user.can_run(name) {
+        return Err(format!(
+            "NOPERM User has no permissions to run the '{}' command",
+            name.to_ascii_lowercase()
+        ));
+    }
+    if command_keys(name, args).into_iter().any(|key| !user.can_access_key(key)) {
+        return Err("NOPERM No permissions to access a key for this user".into());
+    }
+    Ok(())
 }
 
 fn new_acl_users(requirepass: Option<&str>) -> DashMap<String, AclUser> {
