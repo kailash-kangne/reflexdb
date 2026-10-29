@@ -1,5 +1,5 @@
 //! Minimal glob matcher for `SCAN ... MATCH pattern`, supporting the subset
-//! of Redis's `stringmatchlen` syntax people actually use: `*`, `?`, and
+//! of glob syntax: `*`, `?`, and
 //! `[...]` character classes. No backslash-escaping support yet.
 
 pub fn matches(pattern: &[u8], text: &[u8]) -> bool {

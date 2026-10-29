@@ -1,6 +1,6 @@
 //! `SAVE`/`BGSAVE`/`LASTSAVE`/`DUMP`/`RESTORE` — point-in-time snapshotting
 //! built on the `persistence` crate's RDB-style format. `DUMP`'s payload is
-//! reflexdb's own serialization, not byte-compatible with real Redis RDB
+//! reflexdb's own serialization, not byte-compatible with external RDB
 //! blobs (see `persistence::rdb`'s module docs).
 
 use std::time::Duration;

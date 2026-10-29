@@ -15,7 +15,7 @@
 //! single-key commands (`KEY_COMMANDS` below), not every command that
 //! happens to take a key as an argument.
 //!
-//! This is a real subset of Redis/Valkey ACL, not "full ACL" — see
+//! This is a subset of the ACL command surface, not "full ACL" — see
 //! `docs/07-security.md` for the honest scope.
 
 use std::collections::HashSet;

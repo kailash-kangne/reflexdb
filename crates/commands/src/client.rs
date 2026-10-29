@@ -2,7 +2,7 @@
 //! (client-side caching invalidation). See `ServerContext::tracking_table`'s
 //! docs for the scope of what's tracked.
 //!
-//! Scoped down from real Redis: `CLIENT KILL`/`PAUSE`/`UNPAUSE`/`REPLY` are
+//! Scoped down: `CLIENT KILL`/`PAUSE`/`UNPAUSE`/`REPLY` are
 //! not implemented (they'd need the connection loop to reach back into a
 //! *different* connection's socket, which `dispatch()`'s `&ServerContext`
 //! can't do); `CLIENT LIST`/`INFO` report a plausible-but-simplified line

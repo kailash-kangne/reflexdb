@@ -89,7 +89,7 @@ async fn main() -> std::io::Result<()> {
 
     let ctx = Arc::new(ctx);
 
-    // Background active-expire cycle, mirroring Redis's serverCron sampling.
+    // Background active-expire cycle, sampling a bounded number of keys.
     // The same tick also refreshes the `maxmemory` estimate and evicts keys
     // if it's exceeded (both no-ops unless `maxmemory` is configured), and
     // fires any `SCHEDULE AT`/`SCHEDULE IN` commands whose time has come.

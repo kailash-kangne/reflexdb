@@ -1,7 +1,7 @@
 //! `reflexdb-sentinel <sentinel.conf>` — automatic failover for a
 //! monitored primary/replica group. See `docs/06-ha-replication-cluster.md`
 //! §2, and each module's doc comment for exactly what's implemented vs.
-//! simplified from real Redis Sentinel.
+//! a simplified Sentinel-compatible failover watcher.
 
 #[path = "reflexdb-sentinel/commands.rs"]
 mod commands;

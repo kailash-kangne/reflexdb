@@ -1,4 +1,4 @@
-//! `sentinel.conf` parsing. Same line-based, `redis.conf`-style format as
+//! `sentinel.conf` parsing. Same line-based format as
 //! the main server's config, but with Sentinel's own directive set per
 //! `docs/06-ha-replication-cluster.md` §2.
 //!

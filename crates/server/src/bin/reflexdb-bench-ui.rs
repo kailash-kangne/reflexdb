@@ -289,7 +289,7 @@ const HTML: &str = r###"<!DOCTYPE html>
 
 <script>
 const PRESETS = {
-  'Redis default': { n: 100000, c: 50, p: 1, d: 3, r: 100000, cmd: 'ping,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_500,mset,xadd' },
+  'Default command mix': { n: 100000, c: 50, p: 1, d: 3, r: 100000, cmd: 'ping,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_500,mset,xadd' },
   'Pipelined (prod-like)': { n: 500000, c: 50, p: 16, d: 3, r: 500000, cmd: 'ping,set,get,incr,lpush,rpush,sadd,hset,zadd,mset,xadd' },
   'High concurrency': { n: 500000, c: 200, p: 32, d: 100, r: 500000, cmd: 'set,get,incr,lpush,sadd,hset,zadd' },
   'Large payload (object cache)': { n: 100000, c: 50, p: 1, d: 1024, r: 100000, cmd: 'set,get,mset' },

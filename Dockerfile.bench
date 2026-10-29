@@ -1,7 +1,5 @@
-# Throwaway image for benchmarking reflexdb against another engine in the
-# same Docker environment (removes the "native host vs Docker VM networking"
-# confound from an earlier cross-environment comparison). Not meant as a
-# production image — no attempt at minimal layers/size.
+# Throwaway image for repeatable in-Docker benchmark runs. Not meant as a
+# production image — no attempt at minimal layers or size.
 FROM rust:1-bookworm AS builder
 # mlua's "vendored" feature compiles PUC Lua's C sources at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*

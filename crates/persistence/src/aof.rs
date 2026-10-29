@@ -21,13 +21,11 @@
 //! The fix is a single background thread that owns the file and is the
 //! only thing that ever calls `write`/`fsync` on it. `append`/`fsync` just
 //! hand it pre-encoded bytes over a channel and return immediately —
-//! **fire-and-forget, the same trade-off most Redis-compatible servers make**: a
+//! **fire-and-forget**, an explicit asynchronous durability trade-off: a
 //! command can reply to the client before its AOF bytes have actually hit
 //! the kernel, so a process crash (not just a power loss) in that narrow
 //! window can lose the last few commands. That's an explicit choice to
-//! chase speed over the old "block until written" guarantee, made because
-//! no mainstream Redis-compatible server actually gives you more than
-//! this in practice either. What we get in exchange: `append()` is now
+//! chase speed over the old "block until written" guarantee. What we get in exchange: `append()` is now
 //! just an encode + channel push, no lock held across a syscall and no
 //! waiting on the writer thread at all — the full cost of `write`/`fsync`
 //! moves entirely off the request path. The writer thread still drains
@@ -184,11 +182,9 @@ impl AofWriter {
 /// Builds the "minimal command sequence" that reconstructs `store`'s
 /// current state — what `BGREWRITEAOF` uses to replace a long, ever-
 /// growing command history with just enough `SET`/`RPUSH`/`HSET`/`SADD`/
-/// `ZADD`/`PEXPIREAT` calls to recreate what's there right now. Unlike
-/// real Redis's rewrite (which batches many keys per command for
-/// compactness), this emits one command per key — simpler, and still
-/// correct, just a larger file than Redis would produce for the same
-/// data.
+/// `ZADD`/`PEXPIREAT` calls to recreate what's there right now. This emits
+/// one command per key for a simple, correct rewrite; compact batching may
+/// reduce the resulting file size in a future optimization.
 ///
 /// Must be called by `BGREWRITEAOF`'s caller only *after*
 /// `AofWriter::begin_rewrite` has been sent (not necessarily processed —

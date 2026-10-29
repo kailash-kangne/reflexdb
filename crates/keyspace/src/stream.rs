@@ -4,10 +4,7 @@
 //! reads/`MINID` trimming/exclusive range bounds (`(id`) are **not**
 //! implemented. Entries are kept in a plain `BTreeMap` ordered by ID, which
 //! is what gives `XRANGE`/`XREAD`-since-id their ordering for free (no
-//! separate index needed) at the cost of being an in-memory structure, not
-//! Redis's own radix-tree-of-listpacks (`stream.c`) — fine at the scale
-//! this project targets, same trade-off as `ZSet` re-sorting on every
-//! range query.
+//! separate index needed) at the cost of being an in-memory structure.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 

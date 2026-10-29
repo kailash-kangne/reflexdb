@@ -119,7 +119,7 @@ struct Entry {
     /// sliding-TTL reset.
     last_access: Instant,
     /// For `allkeys-lfu`/`volatile-lfu`: a plain monotonically-increasing
-    /// access counter — not Redis's actual probabilistic-decay LFU counter
+    /// access counter — a simplified LFU approximation
     /// (that needs a background decay task we don't have), just "fewest
     /// accesses wins" as the eviction tie-break.
     access_count: u64,

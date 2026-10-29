@@ -1,15 +1,17 @@
 # reflexdb
 
-A **Redis-protocol-compatible** in-memory database written from scratch in **Rust**, with two
-first-class features of our own:
+A database that speaks RESP and explores recoverable live state for long-running
+workflows, written in **Rust**. The current prototype combines live query updates
+(`LIVE` / `UNLIVE`), optional per-key string history (`GETAT` / `HISTORY`), and tiered storage.
 
-1. **Live query subscriptions (`LIVE` / `UNLIVE`)** — subscribe to the *result* of any read-only
-   command and get push updates whenever the underlying keys change.
-2. **Tiered storage** — evicted keys flow transparently to an on-disk LSM tier and are
-   transparently restored on read, so the working set can be larger than RAM.
+The product hypothesis is that developers need to inspect and recover workflow state after a
+bad step, while still using a fast shared store. This is a hypothesis, not a validated market
+position. ReflexDB has not established a speed, memory, or cost advantage across representative
+production workloads. See
+[the product direction](docs/PRODUCT_DIRECTION.md) and [benchmark notes](docs/BENCHMARKS.md).
 
-On top of that it speaks RESP2/RESP3, so any existing Redis client, SDK, or CLI works out of
-the box.
+RESP2/RESP3 compatibility is intended to make experiments easier; command and behavior coverage
+is limited and should be checked before use.
 
 Everything is original Rust code.
 
@@ -28,7 +30,7 @@ cargo build --release
 ./target/release/reflexdb-server reflexdb.conf
 ```
 
-By default it listens on `127.0.0.1:7379`. Talk to it with `redis-cli` or any Redis client:
+By default it listens on `127.0.0.1:7379`. Try supported commands with `redis-cli` or another RESP client:
 
 ```sh
 redis-cli -p 7379 set foo bar
@@ -41,7 +43,7 @@ Or use the bundled CLI instead of `redis-cli`:
 cargo run --release --bin reflexdb-cli -- -p 7379
 ```
 
-Try the two features that aren't in Redis:
+Try the live query prototype:
 
 ```sh
 # LIVE: subscribe to a command's result, get pushed the new result on every change
@@ -61,20 +63,13 @@ replication, TLS, etc.), and [docs/COMMANDS.md](docs/COMMANDS.md) for the full c
 Run the test suite with `cargo test`, or build the production Docker image with
 `docker build -t reflexdb .`.
 
-## Who this might be for (unproven — read this as a hypothesis, not a claim)
+## Product direction (hypothesis)
 
-AI agent memory is hot, short-lived, and high-churn — the shape reflexdb is already built for.
-Three things that shape needs and most teams currently bolt on with an app-level
-checkpointer instead:
-
-- **Undo a bad step** — roll state back to what it was a moment ago, not just delete the key.
-- **Explain itself** — a version history of memory, not external audit tooling bolted on after.
-- **Be watched live** — push updates on state changes, not polling.
-
-`LIVE`/`UNLIVE` (above) covers "watched live." `GETAT`/`HISTORY` (point-in-time reads and
-per-key version logs, off by default behind `history-enabled yes` — see
-[docs/FEATURES.md](docs/FEATURES.md)) are a proof-of-concept of "undo"/"explain itself." This
-positioning is unvalidated — see [docs/ROADMAP.md](docs/ROADMAP.md).
+The first customer problem to test is recovering and inspecting state in long-running workflows:
+what changed, which step changed it, and how to resume from a known-good point. The current
+prototype does not provide a complete workflow checkpoint or rollback guarantee. `LIVE` and
+`GETAT`/`HISTORY` are experiments that may help prove the idea, not finished promises. See
+[docs/PRODUCT_DIRECTION.md](docs/PRODUCT_DIRECTION.md) for the validation plan and scope.
 
 ## Binaries
 
@@ -84,7 +79,7 @@ positioning is unvalidated — see [docs/ROADMAP.md](docs/ROADMAP.md).
 | `reflexdb-proxy` | A pass-through relay (`--listen`/`--upstream`) that sits in front of an *existing* RESP-compatible server — pure byte splice, no RESP parsing, zero data migration required to try. Doesn't add any feature on its own yet — it's the foundation a future `LIVE`/single-flight-at-the-proxy layer would sit on top of. |
 | `reflexdb-sentinel` | Automatic failover watcher for a monitored primary/replica group. |
 | `reflexdb-cli` | Interactive CLI client. |
-| `reflexdb-bench-ui` | Local web UI for running `redis-benchmark` against a running server with live RPS/latency/RAM/disk charts. |
+| `reflexdb-bench-ui` | Local web UI for running `benchmark tool` against a running server with live RPS/latency/RAM/disk charts. |
 
 ## Documentation Index
 
@@ -93,11 +88,12 @@ positioning is unvalidated — see [docs/ROADMAP.md](docs/ROADMAP.md).
 | [docs/FEATURES.md](docs/FEATURES.md) | Everything reflexdb has today: data types, persistence, replication, security, scripting, `LIVE`, time travel, single-flight |
 | [docs/COMMANDS.md](docs/COMMANDS.md) | Full command reference, grouped, with what's cut/planned vs. implemented |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, concurrency model, internals, dependency choices |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Designed-but-not-built features, and the open architectural decisions |
-| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Measured throughput, the `ZPOPMIN` perf fix, and comparisons against other engines |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Focused sequence of product and engineering decisions |
+| [docs/PRODUCT_DIRECTION.md](docs/PRODUCT_DIRECTION.md) | Customer hypothesis, validation plan, and proposed scope |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Development measurements and reproducibility notes |
 
 ## Compatibility
 
-reflexdb targets wire compatibility with the modern Redis command set, so any standard
-Redis client, SDK, or CLI works against it out of the box. We write our own implementation
-from scratch.
+ReflexDB implements a subset of the Redis command protocol over RESP. Compatibility varies by
+command and behavior; check [docs/COMMANDS.md](docs/COMMANDS.md) before connecting an application.
+We write our own implementation from scratch.
