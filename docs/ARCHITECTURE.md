@@ -53,22 +53,31 @@ collections); anything that only needs existence/type checking uses
 
 ## TTL / expiry
 
-Passive (checked on every lookup) + active (background tokio task every 100ms, samples up to 20
-entries). `Instant::now() + duration` uses a `saturating_deadline()` helper to avoid a panic on
-an absurdly large client-supplied TTL.
+Passive (checked on every lookup) + active (background Tokio task every 100ms by default,
+sampling up to 20 entries per tick). `Instant::now() + duration` uses a `saturating_deadline()`
+helper to avoid a panic on an absurdly large client-supplied TTL.
+
+The same configurable maintenance tick runs active expiry, scheduled commands, and memory
+maintenance on Tokio's blocking pool. With all memory limits disabled, memory maintenance returns
+without scanning the keyspace. When eviction is needed, it selects/ranks one bounded candidate
+batch per database (up to 10,000 keys per pass) rather than rebuilding the key list for every
+victim; LRU/LFU/TTL policies preserve their ordering.
 
 ## Persistence
 
-- `SAVE`: fully synchronous. `BGSAVE`: the keyspace walk (`persistence::rdb::serialize`) runs on
-  the calling thread (needs the borrowed `&Store`), but once serialized into an owned `Vec<u8>`,
-  the disk write + atomic rename happens on a spawned OS thread — no `fork()` anywhere in this
-  codebase (Rust + `fork()` is UB-risk territory with allocators/threads).
+- `SAVE` and the `BGSAVE` keyspace serialization run on Tokio's blocking pool, keeping large
+  snapshots off async worker threads. `BGSAVE`'s disk write and atomic rename then run on a
+  spawned OS thread after serialization produces an owned `Vec<u8>`. There is no `fork()` anywhere
+  in this codebase (Rust + `fork()` is UB-risk territory with allocators/threads). New RDB files
+  are zstd-compressed and carry format version 2; uncompressed version-1 files remain readable.
 - AOF: one dedicated background OS thread owns the file and is the only thing that calls
   `write`/`fsync`. `append()`/`fsync()` RESP-encode the command and push onto an `mpsc` channel,
   returning immediately (fire-and-forget). The writer thread drains everything already queued
   and coalesces it into one `write_all` (+ at most one `fsync`) — group commit, turning N
   concurrent callers into O(1) syscalls. `WAITAOF` is the one blocking exception
   (`AofWriter::flush_and_fsync`, waits for a real ack).
+  New AOFs store independently compressed writer batches; the loader accepts legacy RESP-only
+  logs, which are upgraded when `BGREWRITEAOF` replaces them.
 - `GETAT`/`HISTORY` versions go through the same fire-and-forget-to-a-writer-thread shape, on
   `fjall` (`persistence::history::HistoryWriter`).
 
@@ -86,8 +95,15 @@ trait TieringHandler: Send + Sync {
 ```
 
 `promote` is a one-way move, not a cache copy — a tiered key and its RAM copy never coexist.
-`evict`/`promote` are synchronous disk I/O on whatever path triggers them (not off-loaded to a
-blocking thread pool).
+RAM hits avoid any blocking-pool handoff. On Tokio's multi-thread runtime, actual synchronous
+Fjall operations use `block_in_place` so Tokio can replace the occupied worker; outside that
+runtime they execute synchronously. Tier spill selection follows the configured maxmemory
+eviction policy, preserving LRU/LFU ordering where selected.
+
+Replication uses a separate bounded queue per connected replica (32,768 messages and 64 MiB).
+The normal pub/sub slow-client timeout does not apply to replicas. If the replica queue overflows,
+the missed stream cannot be continued safely, so the connection is closed after five seconds and
+must full-resync.
 
 ## `LIVE` (reactivity)
 
@@ -97,12 +113,17 @@ blocking thread pool).
    reply includes the fingerprint for later `UNLIVE`.
 3. Subscription registered in `live_subs: fingerprint -> {db, cmd, watched_key, clients}` and
    `key_watchers: (db, key) -> {fingerprints}`.
-4. Every write calls `notify_key_change`, which looks up `key_watchers` and re-runs the inner
-   command for each matching fingerprint, pushing the new result per-client.
+4. A write looks up matching fingerprints and synchronously re-runs each inner command on the
+   write path. It replaces the cached latest result and broadcasts the fingerprint on one
+   server-wide, 1,024-item event bus. Each interested connection task reads the latest result and
+   writes it to its socket. Slow connections can skip intermediate states when they lag the event
+   bus. Pub/sub and tracking use a separate 1,024-item outbound push queue, whose overflow marks a
+   client for disconnect after 25 ms.
 
 Re-execution, not incremental diffing — a fast bail-out (`key_watchers_len: AtomicUsize`)
-means zero extra cost on the write path when nobody's subscribed. N subscribers on one hot key
-means N re-executions per write.
+means zero extra cost on the write path when nobody's subscribed. Work scales with distinct
+matching fingerprints per write; delivery also fans out to each client subscribed to a matching
+fingerprint.
 
 ## Single-flight
 
@@ -133,6 +154,9 @@ against untrusted payloads; `with_fixint_encoding()` is mandatory because every 
 misreads length-prefixed fields instead of erroring.
 
 ## Dependency choices
+
+Release builds use optimization level 3, thin LTO, one codegen unit, and symbol stripping; debug
+builds retain Cargo's normal development profile.
 
 | Crate | Why |
 |---|---|

@@ -46,10 +46,12 @@ underlying key changes.
 - Fingerprint = CRC64 of `<command> <args>`, used to dedupe subscriptions and for `UNLIVE`.
 - RESP2 connections in `LIVE` mode are restricted to `LIVE`/`UNLIVE`/`PING`/`QUIT`/`RESET`;
   RESP3 allows mixing live subscriptions with normal commands.
-- Live clients never time out. `live-debounce-period-ms` (default `0`) batches rapid changes
-  to one push per period.
-- Implementation: one broadcast bus per shard; every write posts a `KeyChange` event, `LIVE`
-  subscribers re-run their command and push the new result.
+- A single server-wide broadcast bus carries changed subscription fingerprints. Matching
+  read-only commands are re-run synchronously on the write path; connection tasks then read the
+  latest result and send it to their clients. The event bus is bounded at 1,024 items, so a
+  connection that falls behind can skip intermediate states. Pub/sub and tracking use a separate
+  1,024-item outbound queue; overflow marks that client for disconnect after 25 ms. There is no
+  configurable LIVE debounce period.
 
 ## Persistence
 
@@ -60,14 +62,17 @@ underlying key changes.
 | AOF only | `save ""`, `appendonly yes` | max durability |
 | Hybrid (default) | both | fast restart + low loss |
 
-- **RDB**: `SAVE` (sync) / `BGSAVE` (keyspace walk on the caller's thread, disk write+rename on
-  a background thread — no `fork()`). `DUMP`/`RESTORE` for single-key dump/load.
+- **RDB**: `SAVE` is synchronous to the client but runs on Tokio's blocking pool; `BGSAVE`
+  serializes on that pool and writes/renames on a background OS thread — no `fork()`. New
+  snapshots are zstd-compressed; uncompressed format-v1 snapshots remain readable.
+  `DUMP`/`RESTORE` handle single-key dump/load.
 - **AOF**: per-command log, replayed at startup. `appendfsync always/everysec/no`. Writes are
   fire-and-forget to a dedicated writer thread that batches everything queued into one
-  `write`/`fsync` ("group commit") — a crash can lose the last few acked commands under
-  `everysec`; `WAITAOF` is the call that explicitly
-  blocks for a real fsync. `BGREWRITEAOF` compacts to one command per live key (manual trigger
-  only — no automatic rewrite-on-growth yet).
+  write/fsync ("group commit"). New AOF files use compressed batches; legacy RESP-only files
+  remain readable and are upgraded by `BGREWRITEAOF`. A crash can lose the last few acked
+  commands under `everysec`; `WAITAOF` is the call that explicitly blocks for a real fsync.
+  `BGREWRITEAOF` compacts to one command per live key (manual trigger only — no automatic
+  rewrite-on-growth yet).
 
 ## Tiered storage
 
@@ -84,15 +89,19 @@ and promoted back to RAM on the next read — so the working set can exceed the 
 | `eviction-tick-ms` | 100 | how often the background task re-checks `maxmemory`/`tiered-memory-limit`/`tiered-disk-limit` and runs TTL active-expire — a background task, not the request path, so lowering it reacts to write bursts faster for free (small extra idle-tick CPU, not request latency) |
 
 A tiered key and its RAM copy never coexist (promotion is a move, not a copy). `EXISTS` answers
-truthfully for tiered keys without a disk read. Tier I/O is synchronous (not off-loaded to a
-blocking pool) — a cold read can tie up a worker thread briefly. TTLs on sliding-mode keys
-don't survive a tier round-trip.
+truthfully for tiered keys without a disk read. RAM hits avoid a blocking-pool handoff; actual
+Fjall I/O uses Tokio's `block_in_place` on its multi-thread runtime. Tier spill ordering follows
+the configured maxmemory policy, including LRU/LFU ranking. TTLs on sliding-mode keys don't
+survive a tier round-trip.
 
 ## Replication & HA
 
 - `REPLICAOF <host> <port>` / `REPLICAOF NO ONE`; `replica-read-only yes` by default.
 - `PSYNC` always does a **full resync** (serializes an RDB snapshot, streams it, then streams
   live writes) — no partial resync/backlog yet.
+- Replication writes use a dedicated bounded per-replica queue (32,768 messages / 64 MiB); the
+  pub/sub slow-client timeout does not apply. Queue overflow means the replica has missed writes
+  and it is disconnected after a five-second grace period, requiring a full resync.
 - `WAIT`/`WAITAOF` — write-ack sync points, offset-compare based.
 - `reflexdb-sentinel` binary: monitors primaries, votes with peer Sentinels on failure, promotes
   a replica and re-points the others. Replicas/peers are listed explicitly in

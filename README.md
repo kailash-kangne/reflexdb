@@ -91,19 +91,29 @@ Then open `http://127.0.0.1:8080` and pick a workload tab.
 
 ### One real comparison so far
 
-We ran Redis, Dragonfly, and ReflexDB side by side in Docker, same machine, same memory/CPU cap
-per engine, once with 1 CPU and once with 4 CPUs. Short summary:
+On 2026-10-30, Redis, Dragonfly, and ReflexDB were tested with the same 2 GiB memory cap, 16
+clients, and workloads, running one engine at a time. Pipeline depth 16 delivered roughly 8–10×
+the throughput of depth 1. ReflexDB led two of four cases at 1 CPU; Redis led all four at 4 CPUs.
+Each case ran once, so repeat the test before drawing firm performance conclusions. See
+[the benchmark setup and results](docs/BENCHMARKS.md#engine-shootout-reflexdb-vs-redis-vs-dragonfly).
 
-| Scenario | Who was fastest | By how much |
-|---|---|---|
-| Single core | ReflexDB (tied with Redis) | ReflexDB vs. Redis: within noise. ReflexDB vs. Dragonfly: ~30–55% faster |
-| 4 cores | ReflexDB | ReflexDB vs. Redis: ~1–8% faster. ReflexDB vs. Dragonfly: ~10–40% faster |
+### Where ReflexDB may fit better
 
-ReflexDB came out ahead in almost every workload we tried (11 of 12), with Redis close behind and
-Dragonfly further back, though Dragonfly closed some of that gap once it had more cores to use.
-This is from one run of each scenario on one machine, not a guarantee you'll see the same numbers —
-see [the full results, setup, and caveats in docs/BENCHMARKS.md](docs/BENCHMARKS.md#engine-shootout-reflexdb-vs-redis-vs-dragonfly)
-before citing it anywhere else.
+The throughput comparison tests basic commands. ReflexDB also combines capabilities that can help
+when a workload needs them:
+
+- **Disk-backed tiering:** cold keys can move from RAM to a Fjall disk store and promote on access,
+  letting the working set exceed the RAM budget. Cold reads trade latency for memory savings.
+- **Live query results:** `LIVE` pushes updated results of supported read-only commands, reducing
+  application polling. Slow connections can miss intermediate updates; query reevaluation adds
+  work to writes for watched keys.
+- **History:** optional disk-backed string versions support `GETAT` and `HISTORY` for inspection.
+  This is not a complete workflow checkpoint or rollback guarantee.
+- **Persistence and replication:** compressed RDB/AOF files can reduce disk use; primary/replica
+  replication supports `WAIT`/`WAITAOF` acknowledgements. Replication currently uses full resyncs.
+
+The Docker shootout does not measure tiering, history, persistence, `LIVE`, or replication. Its
+results describe basic command throughput only.
 
 ## Vision
 
