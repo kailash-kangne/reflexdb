@@ -57,6 +57,11 @@ use bytes::{Bytes, BytesMut};
 use keyspace::{Store, Value};
 use tokio_util::codec::Decoder;
 
+// New AOFs are independently compressed in writer batches. Legacy RESP-only
+// files remain appendable until BGREWRITEAOF atomically upgrades them.
+const AOF_MAGIC: &[u8; 5] = b"RFXA1";
+const MAX_COMPRESSED_BATCH: usize = 8 * 1024 * 1024;
+
 /// How aggressively the AOF is fsync'd to disk.
 ///
 /// | Policy     | fsync frequency        | Max data loss on crash | Throughput |
@@ -131,11 +136,22 @@ pub struct AofWriter {
 
 impl AofWriter {
     pub fn open(path: &Path, fsync: Fsync) -> io::Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new().create(true).read(true).append(true).open(path)?;
+        let compressed = if file.metadata()?.len() == 0 {
+            file.write_all(AOF_MAGIC)?;
+            true
+        } else {
+            let mut magic = [0; 5];
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::Start(0))?;
+            let n = file.read(&mut magic)?;
+            file.seek(SeekFrom::End(0))?;
+            n == magic.len() && &magic == AOF_MAGIC
+        };
         let (tx, rx) = mpsc::sync_channel(4096);
         let worker = thread::Builder::new()
             .name("reflexdb-aof-writer".into())
-            .spawn(move || writer_loop(file, rx, fsync))
+            .spawn(move || writer_loop(file, rx, fsync, compressed))
             .map_err(|e| io::Error::other(format!("failed to spawn AOF writer thread: {e}")))?;
         Ok(Self { tx: Mutex::new(tx), _worker: worker })
     }
@@ -334,7 +350,7 @@ fn writer_gone() -> io::Error {
 /// queued without blocking, coalescing all of it into one `write` (and at
 /// most one `fsync`) — this is what turns N concurrent callers into O(1)
 /// syscalls instead of N.
-fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync) {
+fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync, mut compressed: bool) {
     const MAX_REWRITE_MIRROR_BYTES: usize = 256 * 1024 * 1024;
     const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
     let mut last_db: Option<usize> = None;
@@ -412,7 +428,13 @@ fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync) {
             }
         }
 
-        let write_result = if buf.is_empty() { Ok(()) } else { file.write_all(&buf) };
+        let write_result = if buf.is_empty() {
+            Ok(())
+        } else if compressed {
+            write_compressed_frame(&mut file, &buf)
+        } else {
+            file.write_all(&buf)
+        };
         if let Err(e) = &write_result {
             tracing::warn!(error = %e, "AOF writer thread failed to write a batch");
         }
@@ -438,6 +460,7 @@ fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync) {
                 Ok(new_file) => {
                     tracing::info!(bytes = base.len(), path = %path.display(), "AOF rewrite complete");
                     file = new_file;
+                    compressed = true;
                     last_db = rw.last_db;
                 }
                 Err(e) => tracing::warn!(error = %e, "AOF rewrite failed to swap in the new file"),
@@ -478,9 +501,32 @@ fn swap_aof_file(path: &Path, bytes: &[u8]) -> io::Result<File> {
         Some(dir) => dir.join(tmp_name),
         None => PathBuf::from(tmp_name),
     };
-    fs::write(&tmp_path, bytes)?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(AOF_MAGIC);
+    if !bytes.is_empty() {
+        append_compressed_frame(&mut encoded, bytes)?;
+    }
+    fs::write(&tmp_path, encoded)?;
     fs::rename(&tmp_path, path)?;
     OpenOptions::new().create(true).append(true).open(path)
+}
+
+fn append_compressed_frame(out: &mut Vec<u8>, bytes: &[u8]) -> io::Result<()> {
+    for chunk in bytes.chunks(MAX_COMPRESSED_BATCH) {
+        let compressed = zstd::bulk::compress(chunk, 1)
+            .map_err(|e| io::Error::other(format!("compress AOF batch: {e}")))?;
+        let len = u32::try_from(compressed.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "compressed AOF frame too large"))?;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(&compressed);
+    }
+    Ok(())
+}
+
+fn write_compressed_frame(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+    let mut frame = Vec::with_capacity(bytes.len().min(MAX_COMPRESSED_BATCH));
+    append_compressed_frame(&mut frame, bytes)?;
+    file.write_all(&frame)
 }
 
 fn select_request(db_index: usize) -> [Bytes; 2] {
@@ -526,6 +572,35 @@ pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
             "AOF exceeds 4 GiB replay limit; rewrite or trim it",
         ));
     }
+    let data = if data.starts_with(AOF_MAGIC) {
+        let mut decoded = Vec::new();
+        let mut cursor = AOF_MAGIC.len();
+        while cursor < data.len() {
+            let frame_start = cursor;
+            if data.len() - cursor < 4 {
+                OpenOptions::new().write(true).open(path)?.set_len(frame_start as u64)?;
+                break;
+            }
+            let len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if len > MAX_COMPRESSED_BATCH + 1024 * 1024 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "AOF frame exceeds replay limit"));
+            }
+            if data.len() - cursor < len {
+                OpenOptions::new().write(true).open(path)?.set_len(frame_start as u64)?;
+                break;
+            }
+            let frame =
+                zstd::bulk::decompress(&data[cursor..cursor + len], MAX_COMPRESSED_BATCH).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("invalid compressed AOF frame: {e}"))
+                })?;
+            decoded.extend_from_slice(&frame);
+            cursor += len;
+        }
+        decoded
+    } else {
+        data
+    };
     let mut buf = BytesMut::from(&data[..]);
     let mut decoder = resp::RequestDecoder;
     let mut requests = Vec::new();
@@ -591,6 +666,14 @@ mod tests {
     fn replay_missing_file_returns_empty() {
         let path = std::env::temp_dir().join("reflexdb-aof-does-not-exist.aof");
         assert_eq!(replay(&path).unwrap(), Vec::<Vec<Bytes>>::new());
+    }
+
+    #[test]
+    fn replay_accepts_legacy_uncompressed_aof() {
+        let path = std::env::temp_dir().join(format!("reflexdb-aof-legacy-{}.aof", std::process::id()));
+        std::fs::write(&path, encode(&[Bytes::from_static(b"PING")])).unwrap();
+        assert_eq!(replay(&path).unwrap(), vec![vec![Bytes::from_static(b"PING")]]);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

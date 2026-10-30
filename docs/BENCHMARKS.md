@@ -1,10 +1,10 @@
 # Benchmarks
 
-These are development measurements, not published performance claims. One measurement pass was
-run on one Apple M5 machine (10 cores, 24GB RAM, macOS) using a release build. Re-measure before
-quoting numbers externally. `benchmarks/run.py` now provides a checked-in, standard-library-only
-RESP2 harness for repeatable runs against a running server; the historical numbers below remain
-single-machine, single-pass observations.
+These are development measurements, not published performance claims. The historical baselines
+below came from one Apple M5 machine; the Engine shootout was rerun on 2026-10-30 on an arm64 Mac.
+Both are single-machine observations, so re-measure before quoting numbers externally.
+`benchmarks/run.py` provides a checked-in, standard-library-only RESP2 harness for repeatable runs
+against a running server.
 
 ## Reproducible harness
 
@@ -30,13 +30,13 @@ The UI streams each completed run into KPI cards, a logarithmic p50/p99/p999 cha
 comparison table. Python 3 must be available on the UI host (`PYTHON` can select its executable),
 and the target database server must already be running.
 
-The LIVE case isolates the currently important fan-out shape: subscriptions with the same
-fingerprint share one inner command evaluation, while each connected watcher still receives a
-separate push. Delivery runs on a background worker. While the worker is busy, a one-slot mailbox
-per fingerprint replaces pending states with the newest value, so a burst does not create an
-unbounded queue of stale updates. This is state-stream behavior: intermediate states can be
-coalesced. The worker still has O(N) recipient work for a delivered update, so use the same setup
-at several watcher counts to measure the remaining cost.
+The current LIVE path re-runs each matching fingerprint's command synchronously on the write
+path, caches its latest result, and broadcasts the fingerprint on a bounded server-wide event
+bus. Each interested connection sends the latest result; lagging connections can skip intermediate
+states. The event bus has 1,024 slots. Pub/sub and tracking use a separate 1,024-item per-client
+outbound queue, whose overflow triggers disconnect after 25 ms. The measurements below are
+historical and do not establish current performance; re-run the harness against the current build
+before using them as a baseline.
 
 ### LIVE fan-out measurement and change
 
@@ -51,15 +51,14 @@ Release-build runs on the Apple M5 machine described above (no persistence, one 
 
 The 0- and 100-watcher runs used two-second samples; the 1,000-watcher result is the range from two
 10-second runs. The updated harness uses one selector loop to drain all subscriber sockets; earlier
-runs used one Python thread per watcher and are not directly comparable as an A/B measurement. The
-updated server queues fan-out off the write path and coalesces pending states. On the 1,000-watcher case, two longer
-10-second runs on the rebuilt source measured 79.6–80.6 writes/s, p50 12.35–12.59 ms, p99
+runs used one Python thread per watcher and are not directly comparable as an A/B measurement. On
+the 1,000-watcher case, two longer 10-second runs on the measured source measured 79.6–80.6 writes/s,
+p50 12.35–12.59 ms, p99
 16.78–17.54 ms, and p999 23.33–24.54 ms, with zero errors. The 100-watcher two-second run measured 907 writes/s, p50 1.10
 ms, p99 1.20 ms, and p999 1.59 ms. The 1,000-watcher result still shows a large server-wide cost:
 this remains unsuitable for low-latency hot keys at that fan-out. The
 10-second p999 is based on only about 850 writes per run, so treat it as a diagnostic rather than
-a stable tail guarantee. LIVE's coalescing also means slow subscribers may skip intermediate
-states by design.
+a stable tail guarantee. Slow subscribers may skip intermediate states by design.
 
 ## Measurements to collect
 
@@ -129,77 +128,40 @@ all members into a temporary vector.
 
 ## Engine shootout: ReflexDB vs. Redis vs. Dragonfly
 
-Two measurement passes, same Apple M5 machine as above, via the bundled **Engine shootout** tab in
-`reflexdb-bench-ui` (`cargo build --release --bin reflexdb-bench-ui`, then the "Engine shootout"
-tab). All three engines ran **at the same time**, each in its own Docker container, persistence
-off, on loopback. `small-mixed` is 70% GET / 30% SET over a 1,000-key keyspace; `hot-key` is
-GET/INCR on one shared key. Images: `redis:7-alpine`,
-`docker.dragonflydb.io/dragonflydb/dragonfly:latest`, and `reflexdb-bench:latest` (this repo,
-`Dockerfile.bench`). Dragonfly's thread count was capped to fit its own per-thread memory
-requirement (see the comment in `run_shootout_engine`); at the memory level used in the multi-core
-pass below it got to use all 4 threads.
+Runs on 2026-10-30 used the current working tree, `benchmarks/run.py`, and a freshly built
+ReflexDB image. Host: arm64 macOS 26.6, 10 logical CPUs, Docker Desktop 29.8. Persistence was off;
+each engine ran **alone** to avoid CPU oversubscription. Both CPU settings used 2 GiB memory,
+16 clients, 1,000 keys, 5 seconds per case, and identical workloads. Dragonfly used 1 or 4
+proactor threads to match its CPU limit. Images: `redis:7-alpine`, Dragonfly `latest`, and
+ReflexDB built from this checkout. Values are operations/second from one run; all reported zero
+client errors.
 
-### Single-core (`--cpus 1`, `--memory 512m`, 16 clients, 8s/run)
+| Workload | CPUs | Pipeline 1: Redis / Dragonfly / ReflexDB | Pipeline 16: Redis / Dragonfly / ReflexDB |
+|---|---:|---:|---:|
+| small-mixed | 1 | 19,464 / 19,547 / **20,630** | **177,530** / 175,716 / 168,818 |
+| small-mixed | 4 | **20,046** / 18,341 / 19,369 | **178,679** / 170,944 / 174,401 |
+| hot-key | 1 | 20,800 / 19,657 / **21,184** | **193,896** / 192,020 / 192,512 |
+| hot-key | 4 | **20,697** / 20,142 / 19,798 | **195,523** / 183,525 / 187,850 |
 
-| Workload | Pipeline | Engine | Ops/s | p50 | p99 | p999 |
-|---|---:|---|---:|---:|---:|---:|
-| small-mixed | 1 | **ReflexDB** | **6,814** | 2.10ms | 6.29ms | 15.2ms |
-| small-mixed | 1 | Redis | 6,810 | 2.08ms | 6.18ms | 19.4ms |
-| small-mixed | 1 | Dragonfly | 4,719 | 2.55ms | 13.1ms | 30.3ms |
-| small-mixed | 16 | **ReflexDB** | **94,297** | 2.35ms | 8.18ms | 16.1ms |
-| small-mixed | 16 | Redis | 93,084 | 2.37ms | 7.86ms | 17.7ms |
-| small-mixed | 16 | Dragonfly | 57,766 | 3.17ms | 18.4ms | 37.0ms |
-| hot-key | 1 | **ReflexDB** | **6,325** | 2.22ms | 6.60ms | 25.2ms |
-| hot-key | 1 | Redis | 6,218 | 2.23ms | 7.12ms | 30.9ms |
-| hot-key | 1 | Dragonfly | 4,966 | 2.45ms | 12.2ms | 24.3ms |
-| hot-key | 16 | Redis | **89,462** | 2.55ms | 7.53ms | 14.6ms |
-| hot-key | 16 | ReflexDB | 88,851 | 2.52ms | 8.61ms | 19.2ms |
-| hot-key | 16 | Dragonfly | 48,377 | 3.92ms | 20.0ms | 34.5ms |
+Pipeline depth 16 delivered about 8–10× the throughput of pipeline depth 1 in these tests.
+Changing the CPU cap from 1 to 4 produced small, mixed changes rather than a consistent gain.
+ReflexDB led two of four cases at 1 CPU; Redis led all four at 4 CPUs. These are single runs,
+so repeat them before drawing firm conclusions.
 
-### Multi-core (`--cpus 4`, `--memory 2048m`, 32 clients, 8s/run)
+Caveats:
 
-| Workload | Pipeline | Engine | Ops/s | p50 | p99 | p999 |
-|---|---:|---|---:|---:|---:|---:|
-| small-mixed | 1 | **ReflexDB** | **6,464** | 4.45ms | 16.3ms | 30.5ms |
-| small-mixed | 1 | Redis | 5,986 | 4.71ms | 18.3ms | 37.0ms |
-| small-mixed | 1 | Dragonfly | 4,873 | 5.29ms | 27.0ms | 54.8ms |
-| small-mixed | 16 | **ReflexDB** | **85,823** | 5.13ms | 19.9ms | 45.1ms |
-| small-mixed | 16 | Redis | 80,701 | 5.45ms | 21.7ms | 47.6ms |
-| small-mixed | 16 | Dragonfly | 57,335 | 7.42ms | 33.4ms | 61.8ms |
-| hot-key | 1 | **ReflexDB** | **6,406** | 4.59ms | 12.4ms | 23.9ms |
-| hot-key | 1 | Redis | 6,165 | 4.74ms | 14.2ms | 20.1ms |
-| hot-key | 1 | Dragonfly | 5,725 | 4.82ms | 20.2ms | 36.1ms |
-| hot-key | 16 | **ReflexDB** | **84,521** | 5.20ms | 18.9ms | 38.3ms |
-| hot-key | 16 | Redis | 78,713 | 5.56ms | 21.0ms | 51.4ms |
-| hot-key | 16 | Dragonfly | 68,657 | 6.29ms | 26.2ms | 51.5ms |
+- **One run per case, one host.** Results can vary; rerun with `--runs 5` or more before drawing
+  firm conclusions.
+- Engines ran one at a time to keep the 4-CPU tests from oversubscribing the host.
+- Redis and Dragonfly used default configuration apart from persistence being disabled and
+  Dragonfly's thread count being set to 1 / 4 to match the CPU limit. ReflexDB
+  used its default settings with `maxmemory`, tiering, history, and replication off.
+- There was no persistence, large-value workload, RSS/bytes-per-key, or disk comparison. See
+  "Remaining measurement gaps" below.
 
-ReflexDB led throughput in 11 of 12 workload/pipeline/scenario combinations in these two passes
-(Redis edged it out on `hot-key` pipeline 16 at single-core, by under 1% — noise). Margins over
-Redis were mostly small (1–8%, likely partly noise at this sample size); margins over Dragonfly
-were larger and grew with concurrency (roughly 30–55% single-core, 10–40% at 4 cores — Dragonfly
-narrowed the gap once it could actually use more threads, as expected for an engine built around
-multi-core sharding).
-
-Caveats that matter before repeating this claim anywhere external:
-
-- **One run per scenario, single machine.** No repeated runs, no confidence interval, no other
-  machine/OS/kernel. Re-run with `runs` > 1 and compare the spread before trusting any specific
-  percentage.
-- **All three ran concurrently** within each pass (by design, to finish faster) — they shared real
-  host CPU/memory bandwidth while all three were under load, so "nothing else was running" is not
-  true here. Run them one at a time (sequentially) for a cleaner isolated comparison.
-- **Default/out-of-the-box config only** for Redis and Dragonfly — no tuning, and ReflexDB's own
-  `maxmemory`/tiering, history, and replication were all off.
-- **Dragonfly's thread count was explicitly capped** to fit the memory budget (see above) rather
-  than left to its own cgroup-derived default; that cap is what let it start at all under tight
-  memory, but it also means its multi-core result here reflects our chosen cap, not necessarily
-  its best possible tuning.
-- **No persistence on any engine**, no large values, no RSS/bytes-per-key/disk comparison. See
-  "Remaining measurement gaps" below for what this does not cover.
-
-Reproduce or re-run this yourself: `cargo build --release --bin reflexdb-bench-ui`, run it, open
-the **Engine shootout** tab (needs Docker, and `docker build -f Dockerfile.bench -t
-reflexdb-bench:latest .` done once).
+Rebuild ReflexDB with `docker build -f Dockerfile.bench -t reflexdb-bench:latest .`, then run
+`benchmarks/run.py` against each engine separately using the settings above. The UI's **Engine
+shootout** tab runs all selected engines concurrently, so its results can differ under host load.
 
 ## Remaining measurement gaps
 

@@ -26,7 +26,10 @@ struct RdbFile {
     databases: Vec<Vec<RdbEntry>>,
 }
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+const LEGACY_FORMAT_VERSION: u32 = 1;
+const COMPRESSED_MAGIC: &[u8; 5] = b"RFXZ1";
+const MAX_RDB_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Serialize every database's live entries to bytes — the same payload
 /// `save` writes to disk, but usable directly over the wire (e.g. the
@@ -60,12 +63,21 @@ pub fn serialize(store: &Store) -> io::Result<Vec<u8>> {
 /// every legitimate RDB load/`PSYNC` resync would fail to parse, not just
 /// malicious payloads.
 pub fn deserialize(payload: &[u8], store: &Store) -> io::Result<()> {
+    let decoded;
+    let payload = if let Some(compressed) = payload.strip_prefix(COMPRESSED_MAGIC) {
+        decoded = zstd::bulk::decompress(compressed, MAX_RDB_SIZE as usize).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid compressed RDB: {e}"))
+        })?;
+        decoded.as_slice()
+    } else {
+        payload
+    };
     let file: RdbFile = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(payload.len() as u64)
         .deserialize(payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    if file.version != FORMAT_VERSION {
+    if file.version != FORMAT_VERSION && file.version != LEGACY_FORMAT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported RDB format version {}", file.version),
@@ -93,7 +105,12 @@ fn write_payload(path: &Path, payload: &[u8]) -> io::Result<()> {
         Some(dir) => dir.join(format!("temp-{}.rdb", std::process::id())),
         None => PathBuf::from(format!("temp-{}.rdb", std::process::id())),
     };
-    fs::write(&tmp_path, payload)?;
+    let compressed = zstd::bulk::compress(payload, 3)
+        .map_err(|e| io::Error::other(format!("compress RDB snapshot: {e}")))?;
+    let mut framed = Vec::with_capacity(COMPRESSED_MAGIC.len() + compressed.len());
+    framed.extend_from_slice(COMPRESSED_MAGIC);
+    framed.extend_from_slice(&compressed);
+    fs::write(&tmp_path, framed)?;
     fs::rename(&tmp_path, path)
 }
 
@@ -123,7 +140,6 @@ pub fn load(path: &Path, store: &Store) -> io::Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    const MAX_RDB_SIZE: u64 = 512 * 1024 * 1024;
     let file = fs::File::open(path)?;
     let size = file.metadata()?.len();
     if size > MAX_RDB_SIZE {
@@ -188,6 +204,22 @@ mod tests {
             bincode::serialize(&RdbFile { version: FORMAT_VERSION + 1, databases: vec![] }).unwrap();
         let error = deserialize(&unsupported, &store).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn deserialize_accepts_legacy_uncompressed_format() {
+        let payload = bincode::serialize(&RdbFile {
+            version: LEGACY_FORMAT_VERSION,
+            databases: vec![vec![RdbEntry {
+                key: B::from("legacy"),
+                value: Value::String(B::from("value")),
+                ttl_ms: None,
+            }]],
+        })
+        .unwrap();
+        let restored = Store::new(1);
+        deserialize(&payload, &restored).unwrap();
+        assert_eq!(restored.db(0).unwrap().get(b"legacy"), Some(Value::String(B::from("value"))));
     }
 
     /// `Value::Stream` carries consumer-group state (`ConsumerGroup`/

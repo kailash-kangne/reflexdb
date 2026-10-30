@@ -12,6 +12,7 @@ papaya.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 bincode.workspace = true

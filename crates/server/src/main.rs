@@ -105,9 +105,16 @@ async fn main() -> std::io::Result<()> {
             let mut tick = tokio::time::interval(Duration::from_millis(tick_ms));
             loop {
                 tick.tick().await;
-                ctx.store.active_expire_cycle(20);
-                ctx.run_eviction_tick();
-                ctx.run_due_scheduled();
+                let maintenance_ctx = ctx.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    maintenance_ctx.store.active_expire_cycle(20);
+                    maintenance_ctx.run_eviction_tick();
+                    maintenance_ctx.run_due_scheduled();
+                })
+                .await
+                {
+                    tracing::warn!(%error, "maintenance task failed");
+                }
             }
         });
     }
@@ -131,7 +138,15 @@ async fn main() -> std::io::Result<()> {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 let cutoff = now_ms.saturating_sub(retention_ms);
-                let removed = ctx.history_sweep(cutoff);
+                let sweep_ctx = ctx.clone();
+                let removed = match tokio::task::spawn_blocking(move || sweep_ctx.history_sweep(cutoff)).await
+                {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        tracing::warn!(%error, "history sweep task failed");
+                        0
+                    }
+                };
                 if removed > 0 {
                     tracing::debug!(removed, "swept expired history versions");
                 }
@@ -147,7 +162,10 @@ async fn main() -> std::io::Result<()> {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tick.tick().await;
-                ctx.aof_fsync();
+                let fsync_ctx = ctx.clone();
+                if let Err(error) = tokio::task::spawn_blocking(move || fsync_ctx.aof_fsync()).await {
+                    tracing::warn!(%error, "AOF fsync enqueue task failed");
+                }
             }
         });
     }
@@ -283,10 +301,15 @@ where
 
     let mut state = ClientState::with_id(id, ctx.requirepass.is_some());
     let mut out = BytesMut::new();
+    let mut replica_pushes: Option<tokio::sync::mpsc::Receiver<commands::ReplicaMessage>> = None;
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(25)), if ctx.is_slow_client(id) => {
+            _ = tokio::time::sleep(Duration::from_millis(25)), if ctx.is_slow_client(id) && !ctx.has_replica_client(id) => {
+                return Ok(());
+            }
+            _ = tokio::time::sleep(ctx.slow_replica_remaining(id).unwrap_or(Duration::from_secs(5))), if ctx.is_slow_replica(id) => {
+                tracing::debug!(client_id = id, "disconnecting replica after its output buffer overflowed");
                 return Ok(());
             }
             // Pub/Sub message pushed from another connection.
@@ -294,6 +317,15 @@ where
                 out.clear();
                 resp::encode_reply(push.as_ref(), state.protocol, &mut out);
                 write_half.write_all(&out).await?;
+            }
+            replica_push = next_replica_push(&mut replica_pushes) => {
+                if let Some(push) = replica_push {
+                    out.clear();
+                    resp::encode_reply(push.value.as_ref(), state.protocol, &mut out);
+                    write_half.write_all(&out).await?;
+                } else {
+                    return Ok(());
+                }
             }
             // One of this connection's own `LIVE` subscriptions changed —
             // fetch its latest cached result and push it. `ctx.live_events`
@@ -346,7 +378,12 @@ where
                         // retry, so reply order on the wire still matches
                         // request order.
                         let req_for_retry = if might_need_retry(&req) { Some(req.clone()) } else { None };
-                        match dispatch(&ctx, &mut state, req) {
+                        let is_psync = req.first().is_some_and(|name| name.eq_ignore_ascii_case(b"PSYNC"));
+                        let outcome = dispatch_offloaded(ctx.clone(), &mut state, req).await;
+                        if is_psync {
+                            replica_pushes = ctx.take_replica_receiver(id);
+                        }
+                        match outcome {
                             Outcome::Reply(value) => resp::encode_reply(&value, state.protocol, &mut out),
                             Outcome::Multi(values) => {
                                 for value in &values {
@@ -458,12 +495,64 @@ where
     }
 }
 
+async fn next_replica_push(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<commands::ReplicaMessage>>,
+) -> Option<commands::ReplicaMessage> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Run persistence writes and snapshot commands on Tokio's blocking pool.
+/// Tier storage I/O yields the worker at the Fjall/keyspace boundary instead,
+/// so RAM-hit commands avoid a per-command pool handoff.
+pub(crate) async fn dispatch_offloaded(
+    ctx: Arc<ServerContext>,
+    state: &mut ClientState,
+    req: resp::Request,
+) -> Outcome {
+    let offload = ((ctx.aof_enabled() || ctx.history_enabled()) && commands::request_may_write(&req))
+        || req.first().is_some_and(|name| {
+            matches!(
+                name.to_ascii_uppercase().as_slice(),
+                b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF" | b"WAITAOF" | b"EXEC"
+            )
+        });
+    if !offload {
+        return dispatch(&ctx, state, req);
+    }
+
+    // While the owned state is on the blocking pool, this placeholder is
+    // never observed by another task; the connection loop awaits completion.
+    // Preserve protocol so a worker panic can still close cleanly.
+    let mut placeholder = ClientState::with_id(state.id, ctx.requirepass.is_some());
+    placeholder.protocol = state.protocol;
+    let owned_state = std::mem::replace(state, placeholder);
+    match tokio::task::spawn_blocking(move || {
+        let mut owned_state = owned_state;
+        let outcome = dispatch(&ctx, &mut owned_state, req);
+        (owned_state, outcome)
+    })
+    .await
+    {
+        Ok((owned_state, outcome)) => {
+            *state = owned_state;
+            outcome
+        }
+        Err(error) => {
+            tracing::error!(%error, "blocking command dispatch failed");
+            Outcome::CloseConnection(resp::Value::error("ERR blocking command dispatch failed"))
+        }
+    }
+}
+
 /// Repeatedly wait on a `GET ... SINGLEFLIGHT` lease and retry the original
 /// request, until either a real value comes back (the leaseholder `SET` the
 /// key, or this caller became the new leaseholder after the old lease
 /// expired) or `singleflight_max_wait` is exceeded.
 async fn resolve_singleflight(
-    ctx: &ServerContext,
+    ctx: &Arc<ServerContext>,
     state: &mut ClientState,
     original_req: resp::Request,
     mut lease: std::sync::Arc<SingleFlightLease>,
@@ -481,7 +570,7 @@ async fn resolve_singleflight(
         if tokio::time::Instant::now() >= deadline {
             return resp::Value::error("ERR SINGLEFLIGHT wait timed out");
         }
-        match dispatch(ctx, state, original_req.clone()) {
+        match dispatch_offloaded(ctx.clone(), state, original_req.clone()).await {
             Outcome::Reply(v) => return v,
             Outcome::Multi(mut vs) => return vs.pop().unwrap_or(resp::Value::NullBulk),
             Outcome::CloseConnection(v) => return v,
@@ -505,7 +594,7 @@ async fn resolve_singleflight(
 /// `resolve_wait`. `deadline: None` means "block forever" (the `BLPOP`-
 /// family's `timeout 0`).
 async fn resolve_block_wait(
-    ctx: &ServerContext,
+    ctx: &Arc<ServerContext>,
     state: &mut ClientState,
     original_req: resp::Request,
     mut deadline: Option<tokio::time::Instant>,
@@ -531,7 +620,7 @@ async fn resolve_block_wait(
             }
             None => ctx.blocking_notify.notified().await,
         }
-        match dispatch(ctx, state, original_req.clone()) {
+        match dispatch_offloaded(ctx.clone(), state, original_req.clone()).await {
             Outcome::Reply(v) => return v,
             Outcome::Multi(mut vs) => return vs.pop().unwrap_or(resp::Value::NullBulk),
             Outcome::CloseConnection(v) => return v,

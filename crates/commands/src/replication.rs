@@ -15,11 +15,13 @@
 //! crate's background supervisor (which does have the `Arc`) watches that
 //! epoch and owns the actual TCP connection to the primary.
 
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use tokio::sync::mpsc;
 
 use crate::dispatch::{err, reply, wrong_args, ClientState, Outcome, ServerContext};
 use resp::Value;
@@ -28,22 +30,67 @@ use resp::Value;
 pub struct ReplicaState {
     pub acked_offset: AtomicU64,
     pub last_db: Mutex<Option<usize>>,
+    tx: mpsc::Sender<ReplicaMessage>,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+pub struct ReplicaMessage {
+    pub value: Arc<Value>,
+    bytes: usize,
+    queued_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for ReplicaMessage {
+    fn drop(&mut self) {
+        self.queued_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+pub(crate) const REPLICA_QUEUE_CAPACITY: usize = 32_768;
+pub(crate) const REPLICA_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const REPLICA_SLOW_DISCONNECT_DELAY: Duration = Duration::from_secs(5);
+
+fn decimal_len(mut n: usize) -> usize {
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+fn resp_array_size(parts: &[Bytes]) -> usize {
+    parts.iter().fold(1 + decimal_len(parts.len()) + 2, |size, part| {
+        size.saturating_add(1 + decimal_len(part.len()) + 2 + part.len() + 2)
+    })
 }
 
 impl ServerContext {
     pub(crate) fn register_replica(&self, client_id: u64) {
+        let (tx, rx) = mpsc::channel(REPLICA_QUEUE_CAPACITY);
+        self.replica_receivers.insert(client_id, Mutex::new(Some(rx)));
         self.replicas.insert(
             client_id,
             ReplicaState {
                 acked_offset: AtomicU64::new(self.master_repl_offset.load(Ordering::Relaxed)),
                 last_db: Mutex::new(None),
+                tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
             },
         );
     }
 
-    /// Fan a write command out to every connected replica, reusing the same
-    /// per-client push channel pub/sub and LIVE already push through.
-    /// Prefixes a `SELECT` whenever a given replica's last-sent db differs,
+    pub fn take_replica_receiver(&self, client_id: u64) -> Option<mpsc::Receiver<ReplicaMessage>> {
+        self.replica_receivers.get(&client_id).and_then(|rx| rx.lock().unwrap().take())
+    }
+
+    pub fn has_replica_client(&self, client_id: u64) -> bool {
+        self.replicas.contains_key(&client_id)
+    }
+
+    /// Fan a write command out to every connected replica through its larger,
+    /// dedicated bounded channel. Prefixes a `SELECT` whenever a given
+    /// replica's last-sent db differs,
     /// same trick the AOF writer uses.
     pub(crate) fn replicate(&self, db_index: usize, req: &[Bytes]) {
         if self.replicas.is_empty() {
@@ -51,16 +98,35 @@ impl ServerContext {
         }
         self.master_repl_offset.fetch_add(1, Ordering::Relaxed);
         for entry in self.replicas.iter() {
+            let replica = entry.value();
             let mut last_db = entry.last_db.lock().unwrap();
             if *last_db != Some(db_index) {
-                let select =
-                    Value::Array(vec![Value::bulk(&b"SELECT"[..]), Value::bulk(db_index.to_string())]);
-                self.push_to(*entry.key(), select);
+                let db = Bytes::from(db_index.to_string());
+                let select = Value::Array(vec![Value::bulk(&b"SELECT"[..]), Value::bulk(db.clone())]);
+                self.push_replica(
+                    *entry.key(),
+                    replica,
+                    select,
+                    resp_array_size(&[Bytes::from_static(b"SELECT"), db]),
+                );
                 *last_db = Some(db_index);
             }
-            drop(last_db);
             let command = Value::Array(req.iter().cloned().map(Value::bulk).collect());
-            self.push_to(*entry.key(), command);
+            self.push_replica(*entry.key(), replica, command, resp_array_size(req));
+        }
+    }
+
+    fn push_replica(&self, client_id: u64, replica: &ReplicaState, value: Value, bytes: usize) {
+        let current = replica.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if current.saturating_add(bytes) > REPLICA_QUEUE_MAX_BYTES {
+            replica.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            self.slow_replicas.entry(client_id).or_insert_with(Instant::now);
+            return;
+        }
+        let message =
+            ReplicaMessage { value: Arc::new(value), bytes, queued_bytes: replica.queued_bytes.clone() };
+        if replica.tx.try_send(message).is_err() {
+            self.slow_replicas.entry(client_id).or_insert_with(Instant::now);
         }
     }
 

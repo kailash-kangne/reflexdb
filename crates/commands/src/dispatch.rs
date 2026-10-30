@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use keyspace::{Store, Ttl, Value as KVal};
+use keyspace::{Db, Store, Ttl, Value as KVal};
 use rand::seq::SliceRandom;
 use resp::{Protocol, Request, Value};
 use tokio::sync::mpsc::Sender;
@@ -75,6 +75,73 @@ fn low_watermark(limit: u64) -> u64 {
     (limit as f64 * EVICTION_LOW_WATERMARK) as u64
 }
 
+/// Keep the coldest `limit` keys under a database's eviction policy. Shared
+/// by hard eviction and RAM-to-tier movement so both paths use the same
+/// eligibility and ranking. `NoEviction` still allows tier spill (which
+/// preserves data) and uses LRU; it only disables destructive eviction.
+fn order_eviction_candidates(
+    db: &Db,
+    keys: Vec<Bytes>,
+    policy: MaxMemoryPolicy,
+    limit: usize,
+    rng: &mut impl rand::Rng,
+) -> Vec<Bytes> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let candidates = if policy.volatile_only() {
+        keys.into_iter().filter(|key| matches!(db.ttl(key), Ttl::Expires(_))).collect()
+    } else {
+        keys
+    };
+    match policy {
+        MaxMemoryPolicy::AllKeysRandom | MaxMemoryPolicy::VolatileRandom => {
+            if limit == 1 {
+                return candidates.choose(rng).cloned().into_iter().collect();
+            }
+            let mut candidates = candidates;
+            candidates.shuffle(rng);
+            candidates.truncate(limit);
+            candidates
+        }
+        MaxMemoryPolicy::NoEviction | MaxMemoryPolicy::AllKeysLru | MaxMemoryPolicy::VolatileLru => {
+            let mut ranked: Vec<_> = candidates
+                .into_iter()
+                .filter_map(|key| db.access_stats(&key).map(|(last, _)| (key, last)))
+                .collect();
+            sort_coldest(&mut ranked, limit);
+            ranked.into_iter().map(|(key, _)| key).collect()
+        }
+        MaxMemoryPolicy::AllKeysLfu | MaxMemoryPolicy::VolatileLfu => {
+            let mut ranked: Vec<_> = candidates
+                .into_iter()
+                .filter_map(|key| db.access_stats(&key).map(|(_, count)| (key, count)))
+                .collect();
+            sort_coldest(&mut ranked, limit);
+            ranked.into_iter().map(|(key, _)| key).collect()
+        }
+        MaxMemoryPolicy::VolatileTtl => {
+            let mut ranked: Vec<_> = candidates
+                .into_iter()
+                .filter_map(|key| match db.ttl(&key) {
+                    Ttl::Expires(remaining) => Some((key, remaining)),
+                    _ => None,
+                })
+                .collect();
+            sort_coldest(&mut ranked, limit);
+            ranked.into_iter().map(|(key, _)| key).collect()
+        }
+    }
+}
+
+fn sort_coldest<T: Ord + Copy>(ranked: &mut Vec<(Bytes, T)>, limit: usize) {
+    if ranked.len() > limit {
+        ranked.select_nth_unstable_by_key(limit - 1, |(_, rank)| *rank);
+        ranked.truncate(limit);
+    }
+    ranked.sort_unstable_by_key(|(_, rank)| *rank);
+}
+
 /// Hard per-tick cap on how many keys one eviction pass will move/drop,
 /// regardless of how far over budget things are — the 100ms background
 /// tick (`server/src/main.rs`) also runs TTL active-expire and scheduled
@@ -137,6 +204,11 @@ pub struct ServerContext {
     /// triggered them.
     pub(crate) clients: DashMap<u64, Sender<Arc<Value>>>,
     pub(crate) slow_clients: DashMap<u64, ()>,
+    pub(crate) slow_replicas: DashMap<u64, Instant>,
+    pub(crate) replica_receivers: DashMap<
+        u64,
+        std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<crate::replication::ReplicaMessage>>>,
+    >,
     pub(crate) channels: DashMap<Bytes, HashSet<u64>>,
     pub(crate) patterns: DashMap<Bytes, HashSet<u64>>,
     /// fingerprint -> subscription (one per distinct `LIVE <cmd> <args>`).
@@ -301,6 +373,8 @@ impl ServerContext {
             next_client_id: AtomicU64::new(1),
             clients: DashMap::new(),
             slow_clients: DashMap::new(),
+            slow_replicas: DashMap::new(),
+            replica_receivers: DashMap::new(),
             channels: DashMap::new(),
             patterns: DashMap::new(),
             live_subs: DashMap::new(),
@@ -458,6 +532,10 @@ impl ServerContext {
         self.aof.is_some()
     }
 
+    pub fn history_enabled(&self) -> bool {
+        self.history.is_some()
+    }
+
     /// Blocks until every `GETAT`/`HISTORY` version recorded so far has
     /// actually landed on disk. Not used on any request path (recording is
     /// fire-and-forget by design, see `persistence::history`'s docs) —
@@ -552,6 +630,16 @@ impl ServerContext {
     /// which rejects writes instead of evicting) is the actual hard
     /// backstop — set it alongside these if "never OOM" is the goal.
     pub fn run_eviction_tick(&self) -> usize {
+        // The server calls this on every maintenance tick. With all memory
+        // controls disabled there is no consumer for an O(n) size estimate,
+        // so keep the default path from walking the entire keyspace 10x/sec.
+        if self.tiered_disk_limit.is_none()
+            && self.tiered_limit.is_none()
+            && self.effective_maxmemory().is_none()
+        {
+            return 0;
+        }
+
         let mut evicted = 0;
 
         if let Some(limit) = self.tiered_disk_limit {
@@ -572,12 +660,11 @@ impl ServerContext {
         if let Some(limit) = self.effective_maxmemory() {
             if used as u64 > limit && self.effective_maxmemory_policy() != MaxMemoryPolicy::NoEviction {
                 let target = low_watermark(limit);
-                for _ in 0..MAX_EVICTIONS_PER_TICK {
-                    if self.refresh_memory_usage() as u64 <= target || !self.delete_one() {
-                        break;
-                    }
-                    evicted += 1;
-                }
+                evicted += self.drain_hard_eviction(target, used as u64);
+                // Reconcile once after the batch for concurrent writes and
+                // approximate-size drift; never rescan the whole store for
+                // every victim.
+                self.refresh_memory_usage();
             }
         }
 
@@ -594,10 +681,12 @@ impl ServerContext {
     /// `target` or `MAX_EVICTIONS_PER_TICK` keys have moved. Takes one key
     /// snapshot per database up front (not one per key moved, the way a
     /// naive "pick one, repeat" loop would) and tracks the running total
-    /// locally via `evict_to_tier_sized`'s freed-bytes return — so this is
-    /// O(total RAM keys + keys moved), not O(total RAM keys * keys moved),
-    /// which matters once `MAX_EVICTIONS_PER_TICK` is in the thousands.
+    /// locally via `evict_to_tier_sized`'s freed-bytes return. Ranked
+    /// policies use linear-time selection for at most
+    /// `MAX_EVICTIONS_PER_TICK` candidates, then sort just that bounded set;
+    /// this avoids rescanning all keys once per move.
     fn drain_to_tier(&self, target: u64) -> usize {
+        let policy = self.effective_maxmemory_policy();
         let mut rng = rand::thread_rng();
         let mut used = self.refresh_memory_usage() as u64;
         let mut moved = 0;
@@ -606,8 +695,8 @@ impl ServerContext {
                 break;
             }
             let db = self.store.db(db_index).expect("index within store.len()");
-            let mut keys = db.ram_keys_snapshot();
-            keys.shuffle(&mut rng);
+            let remaining = MAX_EVICTIONS_PER_TICK - moved;
+            let keys = order_eviction_candidates(db, db.ram_keys_snapshot(), policy, remaining, &mut rng);
             for key in keys {
                 if used <= target || moved >= MAX_EVICTIONS_PER_TICK {
                     break;
@@ -620,6 +709,39 @@ impl ServerContext {
         }
         self.approx_memory.store(used as usize, Ordering::Relaxed);
         moved
+    }
+
+    /// Delete enough RAM keys to reach `target`, selecting and ranking at
+    /// most one bounded candidate batch per database instead of rebuilding
+    /// every database's key snapshot once per victim.
+    fn drain_hard_eviction(&self, target: u64, mut estimated_used: u64) -> usize {
+        let policy = self.effective_maxmemory_policy();
+        if policy == MaxMemoryPolicy::NoEviction {
+            return 0;
+        }
+        let mut rng = rand::thread_rng();
+        let mut evicted = 0;
+        for db_index in 0..self.store.len() {
+            if estimated_used <= target || evicted >= MAX_EVICTIONS_PER_TICK {
+                break;
+            }
+            let db = self.store.db(db_index).expect("index within store.len()");
+            let remaining = MAX_EVICTIONS_PER_TICK - evicted;
+            let candidates =
+                order_eviction_candidates(db, db.ram_keys_snapshot(), policy, remaining, &mut rng);
+            for victim in candidates {
+                if estimated_used <= target || evicted >= MAX_EVICTIONS_PER_TICK {
+                    break;
+                }
+                let (removed, freed) = db.del_sized(std::slice::from_ref(&victim));
+                if removed > 0 {
+                    estimated_used = estimated_used.saturating_sub(freed as u64);
+                    evicted += 1;
+                    on_key_changed(self, db_index, victim);
+                }
+            }
+        }
+        evicted
     }
 
     /// Drops keys from the disk tier outright, oldest-evicted-first (see
@@ -646,55 +768,27 @@ impl ServerContext {
         dropped
     }
 
-    /// Delete one key chosen per `maxmemory_policy`. Returns `false` if
-    /// there's no eligible key left (or the policy is `NoEviction`).
-    fn delete_one(&self) -> bool {
+    /// Test helper for one victim. Production hard eviction batches candidate
+    /// selection through `drain_hard_eviction`.
+    #[cfg(test)]
+    fn delete_one(&self) -> Option<usize> {
         let policy = self.effective_maxmemory_policy();
         let mut rng = rand::thread_rng();
         for db_index in 0..self.store.len() {
             let db = self.store.db(db_index).expect("index within store.len()");
-            let keys = db.ram_keys_snapshot();
-            let candidates: Vec<Bytes> = if policy == MaxMemoryPolicy::NoEviction {
-                return false;
-            } else if policy.volatile_only() {
-                keys.into_iter().filter(|k| matches!(db.ttl(k), Ttl::Expires(_))).collect()
-            } else {
-                keys
-            };
-            if candidates.is_empty() {
-                continue;
+            if policy == MaxMemoryPolicy::NoEviction {
+                return None;
             }
-            let victim = match policy {
-                MaxMemoryPolicy::AllKeysRandom | MaxMemoryPolicy::VolatileRandom => {
-                    candidates.choose(&mut rng).cloned()
+            let candidates = order_eviction_candidates(db, db.ram_keys_snapshot(), policy, 1, &mut rng);
+            if let Some(victim) = candidates.into_iter().next() {
+                let (removed, freed) = db.del_sized(std::slice::from_ref(&victim));
+                if removed > 0 {
+                    on_key_changed(self, db_index, victim);
+                    return Some(freed);
                 }
-                MaxMemoryPolicy::AllKeysLru | MaxMemoryPolicy::VolatileLru => candidates
-                    .into_iter()
-                    .filter_map(|k| db.access_stats(&k).map(|(last, _)| (k, last)))
-                    .min_by_key(|(_, last)| *last)
-                    .map(|(k, _)| k),
-                MaxMemoryPolicy::AllKeysLfu | MaxMemoryPolicy::VolatileLfu => candidates
-                    .into_iter()
-                    .filter_map(|k| db.access_stats(&k).map(|(_, count)| (k, count)))
-                    .min_by_key(|(_, count)| *count)
-                    .map(|(k, _)| k),
-                MaxMemoryPolicy::VolatileTtl => candidates
-                    .into_iter()
-                    .filter_map(|k| match db.ttl(&k) {
-                        Ttl::Expires(d) => Some((k, d)),
-                        _ => None,
-                    })
-                    .min_by_key(|(_, d)| *d)
-                    .map(|(k, _)| k),
-                MaxMemoryPolicy::NoEviction => unreachable!("handled above"),
-            };
-            if let Some(victim) = victim {
-                db.del(std::slice::from_ref(&victim));
-                on_key_changed(self, db_index, victim);
-                return true;
             }
         }
-        false
+        None
     }
 
     /// Register a new connection's outbound push channel, returning its id
@@ -713,6 +807,8 @@ impl ServerContext {
     pub fn disconnect_client(&self, id: u64) {
         self.clients.remove(&id);
         self.slow_clients.remove(&id);
+        self.slow_replicas.remove(&id);
+        self.replica_receivers.remove(&id);
         self.replicas.remove(&id);
         self.client_names.remove(&id);
         let mut tracking_removed = 0usize;
@@ -769,13 +865,27 @@ impl ServerContext {
     pub(crate) fn push_to(&self, client_id: u64, value: Value) {
         if let Some(sender) = self.clients.get(&client_id) {
             if sender.try_send(Arc::new(value)).is_err() {
-                self.slow_clients.insert(client_id, ());
+                if self.replicas.contains_key(&client_id) {
+                    self.slow_replicas.entry(client_id).or_insert_with(Instant::now);
+                } else {
+                    self.slow_clients.insert(client_id, ());
+                }
             }
         }
     }
 
     pub fn is_slow_client(&self, client_id: u64) -> bool {
         self.slow_clients.contains_key(&client_id)
+    }
+
+    pub fn is_slow_replica(&self, client_id: u64) -> bool {
+        self.slow_replicas.contains_key(&client_id)
+    }
+
+    pub fn slow_replica_remaining(&self, client_id: u64) -> Option<Duration> {
+        self.slow_replicas
+            .get(&client_id)
+            .map(|since| crate::replication::REPLICA_SLOW_DISCONNECT_DELAY.saturating_sub(since.elapsed()))
     }
 }
 
@@ -1770,14 +1880,10 @@ fn rename(ctx: &ServerContext, state: &ClientState, args: &[Bytes], nx: bool) ->
     if nx && key != newkey && db.with_value(newkey, |_| ()).is_some() {
         return reply(Value::Integer(0));
     }
-    let Some(value) = db.get(key) else {
+    let Some((value, expires_at)) = db.take(key) else {
         return err("ERR no such key");
     };
-    let expires_at = db.current_expiry(key).flatten();
     db.set(newkey.clone(), value, expires_at);
-    if key != newkey {
-        db.del(std::slice::from_ref(key));
-    }
     on_key_changed(ctx, state.db_index, key.clone());
     on_key_changed(ctx, state.db_index, newkey.clone());
     notify_keyspace_event(ctx, state.db_index, 'g', "rename_from", key);
@@ -2204,12 +2310,36 @@ const WRITE_COMMAND_NAMES: &[&str] = &[
 pub(crate) static WRITE_COMMANDS: std::sync::LazyLock<HashSet<&'static str>> =
     std::sync::LazyLock::new(|| WRITE_COMMAND_NAMES.iter().copied().collect());
 
+/// Whether dispatching this request can enqueue persistence work. Both the
+/// AOF and history writers use bounded synchronous channels for backpressure;
+/// the server routes these requests through `spawn_blocking` so a full queue
+/// cannot park a Tokio worker.
+pub fn request_may_write(req: &Request) -> bool {
+    let Some(command) = req.first() else { return false };
+    let name = String::from_utf8_lossy(command).to_ascii_uppercase();
+    WRITE_COMMANDS.contains(name.as_str())
+        || (name == "SORT" && req[1..].iter().any(|arg| arg.eq_ignore_ascii_case(b"STORE")))
+        || matches!(
+            name.as_str(),
+            "BLPOP" | "BRPOP" | "BLMPOP" | "BLMOVE" | "BZPOPMIN" | "BZPOPMAX" | "BZMPOP"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn req(words: &[&str]) -> Request {
         words.iter().map(|w| Bytes::copy_from_slice(w.as_bytes())).collect()
+    }
+
+    #[test]
+    fn persistence_classifier_covers_mutating_and_blocking_writes() {
+        assert!(request_may_write(&req(&["SET", "k", "v"])));
+        assert!(request_may_write(&req(&["BLPOP", "k", "0"])));
+        assert!(request_may_write(&req(&["SORT", "k", "STORE", "out"])));
+        assert!(!request_may_write(&req(&["GET", "k"])));
+        assert!(!request_may_write(&req(&["SORT", "k"])));
     }
 
     fn run(ctx: &ServerContext, state: &mut ClientState, words: &[&str]) -> Value {
@@ -3533,21 +3663,48 @@ mod tests {
     #[test]
     fn write_commands_replicate_to_connected_replicas() {
         let (ctx, mut st) = fresh();
-        let (replica_id, mut rx) = ctx.register_client();
+        let (replica_id, _client_rx) = ctx.register_client();
         ctx.register_replica(replica_id);
+        let mut rx = ctx.take_replica_receiver(replica_id).unwrap();
 
         run(&ctx, &mut st, &["SET", "k", "v"]);
 
         // First push should be a SELECT for this replica's first command...
         let first = rx.try_recv().expect("expected a SELECT push");
-        assert_eq!(first.as_ref(), &Value::Array(vec![Value::bulk(&b"SELECT"[..]), Value::bulk(&b"0"[..])]));
+        assert_eq!(
+            first.value.as_ref(),
+            &Value::Array(vec![Value::bulk(&b"SELECT"[..]), Value::bulk(&b"0"[..])])
+        );
         // ...then the replicated command itself.
         let second = rx.try_recv().expect("expected the replicated SET");
         assert_eq!(
-            second.as_ref(),
+            second.value.as_ref(),
             &Value::Array(vec![Value::bulk(&b"SET"[..]), Value::bulk(&b"k"[..]), Value::bulk(&b"v"[..])])
         );
         assert_eq!(ctx.master_repl_offset(), 1);
+    }
+
+    #[test]
+    fn replica_output_uses_a_larger_queue_than_pubsub_clients() {
+        let ctx = ServerContext::new(1, None);
+        let (replica_id, _client_rx) = ctx.register_client();
+        ctx.register_replica(replica_id);
+        let mut rx = ctx.take_replica_receiver(replica_id).unwrap();
+
+        for i in 0..1_100 {
+            ctx.replicate(
+                0,
+                &[Bytes::from_static(b"SET"), Bytes::from(i.to_string()), Bytes::from_static(b"v")],
+            );
+        }
+
+        assert!(!ctx.is_slow_client(replica_id));
+        assert!(!ctx.is_slow_replica(replica_id));
+        let mut queued = 0;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, 1_101); // first SELECT, then 1,100 writes
     }
 
     #[test]
@@ -3879,7 +4036,7 @@ mod tests {
         run(&ctx, &mut st, &["SET", "new", "v"]);
         // Touch "new" so it's more recently accessed than "old".
         run(&ctx, &mut st, &["GET", "new"]);
-        assert!(ctx.delete_one());
+        assert!(ctx.delete_one().is_some());
         assert_eq!(run(&ctx, &mut st, &["EXISTS", "old"]), Value::Integer(0));
         assert_eq!(run(&ctx, &mut st, &["EXISTS", "new"]), Value::Integer(1));
     }
@@ -3894,7 +4051,7 @@ mod tests {
         for _ in 0..5 {
             run(&ctx, &mut st, &["GET", "hot"]);
         }
-        assert!(ctx.delete_one());
+        assert!(ctx.delete_one().is_some());
         assert_eq!(run(&ctx, &mut st, &["EXISTS", "rare"]), Value::Integer(0));
         assert_eq!(run(&ctx, &mut st, &["EXISTS", "hot"]), Value::Integer(1));
     }
@@ -3909,7 +4066,7 @@ mod tests {
         run(&ctx, &mut st, &["EXPIRE", "soon", "1000"]);
         run(&ctx, &mut st, &["SET", "later", "v"]);
         run(&ctx, &mut st, &["EXPIRE", "later", "9999"]);
-        assert!(ctx.delete_one());
+        assert!(ctx.delete_one().is_some());
         // Only a volatile (has-a-TTL) key is ever a candidate, and the one
         // closest to expiring is picked over the one with more time left.
         assert_eq!(run(&ctx, &mut st, &["EXISTS", "persistent"]), Value::Integer(1));
@@ -3988,6 +4145,26 @@ mod tests {
             Value::bulk(&b"some reasonably sized value here"[..])
         );
         assert_eq!(ctx.store.db(0).unwrap().ram_keys_snapshot().len(), ram_count + 1);
+    }
+
+    #[test]
+    fn tiered_spill_uses_the_configured_lru_and_lfu_rankings() {
+        for policy in [MaxMemoryPolicy::AllKeysLru, MaxMemoryPolicy::AllKeysLfu] {
+            let tier = std::sync::Arc::new(MockTier::default());
+            let store = Store::new_with_tiering(1, tier.clone());
+            let ctx = ServerContext::with_store(store, None).with_maxmemory(None, policy);
+            let db = ctx.store.db(0).unwrap();
+            db.set(Bytes::from("cold"), KVal::String(Bytes::from("v")), None);
+            db.set(Bytes::from("hot"), KVal::String(Bytes::from("v")), None);
+            for _ in 0..4 {
+                db.with_value(b"hot", |_| ());
+            }
+
+            let used = ctx.refresh_memory_usage() as u64;
+            assert_eq!(ctx.drain_to_tier(used.saturating_sub(1)), 1);
+            assert!(tier.disk.contains_key(b"cold".as_slice()), "{policy:?} should tier cold first");
+            assert!(!tier.disk.contains_key(b"hot".as_slice()), "{policy:?} should keep hot in RAM");
+        }
     }
 
     #[test]

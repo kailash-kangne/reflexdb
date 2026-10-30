@@ -10,4 +10,5 @@ bytes.workspace = true
 serde.workspace = true
 bincode.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 keyspace = { path = "../keyspace" }

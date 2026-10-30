@@ -1,6 +1,8 @@
 //! Minimal glob matcher for `SCAN ... MATCH pattern`, supporting the subset
-//! of glob syntax: `*`, `?`, and
-//! `[...]` character classes. No backslash-escaping support yet.
+//! of glob syntax: `*`, `?`, `[...]` character classes, and `\`-escaping
+//! (matches Redis's `stringmatchlen`: `\x` matches the literal byte `x`,
+//! including escaping `*`/`?`/`[`/`\` themselves; a trailing, unpaired `\`
+//! matches itself literally).
 
 /// Returns true if `text` matches `pattern`.
 pub fn matches(pattern: &[u8], text: &[u8]) -> bool {
@@ -49,6 +51,9 @@ enum MatchStep {
 }
 
 fn match_one(pattern: &[u8], p: usize, ch: u8) -> MatchStep {
+    if pattern[p] == b'\\' {
+        return match_escaped(pattern, p, ch);
+    }
     if pattern[p] == b'?' {
         return MatchStep::Matched(p + 1);
     }
@@ -66,34 +71,79 @@ fn match_one(pattern: &[u8], p: usize, ch: u8) -> MatchStep {
     }
 }
 
+/// `pattern[p] == b'\\'`: the next byte (if any) is matched literally,
+/// bypassing any special meaning it would otherwise have (`\*`, `\?`,
+/// `\[`, `\\`). A trailing, unpaired `\` (nothing after it) matches
+/// itself literally instead of being dropped.
+fn match_escaped(pattern: &[u8], p: usize, ch: u8) -> MatchStep {
+    match pattern.get(p + 1) {
+        Some(&literal) => {
+            if literal == ch {
+                MatchStep::Matched(p + 2)
+            } else {
+                MatchStep::Mismatched
+            }
+        }
+        None => {
+            if ch == b'\\' {
+                MatchStep::Matched(p + 1)
+            } else {
+                MatchStep::Mismatched
+            }
+        }
+    }
+}
+
+/// Scans a `[...]` character class starting at `pattern[p] == b'['`.
+/// Returns `Some((hit, next_p))` for a well-formed class (one with a
+/// closing `]`), where `next_p` is the pattern index just past it, or
+/// `None` for an unterminated class — the caller then falls back to
+/// treating `pattern[p..]` as a literal tail (`MatchStep::LiteralTail`).
+/// A `\]` inside the class matches a literal `]` rather than closing it
+/// (and never starts an `a-z` range), same as `\` anywhere else.
 fn class_matches(pattern: &[u8], p: usize, ch: u8) -> Option<(bool, usize)> {
-    // pattern[p] == b'['
-    let rest = &pattern[p + 1..];
-    let close = rest.iter().position(|&b| b == b']')?;
-    let class = &rest[..close];
-    let np = p + 1 + close + 1;
-
-    let (negate, class) = match class.first() {
-        Some(b'^') => (true, &class[1..]),
-        _ => (false, class),
-    };
-
+    let mut i = p + 1;
+    let negate = pattern.get(i) == Some(&b'^');
+    if negate {
+        i += 1;
+    }
     let mut hit = false;
-    let mut i = 0;
-    while i < class.len() {
-        if i + 2 < class.len() && class[i + 1] == b'-' {
-            if class[i] <= ch && ch <= class[i + 2] {
+    loop {
+        let b = *pattern.get(i)?;
+        if b == b']' {
+            i += 1;
+            break;
+        }
+        if b == b'\\' {
+            let literal = match pattern.get(i + 1) {
+                Some(&next) => {
+                    i += 2;
+                    next
+                }
+                None => {
+                    i += 1;
+                    b'\\'
+                }
+            };
+            if literal == ch {
+                hit = true;
+            }
+            continue;
+        }
+        if pattern.get(i + 1) == Some(&b'-') && pattern.get(i + 2).is_some_and(|&c| c != b']') {
+            let (lo, hi) = (b, pattern[i + 2]);
+            if lo <= ch && ch <= hi {
                 hit = true;
             }
             i += 3;
-        } else {
-            if class[i] == ch {
-                hit = true;
-            }
-            i += 1;
+            continue;
         }
+        if b == ch {
+            hit = true;
+        }
+        i += 1;
     }
-    Some((hit != negate, np))
+    Some((hit != negate, i))
 }
 
 #[cfg(test)]
@@ -126,5 +176,30 @@ mod tests {
     fn malformed_open_class_matches_literal_bracket() {
         assert!(matches(b"[abc", b"[abc"));
         assert!(!matches(b"[abc", b"xabc"));
+    }
+
+    #[test]
+    fn backslash_escapes_special_characters() {
+        assert!(matches(b"a\\*b", b"a*b"));
+        assert!(!matches(b"a\\*b", b"axb"));
+        assert!(matches(b"a\\?b", b"a?b"));
+        assert!(matches(b"a\\[b", b"a[b"));
+        assert!(matches(b"a\\\\b", b"a\\b"));
+    }
+
+    #[test]
+    fn trailing_unpaired_backslash_matches_itself() {
+        assert!(matches(b"end\\", b"end\\"));
+        assert!(!matches(b"end\\", b"end"));
+    }
+
+    #[test]
+    fn backslash_escapes_inside_character_class() {
+        assert!(matches(b"[\\]a]", b"]"));
+        assert!(matches(b"[\\]a]", b"a"));
+        assert!(!matches(b"[\\]a]", b"b"));
+        // A lone trailing `\` inside an (unterminated) class still falls
+        // back to the literal-tail path, same as any other malformed class.
+        assert!(matches(b"[abc\\", b"[abc\\"));
     }
 }

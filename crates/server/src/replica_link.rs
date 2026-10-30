@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use commands::{dispatch, ClientState, ServerContext};
+use commands::{ClientState, ServerContext};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_stream::StreamExt;
@@ -96,7 +96,7 @@ async fn try_link_once(ctx: &Arc<ServerContext>, host: &str, port: u16, epoch: u
             frame = commands.next() => {
                 match frame {
                     Some(Ok(req)) => {
-                        dispatch(ctx, &mut scratch, req);
+                        crate::dispatch_offloaded(ctx.clone(), &mut scratch, req).await;
                         applied += 1;
                     }
                     Some(Err(e)) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),

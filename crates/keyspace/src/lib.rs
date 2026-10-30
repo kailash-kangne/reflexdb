@@ -106,6 +106,19 @@ fn saturating_deadline(dur: Duration) -> Instant {
     }
 }
 
+/// If a tiered operation contends on a synchronous lock while called from a
+/// multi-thread Tokio runtime, let the runtime replace this worker during the
+/// wait. Outside Tokio or on a current-thread runtime, preserve the normal
+/// synchronous library behavior.
+fn wait_without_blocking_tokio_worker<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     value: Value,
@@ -252,7 +265,11 @@ impl Db {
     /// writes to this `Db` through one mutex regardless of key.
     #[inline]
     fn tier_guard(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
-        self.tiering.is_some().then(|| self.tier_ops.lock())
+        self.tiering.as_ref()?;
+        Some(match self.tier_ops.try_lock() {
+            Some(guard) => guard,
+            None => wait_without_blocking_tokio_worker(|| self.tier_ops.lock()),
+        })
     }
 
     /// Like `new`, but keys evicted via `evict_to_tier` land in `handler`
@@ -375,30 +392,70 @@ impl Db {
     }
 
     pub fn del(&self, keys: &[Bytes]) -> usize {
+        self.del_sized(keys).0
+    }
+
+    /// Delete keys and report both the number removed and their approximate
+    /// RAM footprint. The byte count lets bounded eviction loops maintain a
+    /// running estimate instead of rescanning the full keyspace per key.
+    pub fn del_sized(&self, keys: &[Bytes]) -> (usize, usize) {
         let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         let mut removed = 0;
+        let mut freed = 0usize;
         for key in keys {
-            let in_ram = self.map.remove(key.as_ref(), &guard).is_some();
+            let in_ram = self.map.remove(key.as_ref(), &guard);
+            if let Some(lock) = in_ram {
+                let entry = lock.read();
+                freed = freed.saturating_add(key.len() + 48 + entry.value.approx_bytes());
+                removed += 1;
+                continue;
+            }
             // Only touch the disk tier when the key wasn't already found in
             // RAM — a tiered key and its RAM copy never coexist (`promote`
             // removes it from the tier), so there's nothing to clean up
             // there once we know it was in RAM.
-            let in_tier = !in_ram
-                && self
-                    .tiering
-                    .as_ref()
-                    .map(|h| {
-                        let was_present = h.contains(key);
-                        h.remove(key);
-                        was_present
-                    })
-                    .unwrap_or(false);
-            if in_ram || in_tier {
+            let in_tier = self
+                .tiering
+                .as_ref()
+                .map(|h| {
+                    let was_present = h.contains(key);
+                    h.remove(key);
+                    was_present
+                })
+                .unwrap_or(false);
+            if in_tier {
                 removed += 1;
             }
         }
-        removed
+        (removed, freed)
+    }
+
+    /// Remove a key from RAM and return its owned value and absolute expiry
+    /// without cloning the value. A key in the disk tier is promoted first,
+    /// matching `get`'s lookup behavior. Used by rename-style operations
+    /// that immediately install the value under a different key.
+    pub fn take(&self, key: &[u8]) -> Option<(Value, Option<Instant>)> {
+        let _tier_guard = self.tier_guard();
+        let guard = self.map.guard();
+        let Some(lock) = self.map.remove(key, &guard) else {
+            drop(guard);
+            drop(_tier_guard);
+            if self.try_promote(key) {
+                return self.take(key);
+            }
+            return None;
+        };
+
+        let mut entry = lock.write();
+        if entry.is_expired() {
+            return None;
+        }
+        // Preserve the existing access/sliding-TTL semantics of `get`.
+        entry.touch();
+        let expires_at = entry.expires_at;
+        let value = std::mem::replace(&mut entry.value, Value::String(Bytes::new()));
+        Some((value, expires_at))
     }
 
     /// Unlike `get`, doesn't promote a tiered key back into RAM just to
@@ -1017,6 +1074,19 @@ mod tests {
     }
 
     #[test]
+    fn take_moves_owned_value_and_expiry_without_leaving_source_key() {
+        let db = Db::new();
+        let expiry = Instant::now() + Duration::from_secs(30);
+        let value = Value::List(List::from(vec![Bytes::from("a"), Bytes::from("b")]));
+        db.set(Bytes::from("source"), value.clone(), Some(expiry));
+
+        let (taken, taken_expiry) = db.take(b"source").unwrap();
+        assert_eq!(taken, value);
+        assert_eq!(taken_expiry, Some(expiry));
+        assert_eq!(db.exists(&[Bytes::from("source")]), 0);
+    }
+
+    #[test]
     fn ttl_reports_persistent_and_expiring() {
         let db = Db::new();
         db.set(Bytes::from("a"), Value::String(Bytes::from("1")), None);
@@ -1074,6 +1144,16 @@ mod tests {
         assert_eq!(db.exists(&[Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]), 2);
         assert_eq!(db.del(&[Bytes::from("a"), Bytes::from("c")]), 1);
         assert_eq!(db.dbsize(), 1);
+    }
+
+    #[test]
+    fn del_sized_reports_freed_ram_footprint() {
+        let db = Db::new();
+        db.set(Bytes::from("large"), Value::String(Bytes::from(vec![b'x'; 4096])), None);
+        let (removed, freed) = db.del_sized(&[Bytes::from("large")]);
+        assert_eq!(removed, 1);
+        assert!(freed >= 4096);
+        assert_eq!(db.dbsize(), 0);
     }
 
     #[test]

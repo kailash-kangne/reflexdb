@@ -46,6 +46,18 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Keep synchronous LSM work off Tokio worker threads without paying a
+/// `spawn_blocking` task handoff for every Redis command. Call this only at
+/// the actual tier I/O boundary; RAM hits never enter it.
+fn on_blocking_thread<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 fn encode_entry(entry: &TieredEntry) -> Result<Vec<u8>, bincode::Error> {
     let mut payload = TIERED_MAGIC.to_vec();
     payload.extend_from_slice(&bincode::serialize(entry)?);
@@ -116,6 +128,44 @@ impl FjallTier {
 
 impl TieringHandler for FjallTier {
     fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String> {
+        on_blocking_thread(|| self.evict_sync(key, value, ttl))
+    }
+
+    fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
+        on_blocking_thread(|| self.promote_sync(key))
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        on_blocking_thread(|| self.contains_sync(key))
+    }
+
+    fn remove(&self, key: &[u8]) {
+        on_blocking_thread(|| self.remove_tracked(key));
+    }
+
+    fn keys_snapshot(&self) -> Vec<Bytes> {
+        on_blocking_thread(|| self.keys_snapshot_sync())
+    }
+
+    fn oldest_keys(&self, max: usize) -> Vec<Bytes> {
+        on_blocking_thread(|| self.oldest_keys_sync(max))
+    }
+
+    fn disk_usage_bytes(&self) -> Option<u64> {
+        Some(self.used_bytes.load(Ordering::Relaxed))
+    }
+
+    fn clear(&self) {
+        on_blocking_thread(|| {
+            for key in self.keys_snapshot_sync() {
+                self.remove_tracked(&key);
+            }
+        });
+    }
+}
+
+impl FjallTier {
+    fn evict_sync(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String> {
         let entry = TieredEntry {
             value: value.clone(),
             expires_at_ms: ttl.map(|d| now_ms().saturating_add(d.as_millis() as u64)),
@@ -137,7 +187,7 @@ impl TieringHandler for FjallTier {
         self._db.persist(fjall::PersistMode::SyncAll).map_err(|e| format!("persist disk tier: {e}"))
     }
 
-    fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
+    fn promote_sync(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
         let payload = match self.keyspace.get(key) {
             Ok(Some(p)) => p,
             Ok(None) => return None,
@@ -162,7 +212,7 @@ impl TieringHandler for FjallTier {
         Some((entry.value, remaining.map(Duration::from_millis)))
     }
 
-    fn contains(&self, key: &[u8]) -> bool {
+    fn contains_sync(&self, key: &[u8]) -> bool {
         let payload = match self.keyspace.get(key) {
             Ok(Some(payload)) => payload,
             _ => return false,
@@ -176,22 +226,14 @@ impl TieringHandler for FjallTier {
         }
     }
 
-    fn remove(&self, key: &[u8]) {
-        self.remove_tracked(key);
-    }
-
-    fn keys_snapshot(&self) -> Vec<Bytes> {
+    fn keys_snapshot_sync(&self) -> Vec<Bytes> {
         self.keyspace
             .iter()
             .filter_map(|guard| guard.key().ok().map(|key| Bytes::copy_from_slice(&key)))
             .collect()
     }
 
-    fn disk_usage_bytes(&self) -> Option<u64> {
-        Some(self.used_bytes.load(Ordering::Relaxed))
-    }
-
-    fn oldest_keys(&self, max: usize) -> Vec<Bytes> {
+    fn oldest_keys_sync(&self, max: usize) -> Vec<Bytes> {
         // O(tier size log(tier size)) per call — reads every entry's
         // header to sort by `evicted_at_ms`, same trade-off the
         // `maxmemory` LRU/LFU policies already make for RAM keys (fine at
@@ -238,6 +280,18 @@ mod tests {
         assert!(!tier.contains(b"k"));
         assert!(tier.promote(b"k").is_none());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tier_io_can_run_from_a_tokio_worker() {
+        let dir = temp_dir("tokio-worker");
+        let tier = FjallTier::open(&dir).unwrap();
+        let key = B::from("k");
+        let value = Value::String(B::from("v"));
+
+        tier.evict(&key, &value, None).unwrap();
+        assert_eq!(tier.promote(b"k").unwrap().0, value);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
