@@ -47,9 +47,9 @@
 //! escape hatch, used nowhere else.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Mutex;
 use std::thread;
 
@@ -124,7 +124,7 @@ struct RewriteState {
 }
 
 pub struct AofWriter {
-    tx: Mutex<Sender<Job>>,
+    tx: Mutex<SyncSender<Job>>,
     // Keeps the writer thread alive for the program's lifetime.
     _worker: thread::JoinHandle<()>,
 }
@@ -132,7 +132,7 @@ pub struct AofWriter {
 impl AofWriter {
     pub fn open(path: &Path, fsync: Fsync) -> io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(4096);
         let worker = thread::Builder::new()
             .name("reflexdb-aof-writer".into())
             .spawn(move || writer_loop(file, rx, fsync))
@@ -293,9 +293,12 @@ fn reconstruct_commands(key: &Bytes, value: &Value) -> Vec<Vec<Bytes>> {
         // elsewhere in this module. A consumer whose entries were still
         // pending across a rewrite+restart would need to re-read them via
         // `XREADGROUP ... >` as if they were new, same recovery path real
-        // Redis expects after a crashed consumer anyway (`XCLAIM`, not
-        // implemented here, is the real fix — see `keyspace::stream`'s
-        // module docs for the full list of what's cut).
+        // Redis expects after a crashed consumer anyway. `XCLAIM` is now
+        // implemented (see `keyspace::stream::Stream::claim`) and could be
+        // used here to replay each PEL entry's owner/delivery-count after
+        // the `XADD`s, same as real Redis's rewrite does — not done yet,
+        // left for whenever a design partner actually needs pending
+        // entries to survive a rewrite.
         Value::Stream(stream) => {
             let mut reqs = Vec::new();
             for (id, fields) in stream.range(keyspace::StreamId::MIN, keyspace::StreamId::MAX, None) {
@@ -332,11 +335,31 @@ fn writer_gone() -> io::Error {
 /// most one `fsync`) — this is what turns N concurrent callers into O(1)
 /// syscalls instead of N.
 fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync) {
+    const MAX_REWRITE_MIRROR_BYTES: usize = 256 * 1024 * 1024;
+    const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
     let mut last_db: Option<usize> = None;
     let mut rewrite: Option<RewriteState> = None;
-    while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        while let Ok(job) = rx.try_recv() {
+    let mut pending_job = None;
+    loop {
+        let first = match pending_job.take() {
+            Some(job) => job,
+            None => match rx.recv() {
+                Ok(job) => job,
+                Err(_) => break,
+            },
+        };
+        const MAX_BATCH: usize = 1024;
+        let mut batch = Vec::with_capacity(MAX_BATCH.min(64));
+        let mut batch_bytes = job_size(&first);
+        batch.push(first);
+        while batch.len() < MAX_BATCH {
+            let Ok(job) = rx.try_recv() else { break };
+            let job_bytes = job_size(&job);
+            if !batch.is_empty() && batch_bytes.saturating_add(job_bytes) > MAX_BATCH_BYTES {
+                pending_job = Some(job);
+                break;
+            }
+            batch_bytes = batch_bytes.saturating_add(job_bytes);
             batch.push(job);
         }
 
@@ -359,6 +382,13 @@ fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync) {
                             rw.last_db = Some(db_index);
                         }
                         rw.buffer.extend_from_slice(&bytes);
+                        if rw.buffer.len() > MAX_REWRITE_MIRROR_BYTES {
+                            tracing::warn!(
+                                limit = MAX_REWRITE_MIRROR_BYTES,
+                                "AOF rewrite mirror exceeded memory limit; cancelling rewrite"
+                            );
+                            rewrite = None;
+                        }
                     }
                 }
                 Job::Fsync => explicit_fsync_requested = true,
@@ -424,6 +454,14 @@ fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync) {
     }
 }
 
+fn job_size(job: &Job) -> usize {
+    match job {
+        Job::Write { bytes, .. } => bytes.len(),
+        Job::FinishRewrite { base, .. } => base.len(),
+        Job::Fsync | Job::Flush(_) | Job::BeginRewrite => 0,
+    }
+}
+
 /// Writes `bytes` to a temp file next to `path` and renames it over
 /// `path` (atomic on POSIX, same trick `persistence::rdb::save` uses),
 /// then reopens `path` in append mode as the writer thread's new live
@@ -471,7 +509,23 @@ pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let data = std::fs::read(path)?;
+    const MAX_AOF_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+    let file = File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > MAX_AOF_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AOF exceeds 4 GiB replay limit; rewrite or trim it",
+        ));
+    }
+    let mut data = Vec::with_capacity(size as usize);
+    file.take(MAX_AOF_SIZE + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > MAX_AOF_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AOF exceeds 4 GiB replay limit; rewrite or trim it",
+        ));
+    }
     let mut buf = BytesMut::from(&data[..]);
     let mut decoder = resp::RequestDecoder;
     let mut requests = Vec::new();

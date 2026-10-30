@@ -1,6 +1,6 @@
 //! Stream storage (`XADD`/`XRANGE`/`XREAD`/`XGROUP`/`XREADGROUP`/`XACK`/
-//! `XPENDING`). Scope note: this covers the command surface the project
-//! actually implements — `XCLAIM`/`XAUTOCLAIM`/`XINFO`/`XSETID`/`BLOCK`ing
+//! `XPENDING`/`XCLAIM`/`XAUTOCLAIM`). Scope note: this covers the command
+//! surface the project actually implements — `XINFO`/`XSETID`/`BLOCK`ing
 //! reads/`MINID` trimming/exclusive range bounds (`(id`) are **not**
 //! implemented. Entries are kept in a plain `BTreeMap` ordered by ID, which
 //! is what gives `XRANGE`/`XREAD`-since-id their ordering for free (no
@@ -461,6 +461,164 @@ impl Stream {
         )
     }
 
+    /// `XCLAIM key group consumer min-idle-time id [id...]`. For each
+    /// `id` already pending in `group` whose idle time (`now_ms -
+    /// delivery_time_ms`) is at least `min_idle_ms`, reassigns it to
+    /// `new_consumer`. `set_delivery_time_ms`/`set_delivery_count`
+    /// implement `IDLE`/`TIME`/`RETRYCOUNT` (explicit overrides instead
+    /// of the default "now"/"+1" behavior); `justid` (`JUSTID`) skips the
+    /// delivery-count bump entirely, matching real Redis. `force`
+    /// (`FORCE`) creates a new PEL entry for an `id` that isn't already
+    /// pending, as long as it still exists in the stream — ignoring
+    /// `min_idle_time` for it, since there's no previous owner to be
+    /// idle.
+    ///
+    /// IDs that are pending but no longer exist in the stream
+    /// (deleted/trimmed) are dropped from the PEL outright instead of
+    /// being claimed — same as real Redis auto-acking a tombstoned
+    /// pending entry — and aren't included in the returned list. IDs
+    /// that don't meet `min_idle_time` (and weren't `FORCE`d in) are
+    /// silently skipped, not reported, same as real Redis. Returns `None`
+    /// if the group doesn't exist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim(
+        &mut self,
+        group: &[u8],
+        new_consumer: Bytes,
+        min_idle_ms: u64,
+        ids: &[StreamId],
+        now_ms: u64,
+        set_delivery_time_ms: Option<u64>,
+        set_delivery_count: Option<u64>,
+        justid: bool,
+        force: bool,
+    ) -> Option<Entries> {
+        if !self.groups.contains_key(group) {
+            return None;
+        }
+        let mut claimed = Entries::new();
+        for &id in ids {
+            let exists = self.entries.contains_key(&id);
+            let g = self.groups.get_mut(group).expect("checked above");
+            let already_pending = g.pending.contains_key(&id);
+
+            if already_pending && !exists {
+                g.pending.remove(&id);
+                continue;
+            }
+            if already_pending {
+                let idle = now_ms.saturating_sub(g.pending[&id].delivery_time_ms);
+                if idle < min_idle_ms {
+                    continue;
+                }
+            } else if !force || !exists {
+                continue;
+            }
+
+            let delivery_count = if let Some(n) = set_delivery_count {
+                n
+            } else if justid {
+                g.pending.get(&id).map(|p| p.delivery_count).unwrap_or(0)
+            } else {
+                g.pending.get(&id).map(|p| p.delivery_count + 1).unwrap_or(1)
+            };
+            g.pending.insert(
+                id,
+                PendingEntry {
+                    consumer: new_consumer.clone(),
+                    delivery_time_ms: set_delivery_time_ms.unwrap_or(now_ms),
+                    delivery_count,
+                },
+            );
+            g.consumers.insert(new_consumer.clone());
+            claimed.push((id, self.entries.get(&id).cloned().unwrap_or_default()));
+        }
+        Some(claimed)
+    }
+
+    /// `XAUTOCLAIM key group consumer min-idle-time start [COUNT count]
+    /// [JUSTID]`. Scans `group`'s PEL in ID order starting at `start`,
+    /// reassigning up to `count` entries whose idle time is at least
+    /// `min_idle_ms` to `new_consumer` — the "claim everything a dead
+    /// consumer left behind" counterpart to `claim`'s "claim these
+    /// specific IDs". Entries still pending but no longer present in the
+    /// stream (deleted/trimmed) are dropped from the PEL outright and
+    /// returned separately in `deleted`, same tombstone handling as
+    /// `claim`; dropping one doesn't count against `count`.
+    ///
+    /// Returns `None` if the group doesn't exist, otherwise `(next_cursor,
+    /// claimed, deleted)`. `next_cursor` is `StreamId::ZERO` once the
+    /// whole PEL from `start` onward has been scanned (matching real
+    /// Redis's `0-0` "done" cursor), or the first not-yet-scanned ID once
+    /// `count` entries have been claimed.
+    ///
+    /// Simplification: real Redis also caps how many *not-yet-idle*
+    /// entries it will scan past before giving up for this call (`count *
+    /// 10` attempts); this scans the whole remaining PEL from `start`
+    /// looking for `count` eligible entries instead. Only matters for a
+    /// group with a huge PEL where almost nothing is idle enough yet —
+    /// correctness is identical, just a different cost bound on that one
+    /// pathological case.
+    #[allow(clippy::too_many_arguments)]
+    pub fn autoclaim(
+        &mut self,
+        group: &[u8],
+        new_consumer: Bytes,
+        min_idle_ms: u64,
+        start: StreamId,
+        count: usize,
+        now_ms: u64,
+        justid: bool,
+    ) -> Option<(StreamId, Entries, Vec<StreamId>)> {
+        let pending = &self.groups.get(group)?.pending;
+        // Keep the temporary ID list bounded by one page of live entries
+        // plus tombstones encountered before that page is full. The cursor
+        // marks the first unscanned eligible live entry; non-idle entries
+        // are scanned past without storing them.
+        let mut ids = Vec::with_capacity(count);
+        let mut next_cursor = StreamId::ZERO;
+        let mut eligible_live = 0;
+        for (&id, pending_entry) in pending.range(start..) {
+            let exists = self.entries.contains_key(&id);
+            let idle_enough = now_ms.saturating_sub(pending_entry.delivery_time_ms) >= min_idle_ms;
+            if !exists {
+                ids.push(id);
+            } else if idle_enough {
+                if eligible_live == count {
+                    next_cursor = id;
+                    break;
+                }
+                eligible_live += 1;
+                ids.push(id);
+            }
+        }
+
+        let mut claimed = Entries::new();
+        let mut deleted = Vec::new();
+        for id in ids {
+            let exists = self.entries.contains_key(&id);
+            let g = self.groups.get_mut(group).expect("checked above");
+            if !exists {
+                g.pending.remove(&id);
+                deleted.push(id);
+                continue;
+            }
+            let idle = now_ms.saturating_sub(g.pending[&id].delivery_time_ms);
+            if idle < min_idle_ms {
+                continue;
+            }
+            let delivery_count =
+                if justid { g.pending[&id].delivery_count } else { g.pending[&id].delivery_count + 1 };
+            g.pending.insert(
+                id,
+                PendingEntry { consumer: new_consumer.clone(), delivery_time_ms: now_ms, delivery_count },
+            );
+            g.consumers.insert(new_consumer.clone());
+            claimed.push((id, self.entries.get(&id).cloned().unwrap_or_default()));
+        }
+        Some((next_cursor, claimed, deleted))
+    }
+
     /// Everything still pending for `consumer` across the whole group —
     /// what `XREADGROUP`'s "re-read my own PEL from 0" shares its
     /// implementation with, exposed here for completeness/tests.
@@ -583,6 +741,130 @@ mod tests {
 
         assert_eq!(s.delete_consumer(b"g", b"c1"), Some(1));
         assert!(s.pending_for(b"g", b"c1").is_empty());
+    }
+
+    #[test]
+    fn xclaim_reassigns_idle_entries_and_skips_fresh_ones() {
+        let mut s = Stream::new();
+        for i in 1..=3u64 {
+            s.add(IdSpec::Explicit(StreamId::new(i, 0)), 0, f("n", &i.to_string())).unwrap();
+        }
+        s.create_group(Bytes::from_static(b"g"), StreamId::ZERO);
+        s.read_group(b"g", Bytes::from_static(b"c1"), None, None, 1000, false).unwrap();
+
+        // Not idle enough yet (only 500ms since delivery, min-idle 10000).
+        let claimed = s
+            .claim(
+                b"g",
+                Bytes::from_static(b"c2"),
+                10_000,
+                &[StreamId::new(1, 0)],
+                1500,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert!(claimed.is_empty());
+        assert_eq!(s.pending_for(b"g", b"c1").len(), 3);
+
+        // Idle long enough now: claim ids 1 and 2 for c2.
+        let claimed = s
+            .claim(
+                b"g",
+                Bytes::from_static(b"c2"),
+                100,
+                &[StreamId::new(1, 0), StreamId::new(2, 0)],
+                5000,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            claimed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![StreamId::new(1, 0), StreamId::new(2, 0)]
+        );
+        assert_eq!(s.pending_for(b"g", b"c1").len(), 1);
+        assert_eq!(s.pending_for(b"g", b"c2").len(), 2);
+
+        // Deleted entry gets dropped from the PEL instead of claimed.
+        s.del(&[StreamId::new(3, 0)]);
+        let claimed = s
+            .claim(b"g", Bytes::from_static(b"c2"), 0, &[StreamId::new(3, 0)], 5000, None, None, false, false)
+            .unwrap();
+        assert!(claimed.is_empty());
+        let (count, ..) = s.pending_summary(b"g").unwrap();
+        assert_eq!(count, 2);
+
+        // Unknown group.
+        assert!(s
+            .claim(b"nope", Bytes::from_static(b"c2"), 0, &[StreamId::new(1, 0)], 0, None, None, false, false)
+            .is_none());
+    }
+
+    #[test]
+    fn xclaim_force_adopts_a_never_pending_entry_that_still_exists() {
+        let mut s = Stream::new();
+        s.add(IdSpec::Explicit(StreamId::new(1, 0)), 0, f("n", "1")).unwrap();
+        s.create_group(Bytes::from_static(b"g"), StreamId::ZERO);
+
+        // Never delivered via XREADGROUP, so it isn't pending at all —
+        // without FORCE this is a no-op.
+        let claimed = s
+            .claim(b"g", Bytes::from_static(b"c1"), 0, &[StreamId::new(1, 0)], 1000, None, None, false, false)
+            .unwrap();
+        assert!(claimed.is_empty());
+
+        let claimed = s
+            .claim(b"g", Bytes::from_static(b"c1"), 0, &[StreamId::new(1, 0)], 1000, None, None, false, true)
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(s.pending_for(b"g", b"c1"), vec![StreamId::new(1, 0)]);
+    }
+
+    #[test]
+    fn xautoclaim_scans_the_pel_in_id_order_and_paginates() {
+        let mut s = Stream::new();
+        for i in 1..=5u64 {
+            s.add(IdSpec::Explicit(StreamId::new(i, 0)), 0, f("n", &i.to_string())).unwrap();
+        }
+        s.create_group(Bytes::from_static(b"g"), StreamId::ZERO);
+        s.read_group(b"g", Bytes::from_static(b"c1"), None, None, 1000, false).unwrap();
+
+        let (cursor, claimed, deleted) =
+            s.autoclaim(b"g", Bytes::from_static(b"c2"), 0, StreamId::ZERO, 2, 2000, false).unwrap();
+        assert_eq!(
+            claimed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![StreamId::new(1, 0), StreamId::new(2, 0)]
+        );
+        assert!(deleted.is_empty());
+        assert_eq!(cursor, StreamId::new(3, 0)); // more to scan
+
+        let (cursor, claimed, _) =
+            s.autoclaim(b"g", Bytes::from_static(b"c2"), 0, cursor, 10, 2000, false).unwrap();
+        assert_eq!(claimed.len(), 3);
+        assert_eq!(cursor, StreamId::ZERO); // fully scanned
+        assert_eq!(s.pending_for(b"g", b"c2").len(), 5);
+    }
+
+    #[test]
+    fn xautoclaim_drops_tombstoned_entries_without_spending_the_count_budget() {
+        let mut s = Stream::new();
+        for i in 1..=2u64 {
+            s.add(IdSpec::Explicit(StreamId::new(i, 0)), 0, f("n", &i.to_string())).unwrap();
+        }
+        s.create_group(Bytes::from_static(b"g"), StreamId::ZERO);
+        s.read_group(b"g", Bytes::from_static(b"c1"), None, None, 1000, false).unwrap();
+        s.del(&[StreamId::new(1, 0)]);
+
+        let (cursor, claimed, deleted) =
+            s.autoclaim(b"g", Bytes::from_static(b"c2"), 0, StreamId::ZERO, 1, 2000, false).unwrap();
+        assert_eq!(deleted, vec![StreamId::new(1, 0)]);
+        assert_eq!(claimed.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![StreamId::new(2, 0)]);
+        assert_eq!(cursor, StreamId::ZERO);
     }
 
     #[test]

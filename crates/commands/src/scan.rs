@@ -14,7 +14,6 @@ use resp::Value;
 #[derive(Debug, Default)]
 pub struct ScanOptions {
     pattern: Option<Vec<u8>>,
-    #[allow(dead_code)]
     count: Option<usize>,
     /// `TYPE <name>` — only meaningful to the keyspace-wide `SCAN`, ignored
     /// (but still parsed, for client compatibility) by `HSCAN`/`SSCAN`/`ZSCAN`.

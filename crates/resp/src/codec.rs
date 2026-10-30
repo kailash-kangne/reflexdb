@@ -119,7 +119,10 @@ const MAX_MULTIBULK_COUNT: i64 = 1024 * 1024;
 /// naturally bounded by bytes the client has actually sent) — this is
 /// belt-and-suspenders validation, rejecting an obviously-bogus length
 /// instead of patiently waiting forever for 512MB+ that may never arrive.
-const MAX_BULK_LEN: i64 = 512 * 1024 * 1024;
+const MAX_BULK_LEN: i64 = 64 * 1024 * 1024;
+/// Maximum encoded size of one request frame. Prevents a client from
+/// retaining arbitrarily many individually valid bulk strings in a frame.
+const MAX_REQUEST_LEN: usize = 64 * 1024 * 1024;
 
 fn decode_multibulk(src: &mut BytesMut) -> Result<Option<Request>, RespError> {
     let mut pos = 0usize;
@@ -139,7 +142,9 @@ fn decode_multibulk(src: &mut BytesMut) -> Result<Option<Request>, RespError> {
         return Err(RespError::Protocol(format!("invalid multibulk length: {count}")));
     }
     let count = count as usize;
-    let mut items = Vec::with_capacity(count);
+    // Do not trust the declared count for eager allocation: a tiny header
+    // must not reserve millions of `Bytes` slots before any arrive.
+    let mut items = Vec::new();
 
     for _ in 0..count {
         if pos >= src.len() {
@@ -162,6 +167,11 @@ fn decode_multibulk(src: &mut BytesMut) -> Result<Option<Request>, RespError> {
         let len = len as usize;
         let data_start = bulk_header_end + 2;
         let data_end = data_start + len;
+        // `data_end` is already an absolute offset from the frame start,
+        // including every prior header and bulk payload.
+        if data_end.saturating_add(2) > MAX_REQUEST_LEN {
+            return Err(RespError::Protocol("request exceeds maximum size".into()));
+        }
         if src.len() < data_end + 2 {
             return Ok(None);
         }

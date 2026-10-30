@@ -17,6 +17,7 @@ use dashmap::DashMap;
 use resp::{Protocol, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 use tokio_util::codec::FramedRead;
 
@@ -29,12 +30,20 @@ pub async fn run(
 ) -> std::io::Result<()> {
     let addr = format!("{bind}:{port}");
     let listener = TcpListener::bind(&addr).await?;
+    const MAX_CONNECTIONS: usize = 1024;
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tracing::info!(%addr, "reflexdb-sentinel listening");
     loop {
         let (socket, peer) = listener.accept().await?;
+        let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
+            drop(socket);
+            tracing::debug!(%peer, "sentinel connection limit reached");
+            continue;
+        };
         socket.set_nodelay(true).ok();
         let masters = masters.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = handle_connection(socket, masters).await {
                 tracing::debug!(%peer, error = %e, "sentinel connection closed");
             }

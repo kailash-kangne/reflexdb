@@ -8,9 +8,12 @@ use bytes::BytesMut;
 use commands::{dispatch, ClientState, Outcome, ServerContext, SingleFlightLease};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_util::codec::FramedRead;
 
 use reflexdb_server::config::Config;
+
+const MAX_CONNECTIONS: usize = 10_000;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -170,6 +173,7 @@ async fn main() -> std::io::Result<()> {
         );
     }
 
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     if cfg.tls_port != 0 {
         match (&cfg.tls_cert_file, &cfg.tls_key_file) {
             (Some(cert), Some(key)) => match tls::build_acceptor(cert, key) {
@@ -177,8 +181,11 @@ async fn main() -> std::io::Result<()> {
                     let ctx = ctx.clone();
                     let bind = cfg.bind.clone();
                     let tls_port = cfg.tls_port;
+                    let connection_slots = connection_slots.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = run_tls_listener(ctx, &bind, tls_port, acceptor).await {
+                        if let Err(e) =
+                            run_tls_listener(ctx, &bind, tls_port, acceptor, connection_slots).await
+                        {
                             tracing::error!(error = %e, "TLS listener failed");
                         }
                     });
@@ -195,9 +202,15 @@ async fn main() -> std::io::Result<()> {
 
     loop {
         let (socket, peer) = listener.accept().await?;
+        let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
+            drop(socket);
+            tracing::debug!(%peer, "connection limit reached");
+            continue;
+        };
         socket.set_nodelay(true).ok();
         let ctx = ctx.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = handle_connection(ctx, socket).await {
                 tracing::debug!(%peer, error = %e, "connection closed");
             }
@@ -210,16 +223,23 @@ async fn run_tls_listener(
     bind: &str,
     port: u16,
     acceptor: tokio_rustls::TlsAcceptor,
+    connection_slots: Arc<Semaphore>,
 ) -> std::io::Result<()> {
     let addr = format!("{bind}:{port}");
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "reflexdb-server listening (TLS)");
     loop {
         let (socket, peer) = listener.accept().await?;
+        let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
+            drop(socket);
+            tracing::debug!(%peer, "TLS connection limit reached");
+            continue;
+        };
         socket.set_nodelay(true).ok();
         let ctx = ctx.clone();
         let acceptor = acceptor.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             match acceptor.accept(socket).await {
                 Ok(tls_stream) => {
                     if let Err(e) = handle_connection(ctx, tls_stream).await {
@@ -266,6 +286,9 @@ where
 
     loop {
         tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(25)), if ctx.is_slow_client(id) => {
+                return Ok(());
+            }
             // Pub/Sub message pushed from another connection.
             Some(push) = pushes.recv() => {
                 out.clear();

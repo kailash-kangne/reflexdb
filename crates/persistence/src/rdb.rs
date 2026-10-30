@@ -3,7 +3,7 @@
 //! `dump.rdb` writer uses) and reloaded on startup.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -123,7 +123,17 @@ pub fn load(path: &Path, store: &Store) -> io::Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
-    let payload = fs::read(path)?;
+    const MAX_RDB_SIZE: u64 = 512 * 1024 * 1024;
+    let file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size > MAX_RDB_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "RDB snapshot exceeds 512 MiB limit"));
+    }
+    let mut payload = Vec::with_capacity(size as usize);
+    file.take(MAX_RDB_SIZE + 1).read_to_end(&mut payload)?;
+    if payload.len() as u64 > MAX_RDB_SIZE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "RDB snapshot exceeds 512 MiB limit"));
+    }
     deserialize(&payload, store)?;
     Ok(true)
 }

@@ -375,7 +375,9 @@ pub fn cmd_bitfield(ctx: &ServerContext, state: &ClientState, args: &[Bytes], re
         let Some(offset) = parse_bit_offset(&args[i + 2], width) else {
             return err("ERR bit offset is not an integer or out of range");
         };
-        if offset.saturating_add(width as u64) > (512u64 * 1024 * 1024 * 8) {
+        // Match the RESP maximum bulk argument and prevent a tiny command
+        // from forcing a 512 MiB allocation for one bitfield offset.
+        if offset.saturating_add(width as u64) > (64u64 * 1024 * 1024 * 8) {
             return err("ERR bit offset is out of range");
         }
         let value = if op == FieldOp::Set {

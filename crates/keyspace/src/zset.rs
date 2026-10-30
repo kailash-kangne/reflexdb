@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
+use std::ops::Bound::{Included, Unbounded};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,24 @@ impl ZSet {
     /// is already in this order, this just clones it out.
     pub fn sorted(&self) -> Vec<(Bytes, f64)> {
         self.by_score.iter().map(|(ScoreKey(s), m)| (m.clone(), *s)).collect()
+    }
+
+    /// Iterate members in inclusive score order without cloning unrelated
+    /// entries. `O(log n + matches)`.
+    pub fn range_by_score(&self, min: f64, max: f64) -> impl Iterator<Item = (&Bytes, f64)> {
+        self.by_score
+            .range((Included((ScoreKey(min), Bytes::new())), Unbounded))
+            .take_while(move |(ScoreKey(score), _)| *score <= max)
+            .map(|(ScoreKey(score), member)| (member, *score))
+    }
+
+    pub fn remove_score_range(&mut self, min: f64, max: f64) -> usize {
+        let members: Vec<Bytes> = self.range_by_score(min, max).map(|(member, _)| member.clone()).collect();
+        let count = members.len();
+        for member in members {
+            self.remove(&member);
+        }
+        count
     }
 
     /// Removes and returns the `count` lowest-scoring (`min`) or
