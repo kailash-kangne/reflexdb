@@ -52,7 +52,7 @@
 
 use std::io;
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Mutex;
 use std::thread;
 
@@ -77,7 +77,7 @@ enum Job {
 }
 
 pub struct HistoryWriter {
-    tx: Mutex<Sender<Job>>,
+    tx: Mutex<SyncSender<Job>>,
     // Kept alongside `keyspace` so `sweep_older_than` can start a
     // `WriteBatch` (`Database::batch()`) without the writer thread's copy.
     db: Database,
@@ -92,7 +92,7 @@ impl HistoryWriter {
         let db = Database::builder(dir).open().map_err(io::Error::other)?;
         let keyspace =
             db.keyspace("reflexdb-history", KeyspaceCreateOptions::default).map_err(io::Error::other)?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(4096);
         let worker_db = db.clone();
         let worker_keyspace = keyspace.clone();
         let worker = thread::Builder::new()
@@ -172,10 +172,12 @@ impl HistoryWriter {
         let mut upper = vec![BY_TIME];
         upper.extend_from_slice(&cutoff_ms.to_be_bytes());
 
+        const SWEEP_BATCH: usize = 4096;
         let stale: Vec<Vec<u8>> = self
             .keyspace
             .range(lower..upper)
             .filter_map(|guard| guard.key().ok().map(|k| k.to_vec()))
+            .take(SWEEP_BATCH)
             .collect();
         if stale.is_empty() {
             return 0;
@@ -188,18 +190,21 @@ impl HistoryWriter {
                 batch.remove(&self.keyspace, by_key);
             }
         }
-        let removed = stale.len();
         if let Err(e) = batch.commit() {
             tracing::warn!(error = %e, "history sweep failed to commit deletions");
+            return 0;
         }
-        removed
+        stale.len()
     }
 }
 
 fn writer_loop(db: Database, keyspace: Keyspace, rx: Receiver<Job>) {
     while let Ok(first) = rx.recv() {
-        let mut jobs = vec![first];
-        while let Ok(job) = rx.try_recv() {
+        const MAX_BATCH: usize = 1024;
+        let mut jobs = Vec::with_capacity(MAX_BATCH.min(64));
+        jobs.push(first);
+        while jobs.len() < MAX_BATCH {
+            let Ok(job) = rx.try_recv() else { break };
             jobs.push(job);
         }
 

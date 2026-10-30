@@ -16,8 +16,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::sync::Arc;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 struct Args {
     listen: String,
@@ -57,6 +59,8 @@ async fn main() -> std::io::Result<()> {
     };
 
     let listener = TcpListener::bind(&args.listen).await?;
+    const MAX_CONNECTIONS: usize = 2048;
+    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tracing::info!(listen = %args.listen, upstream = %args.upstream, "reflexdb-proxy listening");
 
     // Just for log correlation across concurrent connections — not used
@@ -65,10 +69,16 @@ async fn main() -> std::io::Result<()> {
 
     loop {
         let (client, peer) = listener.accept().await?;
+        let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
+            drop(client);
+            tracing::debug!(%peer, "proxy connection limit reached");
+            continue;
+        };
         client.set_nodelay(true).ok();
         let upstream_addr = args.upstream.clone();
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = relay(client, &upstream_addr).await {
                 tracing::debug!(conn_id, %peer, error = %e, "proxy connection closed");
             }
@@ -79,7 +89,12 @@ async fn main() -> std::io::Result<()> {
 /// Dial `upstream` and splice it with `client` in both directions until
 /// either side closes or errors.
 async fn relay(mut client: TcpStream, upstream: &str) -> std::io::Result<()> {
-    let mut upstream_conn = TcpStream::connect(upstream).await?;
+    let mut upstream_conn =
+        tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(upstream))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy upstream connect timed out")
+            })??;
     upstream_conn.set_nodelay(true).ok();
     copy_bidirectional(&mut client, &mut upstream_conn).await?;
     Ok(())

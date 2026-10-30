@@ -1,17 +1,15 @@
 //! `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/`XGROUP`/`XREADGROUP`/
-//! `XREAD`/`XACK`/`XPENDING` — Redis Streams, on top of `keyspace::Stream`
-//! (see its module docs for the storage design).
+//! `XREAD`/`XACK`/`XPENDING`/`XCLAIM`/`XAUTOCLAIM` — Redis Streams, on top
+//! of `keyspace::Stream` (see its module docs for the storage design).
 //!
-//! **Not implemented** (documented scope cut, not an oversight):
-//! `XCLAIM`/`XAUTOCLAIM` (reassigning another consumer's pending entries —
-//! `XGROUP DELCONSUMER` is the only way to drop a dead consumer's PEL
-//! here), `XINFO`, `XSETID`'s standalone form (`XGROUP SETID` covers the
-//! consumer-group case), `BLOCK` on `XREAD`/`XREADGROUP` (both are
-//! synchronous — see `cmd_xread`'s docs for why that's a real limitation,
-//! not just missing syntax), `MINID`-based trimming, and exclusive range
-//! bounds (`(id`). `MAXLEN` trimming is always exact — `~` isn't treated
-//! differently from `=`, same simplification `docs/02-data-structures.md`
-//! already documents for other types' small-collection thresholds.
+//! **Not implemented** (documented scope cut, not an oversight): `XINFO`,
+//! `XSETID`'s standalone form (`XGROUP SETID` covers the consumer-group
+//! case), `BLOCK` on `XREAD`/`XREADGROUP` (both are synchronous — see
+//! `cmd_xread`'s docs for why that's a real limitation, not just missing
+//! syntax), `MINID`-based trimming, and exclusive range bounds (`(id`).
+//! `MAXLEN` trimming is always exact — `~` isn't treated differently from
+//! `=`, same simplification `docs/02-data-structures.md` already
+//! documents for other types' small-collection thresholds.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -630,4 +628,183 @@ pub fn cmd_xread(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Ou
             })
             .collect(),
     ))
+}
+
+fn is_xclaim_option(arg: &[u8]) -> bool {
+    [&b"IDLE"[..], b"TIME", b"RETRYCOUNT", b"FORCE", b"JUSTID", b"LASTID"]
+        .iter()
+        .any(|kw| arg.eq_ignore_ascii_case(kw))
+}
+
+fn parse_u64_arg(arg: Option<&Bytes>) -> Option<u64> {
+    std::str::from_utf8(arg?).ok()?.parse().ok()
+}
+
+/// `XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME
+/// ms-unix-time] [RETRYCOUNT count] [FORCE] [JUSTID] [LASTID id]`.
+pub fn cmd_xclaim(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    let [key, group, consumer, min_idle_arg, rest @ ..] = args else { return wrong_args("xclaim") };
+    let Some(min_idle_ms) = parse_u64_arg(Some(min_idle_arg)) else {
+        return err("ERR value is not an integer or out of range");
+    };
+
+    let mut i = 0;
+    let mut ids = Vec::new();
+    while let Some(arg) = rest.get(i) {
+        if is_xclaim_option(arg) {
+            break;
+        }
+        let Some(id) = std::str::from_utf8(arg).ok().and_then(|s| StreamId::parse(s, 0)) else {
+            return err("ERR syntax error");
+        };
+        ids.push(id);
+        i += 1;
+    }
+    if ids.is_empty() {
+        return wrong_args("xclaim");
+    }
+
+    let mut set_delivery_time_ms = None;
+    let mut set_delivery_count = None;
+    let mut justid = false;
+    let mut force = false;
+    let mut last_id = None;
+    let now = now_ms();
+    while let Some(arg) = rest.get(i) {
+        if arg.eq_ignore_ascii_case(b"IDLE") {
+            let Some(ms) = parse_u64_arg(rest.get(i + 1)) else {
+                return err("ERR value is not an integer or out of range");
+            };
+            set_delivery_time_ms = Some(now.saturating_sub(ms));
+            i += 2;
+        } else if arg.eq_ignore_ascii_case(b"TIME") {
+            let Some(ms) = parse_u64_arg(rest.get(i + 1)) else {
+                return err("ERR value is not an integer or out of range");
+            };
+            set_delivery_time_ms = Some(ms);
+            i += 2;
+        } else if arg.eq_ignore_ascii_case(b"RETRYCOUNT") {
+            let Some(n) = parse_u64_arg(rest.get(i + 1)) else {
+                return err("ERR value is not an integer or out of range");
+            };
+            set_delivery_count = Some(n);
+            i += 2;
+        } else if arg.eq_ignore_ascii_case(b"LASTID") {
+            let Some(id_arg) = rest.get(i + 1) else { return err("ERR syntax error") };
+            let Some(id) = std::str::from_utf8(id_arg).ok().and_then(|s| StreamId::parse(s, 0)) else {
+                return err("ERR Invalid stream ID specified as lastid");
+            };
+            last_id = Some(id);
+            i += 2;
+        } else if arg.eq_ignore_ascii_case(b"FORCE") {
+            force = true;
+            i += 1;
+        } else if arg.eq_ignore_ascii_case(b"JUSTID") {
+            justid = true;
+            i += 1;
+        } else {
+            return err("ERR syntax error");
+        }
+    }
+
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    let consumer = consumer.clone();
+    let result = db.with_value_mut(key, |v| match v {
+        KVal::Stream(s) => {
+            let claimed = s.claim(
+                group,
+                consumer,
+                min_idle_ms,
+                &ids,
+                now,
+                set_delivery_time_ms,
+                set_delivery_count,
+                justid,
+                force,
+            );
+            if claimed.is_some() {
+                if let Some(id) = last_id {
+                    s.set_group_id(group, id);
+                }
+            }
+            Ok(claimed)
+        }
+        _ => Err(()),
+    });
+    match result {
+        Some(Ok(Some(claimed))) => {
+            if !claimed.is_empty() {
+                on_key_changed(ctx, state.db_index, key.clone());
+                notify_keyspace_event(ctx, state.db_index, 't', "xclaim", key);
+            }
+            reply(Value::Array(if justid {
+                claimed.into_iter().map(|(id, _)| Value::bulk(id.to_display_string())).collect()
+            } else {
+                claimed.into_iter().map(|(id, f)| entry_reply(id, f)).collect()
+            }))
+        }
+        Some(Ok(None)) | None => nogroup(key, group),
+        Some(Err(())) => wrong_type(),
+    }
+}
+
+/// `XAUTOCLAIM key group consumer min-idle-time start [COUNT count]
+/// [JUSTID]`. Reply shape is `[next_cursor, claimed_entries,
+/// deleted_ids]`, matching real Redis 7's three-element form.
+pub fn cmd_xautoclaim(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    let [key, group, consumer, min_idle_arg, start_arg, rest @ ..] = args else {
+        return wrong_args("xautoclaim");
+    };
+    let Some(min_idle_ms) = parse_u64_arg(Some(min_idle_arg)) else {
+        return err("ERR value is not an integer or out of range");
+    };
+    let Some(start) = resolve_bound(start_arg, 0) else { return invalid_id() };
+
+    let mut count = 100usize;
+    let mut justid = false;
+    let mut i = 0;
+    while let Some(arg) = rest.get(i) {
+        if arg.eq_ignore_ascii_case(b"COUNT") {
+            let Some(n) = rest
+                .get(i + 1)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|s| s.parse::<usize>().ok())
+            else {
+                return err("ERR value is not an integer or out of range");
+            };
+            count = n;
+            i += 2;
+        } else if arg.eq_ignore_ascii_case(b"JUSTID") {
+            justid = true;
+            i += 1;
+        } else {
+            return err("ERR syntax error");
+        }
+    }
+
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    let consumer = consumer.clone();
+    let now = now_ms();
+    let result = db.with_value_mut(key, |v| match v {
+        KVal::Stream(s) => Ok(s.autoclaim(group, consumer, min_idle_ms, start, count, now, justid)),
+        _ => Err(()),
+    });
+    match result {
+        Some(Ok(Some((cursor, claimed, deleted)))) => {
+            if !claimed.is_empty() || !deleted.is_empty() {
+                on_key_changed(ctx, state.db_index, key.clone());
+                notify_keyspace_event(ctx, state.db_index, 't', "xautoclaim", key);
+            }
+            let claimed_v = if justid {
+                Value::Array(claimed.into_iter().map(|(id, _)| Value::bulk(id.to_display_string())).collect())
+            } else {
+                Value::Array(claimed.into_iter().map(|(id, f)| entry_reply(id, f)).collect())
+            };
+            let deleted_v =
+                Value::Array(deleted.into_iter().map(|id| Value::bulk(id.to_display_string())).collect());
+            reply(Value::Array(vec![Value::bulk(cursor.to_display_string()), claimed_v, deleted_v]))
+        }
+        Some(Ok(None)) | None => nogroup(key, group),
+        Some(Err(())) => wrong_type(),
+    }
 }

@@ -14,7 +14,7 @@ See [ROADMAP.md](ROADMAP.md) for what's designed but not built yet, and
 | Hash | `HashMap<Bytes, Bytes>` |
 | Set | `IndexSet<Bytes>` — insertion-ordered, enables O(1) `SPOP` via `swap_remove_index` |
 | Sorted Set (ZSET) | `HashMap<Bytes, f64>` + a `BTreeSet<(score, member)>` index — O(log n) `ZPOPMIN`/`ZPOPMAX`, O(n) range scans |
-| Stream | `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/`XGROUP`/`XREADGROUP`/`XACK`/`XPENDING`/`XREAD`. Not implemented: `XCLAIM`/`XAUTOCLAIM`, `XINFO`, `BLOCK`ing reads, `MINID` trimming, exclusive range bounds |
+| Stream | `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/`XGROUP`/`XREADGROUP`/`XACK`/`XPENDING`/`XREAD`/`XCLAIM`/`XAUTOCLAIM`. Not implemented: `XINFO`, `BLOCK`ing reads, `MINID` trimming, exclusive range bounds |
 
 No small-collection compact encodings (listpack/intset/ziplist) — every collection is always
 its full representation. Geo and HyperLogLog are not implemented (see

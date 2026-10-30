@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use keyspace::{Store, Ttl, Value as KVal};
 use rand::seq::SliceRandom;
 use resp::{Protocol, Request, Value};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::live::LiveSub;
 use crate::replication::ReplicaState;
@@ -135,7 +135,8 @@ pub struct ServerContext {
     /// Outbound push channel per connected client, used to deliver pub/sub
     /// messages and LIVE updates asynchronously from whichever connection
     /// triggered them.
-    pub(crate) clients: DashMap<u64, UnboundedSender<Arc<Value>>>,
+    pub(crate) clients: DashMap<u64, Sender<Arc<Value>>>,
+    pub(crate) slow_clients: DashMap<u64, ()>,
     pub(crate) channels: DashMap<Bytes, HashSet<u64>>,
     pub(crate) patterns: DashMap<Bytes, HashSet<u64>>,
     /// fingerprint -> subscription (one per distinct `LIVE <cmd> <args>`).
@@ -299,6 +300,7 @@ impl ServerContext {
             start_time: Instant::now(),
             next_client_id: AtomicU64::new(1),
             clients: DashMap::new(),
+            slow_clients: DashMap::new(),
             channels: DashMap::new(),
             patterns: DashMap::new(),
             live_subs: DashMap::new(),
@@ -698,9 +700,9 @@ impl ServerContext {
     /// Register a new connection's outbound push channel, returning its id
     /// and the receiving half the connection loop should poll alongside its
     /// socket reads.
-    pub fn register_client(&self) -> (u64, tokio::sync::mpsc::UnboundedReceiver<Arc<Value>>) {
+    pub fn register_client(&self) -> (u64, tokio::sync::mpsc::Receiver<Arc<Value>>) {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(1024);
         self.clients.insert(id, tx);
         (id, rx)
     }
@@ -710,6 +712,7 @@ impl ServerContext {
     /// index subscriptions per-client to avoid the full scan.
     pub fn disconnect_client(&self, id: u64) {
         self.clients.remove(&id);
+        self.slow_clients.remove(&id);
         self.replicas.remove(&id);
         self.client_names.remove(&id);
         let mut tracking_removed = 0usize;
@@ -765,8 +768,14 @@ impl ServerContext {
 
     pub(crate) fn push_to(&self, client_id: u64, value: Value) {
         if let Some(sender) = self.clients.get(&client_id) {
-            let _ = sender.send(Arc::new(value));
+            if sender.try_send(Arc::new(value)).is_err() {
+                self.slow_clients.insert(client_id, ());
+            }
         }
+    }
+
+    pub fn is_slow_client(&self, client_id: u64) -> bool {
+        self.slow_clients.contains_key(&client_id)
     }
 }
 
@@ -1413,6 +1422,8 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "XACK" => stream::cmd_xack(ctx, state, args),
         "XPENDING" => stream::cmd_xpending(ctx, state, args),
         "XREAD" => stream::cmd_xread(ctx, state, args),
+        "XCLAIM" => stream::cmd_xclaim(ctx, state, args),
+        "XAUTOCLAIM" => stream::cmd_xautoclaim(ctx, state, args),
 
         "SUBSCRIBE" => pubsub::cmd_subscribe(ctx, state, args),
         "UNSUBSCRIBE" => pubsub::cmd_unsubscribe(ctx, state, args),
@@ -2054,6 +2065,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "XACK",
     "XPENDING",
     "XREAD",
+    "XCLAIM",
+    "XAUTOCLAIM",
     "SUBSCRIBE",
     "UNSUBSCRIBE",
     "PSUBSCRIBE",
@@ -2181,6 +2194,8 @@ const WRITE_COMMAND_NAMES: &[&str] = &[
     "XGROUP",
     "XREADGROUP",
     "XACK",
+    "XCLAIM",
+    "XAUTOCLAIM",
 ];
 
 /// `WRITE_COMMAND_NAMES`, but as a `HashSet` for O(1) membership checks —
@@ -2777,6 +2792,95 @@ mod tests {
         match run(&ctx, &mut st, &["XPENDING", "s", "g"]) {
             Value::Error(e) => assert!(e.starts_with("NOGROUP")),
             other => panic!("expected NOGROUP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xclaim_reassigns_pending_entries_to_another_consumer() {
+        let (ctx, mut st) = fresh();
+        run(&ctx, &mut st, &["XADD", "s", "1-1", "f", "a"]);
+        run(&ctx, &mut st, &["XADD", "s", "2-1", "f", "b"]);
+        run(&ctx, &mut st, &["XGROUP", "CREATE", "s", "g", "0"]);
+        run(&ctx, &mut st, &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"]);
+
+        // min-idle-time 0 always qualifies, deterministically.
+        match run(&ctx, &mut st, &["XCLAIM", "s", "g", "c2", "0", "1-1"]) {
+            Value::Array(entries) => {
+                assert_eq!(entries.len(), 1);
+                match &entries[0] {
+                    Value::Array(pair) => assert_eq!(pair[0], Value::bulk(&b"1-1"[..])),
+                    other => panic!("expected [id, fields], got {other:?}"),
+                }
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+        // Ownership moved: c2 now owns it, not c1.
+        match run(&ctx, &mut st, &["XPENDING", "s", "g", "-", "+", "10", "c1"]) {
+            Value::Array(items) => assert_eq!(items.len(), 1), // just 2-1 left for c1
+            other => panic!("expected an array, got {other:?}"),
+        }
+        match run(&ctx, &mut st, &["XPENDING", "s", "g", "-", "+", "10", "c2"]) {
+            Value::Array(items) => assert_eq!(items.len(), 1),
+            other => panic!("expected an array, got {other:?}"),
+        }
+
+        // Not pending and not FORCE: no-op.
+        assert_eq!(run(&ctx, &mut st, &["XCLAIM", "s", "g", "c2", "0", "9-9"]), Value::Array(vec![]));
+
+        // JUSTID: reply is just the id, not the fields.
+        assert_eq!(
+            run(&ctx, &mut st, &["XCLAIM", "s", "g", "c3", "0", "2-1", "JUSTID"]),
+            Value::Array(vec![Value::bulk(&b"2-1"[..])])
+        );
+
+        // Unknown group.
+        match run(&ctx, &mut st, &["XCLAIM", "s", "nope", "c1", "0", "1-1"]) {
+            Value::Error(e) => assert!(e.starts_with("NOGROUP")),
+            other => panic!("expected NOGROUP, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn xautoclaim_scans_the_pel_and_paginates_via_cursor() {
+        let (ctx, mut st) = fresh();
+        for i in 1..=3u64 {
+            run(&ctx, &mut st, &["XADD", "s", &format!("{i}-1"), "f", "a"]);
+        }
+        run(&ctx, &mut st, &["XGROUP", "CREATE", "s", "g", "0"]);
+        run(&ctx, &mut st, &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"]);
+
+        let (cursor, claimed) =
+            match run(&ctx, &mut st, &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT", "1"]) {
+                Value::Array(reply) => {
+                    assert_eq!(reply.len(), 3); // [cursor, claimed, deleted]
+                    let cursor = match &reply[0] {
+                        Value::Bulk(b) => b.clone(),
+                        other => panic!("expected bulk cursor, got {other:?}"),
+                    };
+                    let claimed = match &reply[1] {
+                        Value::Array(a) => a.len(),
+                        other => panic!("expected claimed array, got {other:?}"),
+                    };
+                    (cursor, claimed)
+                }
+                other => panic!("expected an array, got {other:?}"),
+            };
+        assert_eq!(claimed, 1);
+        assert_ne!(cursor.as_ref(), b"0-0"); // more left to scan
+
+        match run(&ctx, &mut st, &["XAUTOCLAIM", "s", "g", "c2", "0", std::str::from_utf8(&cursor).unwrap()])
+        {
+            Value::Array(reply) => {
+                match &reply[0] {
+                    Value::Bulk(b) => assert_eq!(b.as_ref(), b"0-0"), // fully scanned
+                    other => panic!("expected bulk cursor, got {other:?}"),
+                }
+                match &reply[1] {
+                    Value::Array(a) => assert_eq!(a.len(), 2), // the remaining two entries
+                    other => panic!("expected claimed array, got {other:?}"),
+                }
+            }
+            other => panic!("expected an array, got {other:?}"),
         }
     }
 

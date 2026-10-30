@@ -112,6 +112,8 @@ const KEY_COMMANDS: &[&str] = &[
     "WATCH",
     "XACK",
     "XADD",
+    "XAUTOCLAIM",
+    "XCLAIM",
     "XDEL",
     "XGROUP",
     "XLEN",

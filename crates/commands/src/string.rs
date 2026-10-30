@@ -14,6 +14,7 @@ use crate::range::{normalize, parse_i64};
 
 pub fn cmd_append(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let [key, suffix] = args else { return wrong_args("append") };
+    const MAX_STRING_SIZE: usize = 64 * 1024 * 1024;
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let key = key.clone();
 
@@ -22,13 +23,19 @@ pub fn cmd_append(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         || KVal::String(Bytes::new()),
         |v| match v {
             KVal::String(s) => {
-                let mut buf = Vec::with_capacity(s.len() + suffix.len());
+                let Some(new_len) = s.len().checked_add(suffix.len()) else {
+                    return Err(AppendError::TooLarge);
+                };
+                if new_len > MAX_STRING_SIZE {
+                    return Err(AppendError::TooLarge);
+                }
+                let mut buf = Vec::with_capacity(new_len);
                 buf.extend_from_slice(s);
                 buf.extend_from_slice(suffix);
                 *s = Bytes::from(buf);
                 Ok(s.len())
             }
-            _ => Err(()),
+            _ => Err(AppendError::WrongType),
         },
     );
 
@@ -38,8 +45,14 @@ pub fn cmd_append(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
             notify_keyspace_event(ctx, state.db_index, '$', "append", &key);
             reply(Value::Integer(len as i64))
         }
-        Err(()) => wrong_type(),
+        Err(AppendError::WrongType) => wrong_type(),
+        Err(AppendError::TooLarge) => err("ERR string exceeds maximum allowed size"),
     }
+}
+
+enum AppendError {
+    WrongType,
+    TooLarge,
 }
 
 enum IncrError {
@@ -418,7 +431,7 @@ pub fn cmd_setbit(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         b"1" => 1u8,
         _ => return err("ERR bit is not an integer or out of range"),
     };
-    const MAX_STRING_SIZE: usize = 512 * 1024 * 1024;
+    const MAX_STRING_SIZE: usize = 64 * 1024 * 1024;
     let byte_index = offset / 8;
     if byte_index >= MAX_STRING_SIZE {
         return err("ERR bit offset is not an integer or out of range");
@@ -502,7 +515,7 @@ pub fn cmd_setrange(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) ->
         Some(n) => n,
         None => return err("ERR offset is out of range"),
     };
-    const MAX_STRING_SIZE: usize = 512 * 1024 * 1024;
+    const MAX_STRING_SIZE: usize = 64 * 1024 * 1024;
     let Some(end) = offset.checked_add(replacement.len()) else {
         return err("ERR string exceeds maximum allowed size");
     };

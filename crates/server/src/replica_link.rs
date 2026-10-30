@@ -56,15 +56,23 @@ async fn run_link(ctx: Arc<ServerContext>, host: String, port: u16, epoch: u64) 
 }
 
 async fn try_link_once(ctx: &Arc<ServerContext>, host: &str, port: u16, epoch: u64) -> io::Result<()> {
-    let stream = TcpStream::connect((host, port)).await?;
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    const FULL_RESYNC_TIMEOUT: Duration = Duration::from_secs(300);
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "replication connect timed out"))??;
     stream.set_nodelay(true).ok();
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
-    write_half.write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n").await?;
-
-    let mut applied = read_fullresync_line(&mut reader).await?;
-    let snapshot = read_bulk_payload(&mut reader).await?;
+    let (mut applied, snapshot) = tokio::time::timeout(FULL_RESYNC_TIMEOUT, async {
+        write_half.write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n").await?;
+        let offset = read_fullresync_line(&mut reader).await?;
+        let snapshot = read_bulk_payload(&mut reader).await?;
+        io::Result::Ok((offset, snapshot))
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "replication full resync timed out"))??;
 
     for i in 0..ctx.store.len() {
         if let Some(db) = ctx.store.db(i) {

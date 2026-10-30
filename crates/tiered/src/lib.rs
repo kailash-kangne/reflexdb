@@ -8,6 +8,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -82,6 +83,7 @@ pub struct FjallTier {
     // accurate the instant a write/remove happens, which matters more for
     // a capacity guard than being exact.
     used_bytes: AtomicU64,
+    accounting_lock: Mutex<()>,
 }
 
 impl FjallTier {
@@ -89,7 +91,13 @@ impl FjallTier {
         std::fs::create_dir_all(dir).map_err(fjall::Error::from)?;
         let db = Database::builder(dir).open()?;
         let keyspace = db.keyspace("reflexdb-tier", KeyspaceCreateOptions::default)?;
-        Ok(Self { keyspace, _db: db, used_bytes: AtomicU64::new(0) })
+        let used_bytes = keyspace.iter().filter_map(|guard| guard.value().ok().map(|v| v.len() as u64)).sum();
+        Ok(Self {
+            keyspace,
+            _db: db,
+            used_bytes: AtomicU64::new(used_bytes),
+            accounting_lock: Mutex::new(()),
+        })
     }
 
     /// Looks up `key`'s stored payload length (if present) and subtracts
@@ -97,10 +105,12 @@ impl FjallTier {
     /// path (explicit `remove`, promote, corrupt/expired cleanup) goes
     /// through this so the counter can't drift out of sync.
     fn remove_tracked(&self, key: &[u8]) {
+        let _guard = self.accounting_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Ok(Some(payload)) = self.keyspace.get(key) {
-            self.used_bytes.fetch_sub(payload.len() as u64, Ordering::Relaxed);
+            if self.keyspace.remove(key).is_ok() {
+                self.used_bytes.fetch_sub(payload.len() as u64, Ordering::Relaxed);
+            }
         }
-        let _ = self.keyspace.remove(key);
     }
 }
 
@@ -113,9 +123,12 @@ impl TieringHandler for FjallTier {
         };
         let payload = encode_entry(&entry).map_err(|e| format!("serialize tiered value: {e}"))?;
         let len = payload.len() as u64;
+        let _guard = self.accounting_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old_len = self.keyspace.get(key.as_ref()).ok().flatten().map(|old| old.len() as u64).unwrap_or(0);
         self.keyspace
             .insert(key.as_ref(), payload)
             .map_err(|e| format!("write evicted key to disk tier: {e}"))?;
+        self.used_bytes.fetch_sub(old_len, Ordering::Relaxed);
         self.used_bytes.fetch_add(len, Ordering::Relaxed);
         // Without this, writes sit in fjall's in-memory journal buffer
         // until its own internal flush threshold — a process crash right

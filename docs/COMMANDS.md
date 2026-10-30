@@ -51,10 +51,9 @@ Iteration order is randomized per-process — never assert ordering from `HKEYS`
 ## Stream
 
 `XADD`, `XLEN`, `XRANGE`, `XREVRANGE`, `XDEL`, `XTRIM`, `XGROUP`, `XREADGROUP`, `XACK`,
-`XPENDING`, `XREAD`
+`XPENDING`, `XREAD`, `XCLAIM`, `XAUTOCLAIM`
 
-`XCLAIM`/`XAUTOCLAIM`, `XINFO`, standalone `XSETID`, `BLOCK`ing reads, `MINID` trimming —
-**[cut]**.
+`XINFO`, standalone `XSETID`, `BLOCK`ing reads, `MINID` trimming — **[cut]**.
 
 ## Geo, HyperLogLog — **[cut]**
 

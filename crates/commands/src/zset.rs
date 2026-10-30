@@ -690,15 +690,11 @@ pub fn cmd_zrangebyscore(ctx: &ServerContext, state: &ClientState, args: &[Bytes
 
     let db = ctx.store.db(state.db_index).expect("valid db index");
     match db.with_value(key, |v| match v {
-        KVal::ZSet(z) => Ok(z.sorted()),
+        KVal::ZSet(z) => Ok(z.range_by_score(min, max).map(|(m, s)| (m.clone(), s)).collect::<Vec<_>>()),
         _ => Err(()),
     }) {
         None => reply(Value::Array(vec![])),
-        Some(Ok(sorted)) => {
-            let filtered: Vec<(Bytes, f64)> =
-                sorted.into_iter().filter(|(_, s)| *s >= min && *s <= max).collect();
-            reply(Value::Array(render(&filtered, withscores)))
-        }
+        Some(Ok(sorted)) => reply(Value::Array(render(&sorted, withscores))),
         Some(Err(())) => wrong_type(),
     }
 }
@@ -788,15 +784,13 @@ pub fn cmd_zrevrangebyscore(ctx: &ServerContext, state: &ClientState, args: &[By
 
     let db = ctx.store.db(state.db_index).expect("valid db index");
     match db.with_value(key, |v| match v {
-        KVal::ZSet(z) => Ok(z.sorted()),
+        KVal::ZSet(z) => Ok(z.range_by_score(min, max).map(|(m, s)| (m.clone(), s)).collect::<Vec<_>>()),
         _ => Err(()),
     }) {
         None => reply(Value::Array(vec![])),
-        Some(Ok(sorted)) => {
-            let mut filtered: Vec<(Bytes, f64)> =
-                sorted.into_iter().filter(|(_, s)| *s >= min && *s <= max).collect();
-            filtered.reverse();
-            reply(Value::Array(render(&filtered, withscores)))
+        Some(Ok(mut sorted)) => {
+            sorted.reverse();
+            reply(Value::Array(render(&sorted, withscores)))
         }
         Some(Err(())) => wrong_type(),
     }
@@ -811,13 +805,11 @@ pub fn cmd_zcount(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     };
     let db = ctx.store.db(state.db_index).expect("valid db index");
     match db.with_value(key, |v| match v {
-        KVal::ZSet(z) => Ok(z.sorted()),
+        KVal::ZSet(z) => Ok(z.range_by_score(min, max).count()),
         _ => Err(()),
     }) {
         None => reply(Value::Integer(0)),
-        Some(Ok(sorted)) => {
-            reply(Value::Integer(sorted.iter().filter(|(_, s)| *s >= min && *s <= max).count() as i64))
-        }
+        Some(Ok(count)) => reply(Value::Integer(count as i64)),
         Some(Err(())) => wrong_type(),
     }
 }
@@ -832,14 +824,7 @@ pub fn cmd_zremrangebyscore(ctx: &ServerContext, state: &ClientState, args: &[By
     };
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let removed = db.with_value_mut(key, |v| match v {
-        KVal::ZSet(z) => {
-            let to_remove: Vec<Bytes> =
-                z.sorted().into_iter().filter(|(_, s)| *s >= min && *s <= max).map(|(m, _)| m).collect();
-            for m in &to_remove {
-                z.remove(m);
-            }
-            Ok(to_remove.len())
-        }
+        KVal::ZSet(z) => Ok(z.remove_score_range(min, max)),
         _ => Err(()),
     });
     let removed = match removed {
