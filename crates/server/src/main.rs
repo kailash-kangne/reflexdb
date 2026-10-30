@@ -47,6 +47,8 @@ async fn main() -> std::io::Result<()> {
         .with_rdb_path(cfg.rdb_path())
         .with_maxmemory(cfg.maxmemory, cfg.maxmemory_policy)
         .with_tiered_limit(cfg.tiered_storage.then_some(cfg.tiered_memory_limit))
+        .with_tiered_disk_limit(cfg.tiered_storage.then_some(cfg.tiered_disk_limit).flatten())
+        .with_slowlog(cfg.slowlog_log_slower_than_us, cfg.slowlog_max_len)
         .with_singleflight_max_wait(Duration::from_millis(cfg.singleflight_max_wait_ms))
         .with_notify_keyspace_events(commands::NotifyFlags::parse(&cfg.notify_keyspace_events));
 
@@ -95,8 +97,9 @@ async fn main() -> std::io::Result<()> {
     // fires any `SCHEDULE AT`/`SCHEDULE IN` commands whose time has come.
     {
         let ctx = ctx.clone();
+        let tick_ms = cfg.eviction_tick_ms.max(1);
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(100));
+            let mut tick = tokio::time::interval(Duration::from_millis(tick_ms));
             loop {
                 tick.tick().await;
                 ctx.store.active_expire_cycle(20);
@@ -255,6 +258,7 @@ where
     let mut reader = FramedRead::new(read_half, resp::RequestDecoder);
 
     let (id, mut pushes) = ctx.register_client();
+    let mut live_events = ctx.subscribe_live_events();
     let _guard = ClientGuard { ctx: ctx.clone(), id };
 
     let mut state = ClientState::with_id(id, ctx.requirepass.is_some());
@@ -262,11 +266,26 @@ where
 
     loop {
         tokio::select! {
-            // Pub/Sub message or LIVE update pushed from another connection.
-            Some(value) = pushes.recv() => {
+            // Pub/Sub message pushed from another connection.
+            Some(push) = pushes.recv() => {
                 out.clear();
-                resp::encode_reply(&value, state.protocol, &mut out);
+                resp::encode_reply(push.as_ref(), state.protocol, &mut out);
                 write_half.write_all(&out).await?;
+            }
+            // One of this connection's own `LIVE` subscriptions changed —
+            // fetch its latest cached result and push it. `ctx.live_events`
+            // only carries a fingerprint (cheap to broadcast on every
+            // write); a connection lagging behind a write burst just skips
+            // the intermediate values it missed, since every fingerprint
+            // resolves to whatever is currently cached, not a queued diff.
+            Ok(fp) = live_events.recv(), if !state.live_fingerprints.is_empty() => {
+                if state.live_fingerprints.contains(&fp) {
+                    if let Some(value) = ctx.latest_live_value(fp) {
+                        out.clear();
+                        resp::encode_reply(value.as_ref(), state.protocol, &mut out);
+                        write_half.write_all(&out).await?;
+                    }
+                }
             }
             frame = tokio_stream_next(&mut reader) => {
                 let req = match frame {

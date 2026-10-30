@@ -78,6 +78,39 @@ const HTML: &str = r###"<!DOCTYPE html>
   .cmd-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 1.1rem; }
   .cmd-card { background: #14141c; border: 1px solid #2a2a38; border-radius: 16px; padding: 1.1rem; border-top: 3px solid var(--accent, #8b5cf6); transition: transform .15s, border-color .15s; }
   .cmd-card:hover { transform: translateY(-2px); border-color: #3a3a4a; }
+  .latency-panel { display: grid; gap: 1rem; background: #14141c; border: 1px solid #2a2a38; border-radius: 16px; padding: 1.25rem; }
+  .latency-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: .8rem; }
+  .latency-field { display: grid; gap: .35rem; }
+  .latency-field label { color: #9a9aa8; font-size: .82rem; }
+  .latency-field input { width: 100%; }
+  .scenario-picks { display: flex; gap: .55rem; flex-wrap: wrap; }
+  .scenario-pick { display: flex; align-items: center; gap: .45rem; background: #0c0c12; border: 1px solid #2a2a38; padding: .55rem .75rem; border-radius: 9px; color: #c5c5d0; font-size: .84rem; }
+  .scenario-pick input { accent-color: #a78bfa; }
+  .latency-results { display: grid; gap: 1rem; }
+  .latency-card { background: linear-gradient(155deg,#171722,#101018); border: 1px solid #2a2a38; border-radius: 14px; padding: 1rem 1.15rem; }
+  .latency-card h3 { margin: 0 0 .8rem; color: #e8e8ee; font-size: 1rem; }
+  .latency-kpis { display: grid; grid-template-columns: repeat(auto-fit,minmax(125px,1fr)); gap: .6rem; }
+  .latency-kpi { background:#0c0c12; border:1px solid #24242f; border-radius:10px; padding:.7rem; }
+  .latency-kpi span { display:block; color:#8a8a99; font-size:.7rem; text-transform:uppercase; letter-spacing:.04em; }
+  .latency-kpi strong { display:block; color:#e8e8ee; font-size:1.2rem; margin-top:.25rem; }
+  .latency-table-wrap { overflow-x:auto; }
+  #latencyTable { min-width:760px; }
+  .latency-empty { color:#8a8a99; border:1px dashed #333345; padding:1rem; border-radius:10px; text-align:center; }
+  .latency-chart-wrap { background:#101018; border:1px solid #2a2a38; border-radius:14px; padding:1rem; overflow-x:auto; }
+  #shootoutChart { width:100%; min-width:620px; height:auto; display:block; }
+  .chart-legend { display:flex; gap:1rem; flex-wrap:wrap; color:#a8a8b5; font-size:.78rem; margin:.2rem 0 .75rem; }
+  .legend-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:.35rem; }
+  #shootoutTable { min-width:760px; }
+  .shootout-engine-grid { display:flex; flex-direction:column; gap: 1rem; }
+  .shootout-engine-card { background:#101018; border:1px solid #2a2a38; border-radius:14px; padding:1rem; border-top: 3px solid var(--accent, #8b5cf6); }
+  .shootout-engine-card h3 { margin: 0 0 .6rem; color:#e8e8ee; font-size:1rem; display:flex; align-items:center; gap:.5rem; }
+  .shootout-engine-card .engine-status { font-size:.74rem; color:#9a9aa8; font-weight: 400; }
+  .shootout-engine-card svg { width:100%; max-width:460px; height:auto; display:block; }
+  .shootout-status-row { display:flex; gap:.6rem; flex-wrap:wrap; margin: .75rem 0; }
+  .shootout-status-chip { display:flex; align-items:center; gap:.4rem; background:#101018; border:1px solid #2a2a38; border-radius:20px; padding:.3rem .75rem; font-size:.78rem; color:#d4d4de; }
+  .shootout-status-chip .legend-dot { margin-right:0; }
+  .shootout-status-chip .chip-status { color:#9a9aa8; }
+  #shootoutTable tbody tr.workload-group-start td { border-top: 2px solid #4a4a5c; }
   .cmd-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .5rem; }
   .cmd-name { font-weight: 800; font-size: 1.05rem; letter-spacing: .02em; }
   .cmd-status { font-size: .72rem; font-weight: 700; padding: .2rem .6rem; border-radius: 20px; text-transform: uppercase; letter-spacing: .03em; }
@@ -121,20 +154,20 @@ const HTML: &str = r###"<!DOCTYPE html>
 <p class="subtitle">Pick a workload, run it, and watch RAM &amp; disk move in real time &mdash; one card per command.</p>
 
 <div class="limit-inputs">
-  <label for="ramLimitGB">Max RAM (GB)</label>
+  <label for="ramLimitGB">Warn above (GB RAM)</label>
   <input id="ramLimitGB" type="number" value="8" step="0.1" min="0.1">
-  <label for="diskLimitGB">Max Disk (GB)</label>
-  <input id="diskLimitGB" type="number" value="0.5" step="0.1" min="0.1">
+  <label for="diskLimitGB">Warn above (GB disk)</label>
+  <input id="diskLimitGB" type="number" value="20" step="0.1" min="0.1">
 </div>
 
 <button id="refreshStats" class="secondary">Show host memory &amp; disk</button>
 <div id="statsArea" style="margin: 1rem 0; display:none;">
   <div style="margin-bottom:1rem;">
-    <div class="bar-label"><span>Host RAM</span><span id="ramText">-</span></div>
+    <div class="bar-label"><span>Host RAM (live)</span><span id="ramText">-</span></div>
     <div class="bar-wrap"><div id="ramBar" class="bar-fill"></div></div>
   </div>
   <div>
-    <div class="bar-label"><span>Host Disk</span><span id="diskText">-</span></div>
+    <div class="bar-label"><span>Host Disk (live)</span><span id="diskText">-</span></div>
     <div class="bar-wrap"><div id="diskBar" class="bar-fill"></div></div>
   </div>
   <pre id="statsRaw" style="display:none;"></pre>
@@ -143,6 +176,29 @@ const HTML: &str = r###"<!DOCTYPE html>
 <div class="tab-row" id="tabRow">
   <button type="button" class="tab-btn active" data-tab="sequential">Sequential</button>
   <button type="button" class="tab-btn" data-tab="parallel">Parallel (all at once)</button>
+  <button type="button" class="tab-btn" data-tab="latency">Latency lab</button>
+  <button type="button" class="tab-btn" data-tab="durability">Durability / crash recovery<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Spawns its own throwaway <code>reflexdb-server</code> (not your running one), writes under load,
+    force-kills it (<code>SIGKILL</code>), restarts it against the same data dir, and compares
+    acknowledged writes to what AOF replay actually recovered — per <code>appendfsync</code> policy.
+  </span></span></button>
+  <button type="button" class="tab-btn" data-tab="reslimit">Resource limits (OOM / disk-full)<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Runs <code>reflexdb-server</code> in one Docker container with a real, OS-enforced
+    <code>--memory</code> cap and a size-capped <code>--tmpfs /data</code> mount applied at the
+    same time — not reflexdb's own <code>maxmemory</code> (which degrades gracefully by rejecting
+    writes, never crashes). Shows whether the kernel OOM-kills it and/or the disk fills up, and
+    whether it keeps responding once it does.
+    Needs Docker running and <code>docker build -f Dockerfile.bench -t reflexdb-bench:latest .</code>
+    done once beforehand.
+  </span></span></button>
+  <button type="button" class="tab-btn" data-tab="shootout">Engine shootout<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Runs Redis, Dragonfly, and ReflexDB each in their own Docker container with an identical
+    <code>--memory</code>/<code>--cpus</code> cap, feeds each the exact same workload (one at a
+    time, never concurrently — otherwise they'd be competing for the same physical CPU/memory
+    bandwidth), and charts throughput/tail latency side by side. Needs Docker running; pulls
+    <code>redis:7-alpine</code> and the Dragonfly image automatically the first time, and needs
+    <code>docker build -f Dockerfile.bench -t reflexdb-bench:latest .</code> done once for ReflexDB.
+  </span></span></button>
   <button type="button" class="tab-btn" data-tab="history" hidden id="historyTabBtn">History (GETAT/HISTORY)<span class="tab-badge">on</span><span class="info-icon" tabindex="0">i<span class="info-tooltip">
     <strong>History mode</strong> runs three steps in order: (1) <code>SET</code> writes to populate a keyspace
     (history is recorded automatically on every write once <code>history-enabled yes</code> is set), then
@@ -184,6 +240,158 @@ const HTML: &str = r###"<!DOCTYPE html>
   </div>
 </form>
 
+<section id="latencyPanel" class="latency-panel" style="display:none;">
+  <div class="note" style="margin:0;">
+    <strong>Explore the tradeoffs.</strong> Each run connects to your server, measures client-observed latency,
+    and reports p50/p99/p999 plus throughput. Use short runs to explore; use repeated longer runs on an idle,
+    release-build server before sharing a result.
+  </div>
+  <div class="latency-fields">
+    <div class="latency-field"><label for="latHost">Server host</label><input id="latHost" value="127.0.0.1"></div>
+    <div class="latency-field"><label for="latPort">Server port</label><input id="latPort" type="number" value="7379" min="1" max="65535"></div>
+    <div class="latency-field"><label for="latSeconds">Seconds per run</label><input id="latSeconds" type="number" value="5" min="1" max="60"></div>
+    <div class="latency-field"><label for="latRuns">Repeated runs</label><input id="latRuns" type="number" value="3" min="1" max="10"></div>
+    <div class="latency-field"><label for="latClients">Concurrent clients</label><input id="latClients" type="number" value="16" min="1" max="512"></div>
+    <div class="latency-field"><label for="latPipeline">Pipeline depths</label><input id="latPipeline" value="1,16" inputmode="numeric"></div>
+    <div class="latency-field"><label for="latKeys">Small-key dataset size</label><input id="latKeys" type="number" value="1000" min="1" max="100000"></div>
+    <div class="latency-field"><label for="latWatchers">LIVE watchers</label><input id="latWatchers" type="number" value="1000" min="0" max="10000"></div>
+    <div class="latency-field"><label for="latLiveDrain">LIVE measurement</label><select id="latLiveDrain"><option value="buffered">Writer latency (buffered clients)</option><option value="selector">End-to-end delivery (selector)</option></select></div>
+  </div>
+  <div>
+    <div class="latency-field" style="margin-bottom:.5rem;"><label>Workloads to compare</label></div>
+    <div class="scenario-picks">
+      <label class="scenario-pick"><input type="checkbox" name="latWorkload" value="small-mixed" checked> Small-key mixed</label>
+      <label class="scenario-pick"><input type="checkbox" name="latWorkload" value="hot-key" checked> Hot-key contention</label>
+      <label class="scenario-pick"><input type="checkbox" name="latWorkload" value="live-fanout" checked> LIVE fan-out</label>
+    </div>
+  </div>
+  <div class="actions" style="margin:0;">
+    <button type="button" id="latRunBtn">Run comparison</button>
+    <button type="button" id="latStopBtn" class="secondary" disabled>Stop</button>
+    <span id="latStatus" style="color:#9a9aa8;font-size:.86rem;">Ready. Defaults are editable.</span>
+  </div>
+  <div id="latencyResults" class="latency-results"><div class="latency-empty">Run a workload to see throughput and tail latency.</div></div>
+  <div id="latencyTableWrap" class="latency-table-wrap" style="display:none;">
+    <table id="latencyTable"><thead><tr><th>Run</th><th>Workload</th><th>Pipeline</th><th>Clients</th><th>Ops/s</th><th>p50</th><th>p99</th><th>p999</th><th>Errors</th></tr></thead><tbody id="latencyBody"></tbody></table>
+  </div>
+</section>
+
+<section id="durabilityPanel" class="latency-panel" style="display:none;">
+  <div class="note" style="margin:0;">
+    <strong>This spawns its own server</strong> on the demo port below (default <code>17380</code>,
+    not your running server) in a throwaway data dir, so it's safe to run against any machine with
+    <code>reflexdb-server</code> built. Each policy gets a clean data dir and is tested one at a time.
+  </div>
+  <div class="note" style="margin:0; border-left-color:#f59e0b;">
+    <strong>What this does and doesn't prove.</strong> The kill here is <code>SIGKILL</code> on the
+    server process — it proves AOF replay correctly recovers whatever actually hit disk, but it does
+    <em>not</em> simulate a real power loss/OS crash. <code>appendfsync no</code> — the default if
+    <code>appendfsync</code> isn't set at all — relies on the OS page cache, which usually survives a
+    killed process but would not survive a hard power cut — a clean (0 lost) result for <code>no</code>
+    here is expected and isn't evidence it's as safe as <code>always</code>/<code>everysec</code>
+    against a real outage. If you need a bounded worst case, set <code>appendfsync everysec</code> or
+    <code>always</code> explicitly — don't rely on the default for that.<br><br>
+    Also: unlike Redis, <code>appendfsync always</code> here does <strong>not</strong> block the
+    client's reply until the write is fsync'd — every policy is fire-and-forget to a background
+    writer thread (see <code>crates/persistence/src/aof.rs</code>); <code>always</code> only fsyncs
+    after every batch. A small, non-zero <code>lost</code> count for <code>always</code> on a
+    process-kill test is therefore expected, not a bug — don't present it to a client as
+    "zero data loss," and consider <code>WAITAOF</code> for callers that need a real durability ack.
+  </div>
+  <div class="latency-fields">
+    <div class="latency-field"><label for="durHost">Demo server host</label><input id="durHost" value="127.0.0.1"></div>
+    <div class="latency-field"><label for="durPort">Demo server port</label><input id="durPort" type="number" value="17380" min="1" max="65535"></div>
+    <div class="latency-field"><label for="durSeconds">Seconds of writes before the kill</label><input id="durSeconds" type="number" value="4" min="1" max="30"></div>
+  </div>
+  <div>
+    <div class="latency-field" style="margin-bottom:.5rem;"><label>appendfsync policies to compare</label></div>
+    <div class="scenario-picks">
+      <label class="scenario-pick"><input type="checkbox" name="durPolicy" value="always" checked> always</label>
+      <label class="scenario-pick"><input type="checkbox" name="durPolicy" value="everysec" checked> everysec</label>
+      <label class="scenario-pick"><input type="checkbox" name="durPolicy" value="no" checked> no</label>
+    </div>
+  </div>
+  <div class="actions" style="margin:0;">
+    <button type="button" id="durRunBtn">Run crash-recovery test</button>
+    <button type="button" id="durStopBtn" class="secondary" disabled>Stop</button>
+    <span id="durStatus" style="color:#9a9aa8;font-size:.86rem;">Ready. Each policy runs sequentially — this takes a while.</span>
+  </div>
+  <div id="durabilityResults" class="latency-results"><div class="latency-empty">Run the test to see acknowledged vs. recovered writes per policy.</div></div>
+</section>
+
+<section id="reslimitPanel" class="latency-panel" style="display:none;">
+  <div class="note" style="margin:0;">
+    <strong>Runs in Docker</strong>, not as a plain process — that's the only reliable
+    cross-platform way to get a real, OS-enforced RAM/disk ceiling (macOS has no cgroups).
+    Build the image once: <code>docker build -f Dockerfile.bench -t reflexdb-bench:latest .</code>
+  </div>
+  <div class="latency-fields">
+    <div class="latency-field"><label for="resImage">Docker image</label><input id="resImage" value="reflexdb-bench:latest"></div>
+    <div class="latency-field"><label for="resPort">Demo server port</label><input id="resPort" type="number" value="17385" min="1" max="65535"></div>
+    <div class="latency-field"><label for="resRamGB">RAM limit (GB)</label><input id="resRamGB" type="number" value="1" step="0.1" min="0.1"></div>
+    <div class="latency-field"><label for="resDiskGB">Disk limit (GB)</label><input id="resDiskGB" type="number" value="0.25" step="0.05" min="0.05"></div>
+    <div class="latency-field"><label for="resValueBytes">Value size (bytes)</label><input id="resValueBytes" type="number" value="4096" min="64" max="65536"></div>
+    <div class="latency-field"><label for="resMaxSeconds">Safety cap (seconds)</label><input id="resMaxSeconds" type="number" value="90" min="5" max="300"></div>
+  </div>
+  <div class="note" style="margin:0;">
+    Both limits are applied to one container at once, so whichever fills up first is what
+    actually crashes it — the result reports which (RAM, disk, or both).
+  </div>
+  <div class="actions" style="margin:0;">
+    <button type="button" id="resRunBtn">Run resource-limit test</button>
+    <button type="button" id="resStopBtn" class="secondary" disabled>Stop</button>
+    <span id="resStatus" style="color:#9a9aa8;font-size:.86rem;">Ready. Needs Docker running and the image built.</span>
+  </div>
+  <div id="reslimitResults" class="latency-results"><div class="latency-empty">Run the test to see crash behavior under a real hard limit.</div></div>
+</section>
+
+<section id="shootoutPanel" class="latency-panel" style="display:none;">
+  <div class="note" style="margin:0;">
+    <strong>Quick side-by-side, not a lab-grade isolated benchmark.</strong> All three engines run
+    <em>at the same time</em>, each in its own container, each with the same <code>--memory</code>/
+    <code>--cpus</code> cap, on its own port (<code>port</code>, <code>port+1</code>, <code>port+2</code>
+    below). Running concurrently means they share the host's real CPU/memory bandwidth while all three
+    are active — each container's limit still caps what <em>it</em> can use, but "nothing else was
+    running" is no longer true. Persistence is off on all three. This keeps running even if you switch
+    to another tab; use Stop to actually cancel it.
+  </div>
+  <div class="latency-fields">
+    <div class="latency-field"><label for="sMemMB">Memory limit (MB, each engine)</label><input id="sMemMB" type="number" value="512" min="64" max="65536"></div>
+    <div class="latency-field"><label for="sCpus">CPU limit (cores, each engine)</label><input id="sCpus" type="number" value="1" step="0.1" min="0.1" max="64"></div>
+    <div class="latency-field"><label for="sPort">Base port (each engine gets port, port+1, port+2\u2026)</label><input id="sPort" type="number" value="17400" min="1" max="65500"></div>
+    <div class="latency-field"><label for="sSeconds">Seconds per run</label><input id="sSeconds" type="number" value="5" min="1" max="60"></div>
+    <div class="latency-field"><label for="sRuns">Repeated runs</label><input id="sRuns" type="number" value="1" min="1" max="10"></div>
+    <div class="latency-field"><label for="sClients">Concurrent clients</label><input id="sClients" type="number" value="16" min="1" max="512"></div>
+    <div class="latency-field"><label for="sPipeline">Pipeline depths</label><input id="sPipeline" value="1,16" inputmode="numeric"></div>
+    <div class="latency-field"><label for="sKeys">Small-key dataset size</label><input id="sKeys" type="number" value="1000" min="1" max="100000"></div>
+  </div>
+  <div>
+    <div class="latency-field" style="margin-bottom:.5rem;"><label>Engines</label></div>
+    <div class="scenario-picks">
+      <label class="scenario-pick"><input type="checkbox" name="sEngine" value="redis" checked> Redis</label>
+      <label class="scenario-pick"><input type="checkbox" name="sEngine" value="dragonfly" checked> Dragonfly</label>
+      <label class="scenario-pick"><input type="checkbox" name="sEngine" value="reflexdb" checked> ReflexDB</label>
+    </div>
+  </div>
+  <div>
+    <div class="latency-field" style="margin-bottom:.5rem;"><label>Workloads</label></div>
+    <div class="scenario-picks">
+      <label class="scenario-pick"><input type="checkbox" name="sWorkload" value="small-mixed" checked> Small-key mixed</label>
+      <label class="scenario-pick"><input type="checkbox" name="sWorkload" value="hot-key" checked> Hot-key contention</label>
+    </div>
+  </div>
+  <div class="actions" style="margin:0;">
+    <button type="button" id="sRunBtn">Run shootout</button>
+    <button type="button" id="sStopBtn" class="secondary" disabled>Stop</button>
+    <span id="sStatus" style="color:#9a9aa8;font-size:.86rem;">Ready. Needs Docker running.</span>
+  </div>
+  <div id="shootoutEngineStatusRow" class="shootout-status-row"></div>
+  <div id="shootoutEngineGrid" class="shootout-engine-grid"></div>
+  <div id="shootoutTableWrap" class="latency-table-wrap" style="display:none;">
+    <table id="shootoutTable"><thead><tr><th>Engine</th><th>Run</th><th>Workload</th><th>Pipeline</th><th>Ops/s</th><th>p50</th><th>p99</th><th>p999</th><th>Errors</th></tr></thead><tbody id="shootoutBody"></tbody></table>
+  </div>
+</section>
+
 <div id="liveDemoPanel" class="panel" style="display:none;">
   <label>Host</label><input id="liveHost" value="127.0.0.1">
   <label>Port</label><input id="livePort" value="7379" type="number">
@@ -214,17 +422,22 @@ const HTML: &str = r###"<!DOCTYPE html>
 
 <div id="tieredDemoPanel" class="panel" style="display:none;">
   <div class="note" style="grid-column: 1 / -1;">
-    <strong>This must point at a dedicated server</strong>, not your regular one (e.g. not the
-    default port <code>7379</code>) — <code>tiered-storage</code> and
-    <code>tiered-memory-limit</code> can only be set when a server <em>starts</em> (in its
-    <code>.conf</code> file), there's no way to turn tiering on or change the limit from this UI
-    or from a running client. Start one like:
-    <pre style="margin:.5rem 0 0; background:#0c0c12; padding:.6rem .8rem; border-radius:8px; font-size:.78rem;">reflexdb-server --port 7391 --dir /tmp/tiered-demo \
-  --tiered-storage yes --tiered-memory-limit 10kb --tiered-dir tiered</pre>
+    <strong>Spawns its own throwaway server</strong> on the demo port below (not your regular
+    one) in a throwaway data dir — <code>tiered-storage</code>, <code>tiered-memory-limit</code>,
+    and <code>tiered-disk-limit</code> can only be set at server <em>startup</em>, there's no live
+    <code>CONFIG SET</code> for them, so this is the only way to make them UI-configurable at all.
+    Needs <code>reflexdb-server</code> built (<code>cargo build --bin reflexdb-server</code>).
   </div>
-  <label>Host</label><input id="tieredHost" value="127.0.0.1">
-  <label>Port</label><input id="tieredPort" value="7391" type="number">
-  <label>Tiered dir (on disk)</label><input id="tieredDir" value="/tmp/tiered-demo/tiered">
+  <label>Demo server port</label><input id="tieredPort" value="17391" type="number">
+  <label>Tiered memory limit<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    RAM budget before keys start spilling to disk. Accepts the same size strings as the config
+    file: <code>10kb</code>, <code>1mb</code>, etc.
+  </span></span></label><input id="tieredMemoryLimit" value="10kb">
+  <label>Tiered disk limit (blank = unbounded)<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Once the disk tier itself exceeds this, cold tiered entries are dropped outright (real loss,
+    same spirit as <code>allkeys-random</code> — nowhere left to move them). Leave blank to test
+    the old unbounded behavior.
+  </span></span></label><input id="tieredDiskLimit" value="50kb">
   <label>Keys to write</label><input id="tieredCount" value="2000" type="number">
   <label>Value size (bytes)</label><input id="tieredSize" value="2000" type="number">
   <div class="actions">
@@ -255,7 +468,7 @@ const HTML: &str = r###"<!DOCTYPE html>
 <div id="tieredSummary" class="hero-row" style="display:none;">
   <div class="hero-card"><div class="k">Keys written</div><div class="v purple" id="tsWritten">-</div></div>
   <div class="hero-card"><div class="k">DBSIZE (in RAM)</div><div class="v cyan" id="tsDbsize">-</div></div>
-  <div class="hero-card"><div class="k">Tiered dir on disk</div><div class="v green" id="tsDisk">-</div></div>
+  <div class="hero-card"><div class="k">Tracked tiered usage</div><div class="v green" id="tsDisk">-</div></div>
   <div class="hero-card"><div class="k">Promote GET time</div><div class="v red" id="tsPromote">-</div></div>
 </div>
 
@@ -330,6 +543,10 @@ const runEndpoints = { sequential: '/run-profiled', parallel: '/run-profiled', h
 const benchResults = document.getElementById('benchResults');
 const liveDemoPanel = document.getElementById('liveDemoPanel');
 const tieredDemoPanel = document.getElementById('tieredDemoPanel');
+const latencyPanel = document.getElementById('latencyPanel');
+const durabilityPanel = document.getElementById('durabilityPanel');
+const reslimitPanel = document.getElementById('reslimitPanel');
+const shootoutPanel = document.getElementById('shootoutPanel');
 const liveFeed = document.getElementById('liveFeed');
 const liveStats = document.getElementById('liveStats');
 const liveExplain = document.getElementById('liveExplain');
@@ -342,6 +559,10 @@ let controller = null;
 let liveController = null;
 let liveAutoController = null;
 let tieredController = null;
+let latencyController = null;
+let durabilityController = null;
+let reslimitController = null;
+let shootoutController = null;
 let currentTab = 'sequential';
 let liveStartedAt = 0;
 let liveWatchedKeyCount = 0;
@@ -375,8 +596,16 @@ function setTab(tab) {
 
   const isLive = tab === 'live';
   const isTiered = tab === 'tiered';
-  bench.style.display = (isLive || isTiered) ? 'none' : '';
-  benchResults.style.display = (isLive || isTiered) ? 'none' : '';
+  const isLatency = tab === 'latency';
+  const isDurability = tab === 'durability';
+  const isReslimit = tab === 'reslimit';
+  const isShootout = tab === 'shootout';
+  bench.style.display = (isLive || isTiered || isLatency || isDurability || isReslimit || isShootout) ? 'none' : '';
+  benchResults.style.display = (isLive || isTiered || isLatency || isDurability || isReslimit || isShootout) ? 'none' : '';
+  latencyPanel.style.display = isLatency ? 'grid' : 'none';
+  durabilityPanel.style.display = isDurability ? 'grid' : 'none';
+  reslimitPanel.style.display = isReslimit ? 'grid' : 'none';
+  shootoutPanel.style.display = isShootout ? 'grid' : 'none';
   liveDemoPanel.style.display = isLive ? 'grid' : 'none';
   tieredDemoPanel.style.display = isTiered ? 'grid' : 'none';
   liveFeed.style.display = isLive ? '' : 'none';
@@ -385,6 +614,14 @@ function setTab(tab) {
   if (!isLive && liveController) { liveController.abort(); liveController = null; }
   if (!isLive && liveAutoController) { liveAutoController.abort(); liveAutoController = null; }
   if (!isTiered && tieredController) { tieredController.abort(); tieredController = null; }
+  if (!isLatency && latencyController) { latencyController.abort(); latencyController = null; }
+  if (!isDurability && durabilityController) { durabilityController.abort(); durabilityController = null; }
+  if (!isReslimit && reslimitController) { reslimitController.abort(); reslimitController = null; }
+  // Deliberately NOT aborting shootoutController here: all three engines
+  // run in parallel on the backend regardless of which tab is open, and
+  // navigating away used to kill the whole in-flight request, silently
+  // dropping any engine that hadn't started yet. Use the Stop button to
+  // actually cancel a run.
   if (!isTiered) tieredSummary.style.display = 'none';
 }
 tabRow.addEventListener('click', (e) => {
@@ -433,17 +670,23 @@ function fmtKB(kb) {
   return sign + kb.toFixed(0) + ' KB';
 }
 
-function updateBar(kb, limitGB, fill, text) {
-  const limitKB = limitGB * 1024 * 1024;
-  const pct = limitKB > 0 ? Math.min(100, (kb / limitKB) * 100) : 0;
+// Percentage is always against the host's *actual* total (from /stats),
+// not the "warn above" field below — that field only decides when the bar
+// turns red, it never used to be the denominator, which is why it could
+// show a pinned, meaningless 100% whenever someone's real usage was
+// larger than whatever GB they'd typed in.
+function updateBar(usedKb, totalKb, warnAboveGB, fill, text) {
+  const pct = totalKb > 0 ? Math.min(100, (usedKb / totalKb) * 100) : 0;
+  const usedGB = usedKb / 1024 / 1024;
   fill.style.width = pct + '%';
-  fill.className = 'bar-fill' + (pct > 90 ? ' danger' : pct > 70 ? ' warn' : '');
-  text.textContent = `${fmtGB(kb)} / ${limitGB} GB used (${pct.toFixed(1)}%)`;
+  fill.className = 'bar-fill' + (usedGB > warnAboveGB ? ' danger' : pct > 70 ? ' warn' : '');
+  const totalText = totalKb > 0 ? `${fmtGB(totalKb)} GB` : 'unknown';
+  text.textContent = `${fmtGB(usedKb)} GB / ${totalText} used (${pct.toFixed(1)}%)`;
 }
 
-refreshStats.onclick = async () => {
-  statsArea.style.display = 'block';
-  statsRaw.textContent = 'Loading...';
+let statsPollTimer = null;
+
+async function pollStatsOnce() {
   try {
     const r = await fetch('/stats');
     const text = await r.text();
@@ -453,11 +696,24 @@ refreshStats.onclick = async () => {
       if (k && v) map[k] = parseFloat(v) || 0;
     });
     statsRaw.textContent = text;
-    updateBar(map.ram_used_kb, parseFloat(ramLimitGB.value) || 1, ramBar, ramText);
-    updateBar(map.disk_used_kb, parseFloat(diskLimitGB.value) || 1, diskBar, diskText);
+    updateBar(map.ram_used_kb, map.ram_total_kb, parseFloat(ramLimitGB.value) || Infinity, ramBar, ramText);
+    updateBar(map.disk_used_kb, map.disk_total_kb, parseFloat(diskLimitGB.value) || Infinity, diskBar, diskText);
   } catch (e) {
     statsRaw.textContent = 'Failed to load stats: ' + e.message;
   }
+}
+
+refreshStats.onclick = () => {
+  if (statsPollTimer) {
+    clearInterval(statsPollTimer);
+    statsPollTimer = null;
+    refreshStats.textContent = 'Show host memory & disk';
+    return;
+  }
+  statsArea.style.display = 'block';
+  refreshStats.textContent = 'Stop live memory & disk';
+  pollStatsOnce();
+  statsPollTimer = setInterval(pollStatsOnce, 1500);
 };
 
 // Reads the fixed set of percentile/latency pairs redis-benchmark prints
@@ -896,9 +1152,9 @@ tieredRunBtn.onclick = async () => {
   tieredSummary.style.display = 'none';
   tieredRunBtn.disabled = true;
   const qs = new URLSearchParams({
-    host: document.getElementById('tieredHost').value,
     port: document.getElementById('tieredPort').value,
-    dir: document.getElementById('tieredDir').value,
+    tiered_memory_limit: document.getElementById('tieredMemoryLimit').value.trim(),
+    tiered_disk_limit: document.getElementById('tieredDiskLimit').value.trim(),
     count: document.getElementById('tieredCount').value,
     size: document.getElementById('tieredSize').value,
   }).toString();
@@ -918,24 +1174,37 @@ tieredRunBtn.onclick = async () => {
         if (!line.trim()) continue;
         let evt;
         try { evt = JSON.parse(line); } catch { continue; }
-        if (evt.type === 'progress') {
+        if (evt.type === 'progress' && evt.message) {
+          output.textContent = evt.message + '\n';
+        } else if (evt.type === 'progress') {
           output.textContent = `Writing keys: ${evt.written} / ${evt.total}\n`;
         } else if (evt.type === 'settling') {
           output.textContent = 'Letting the background eviction tick catch up...\n';
         } else if (evt.type === 'summary') {
           document.getElementById('tsWritten').textContent = evt.written.toLocaleString();
           document.getElementById('tsDbsize').textContent = evt.dbsize.toLocaleString();
-          document.getElementById('tsDisk').textContent = fmtKB(evt.tiered_disk_kb);
+          document.getElementById('tsDisk').textContent = fmtKB(evt.tiered_disk_tracked_bytes / 1024);
           tieredSummary.style.display = 'grid';
-          output.textContent += `\nWrote ${evt.written} keys. DBSIZE (in RAM) = ${evt.dbsize}. ` +
-            `Tiered dir on disk = ${fmtKB(evt.tiered_disk_kb)}.\n` +
+          // DBSIZE counts tiered (on-disk) keys too — it only drops when a
+          // key is actually deleted outright (tiered-disk-limit or expiry),
+          // never just from moving RAM -> disk. So "tiered_disk_tracked_bytes
+          // > 0" is the RAM-limit-working signal, and "dbsize < written" is
+          // the disk-limit-working (or TTL) signal — two different things.
+          // "tiered dir on disk" (raw `du`) is shown too since it's what
+          // you'd actually see poking around on the filesystem, but it's
+          // dominated by fjall's pre-allocated journal segments and isn't
+          // the number tiered-disk-limit is compared against.
+          output.textContent += `\nWrote ${evt.written} keys. DBSIZE (RAM + tiered) = ${evt.dbsize}. ` +
+            `Tracked tiered usage = ${fmtKB(evt.tiered_disk_tracked_bytes / 1024)} ` +
+            `(raw tiered dir on disk = ${fmtKB(evt.tiered_disk_kb)}, inflated by fjall's own ` +
+            `pre-allocated journal files).\n` +
+            (evt.tiered_disk_tracked_bytes > 0
+              ? `tiered-memory-limit is working: some keys moved to disk.\n`
+              : `Nothing moved to disk yet — tiered-memory-limit may be larger than what was written.\n`) +
             (evt.dbsize < evt.written
-              ? `${evt.written - evt.dbsize} key(s) spilled to disk.\n`
-              : evt.tiered_disk_kb === 0
-                ? `Nothing evicted, and the tiered dir is empty — this server almost certainly wasn't ` +
-                  `started with "tiered-storage yes" (or "dir" above points at the wrong path). ` +
-                  `tiered-memory-limit can't be set from here — it only takes effect at server startup.\n`
-                : `Nothing newly evicted since last run, but ${fmtKB(evt.tiered_disk_kb)} is already on disk from before.\n`);
+              ? `tiered-disk-limit is working: ${evt.written - evt.dbsize} key(s) were dropped outright ` +
+                `once the disk tier filled up.\n`
+              : '');
         } else if (evt.type === 'promote_check') {
           document.getElementById('tsPromote').textContent = evt.ms + ' ms';
           output.textContent += `GET ${evt.key}: ${evt.found ? 'found' : 'not found'} in ${evt.ms}ms` +
@@ -1064,7 +1333,496 @@ bench.onsubmit = async (e) => {
 };
 
 stopBtn.onclick = () => { if (controller) { controller.abort(); } };
-ramLimitGB.onchange = diskLimitGB.onchange = () => { if (statsArea.style.display !== 'none') refreshStats.click(); };
+
+const latRunBtn = document.getElementById('latRunBtn');
+const latStopBtn = document.getElementById('latStopBtn');
+const latStatus = document.getElementById('latStatus');
+const latencyResults = document.getElementById('latencyResults');
+const latencyBody = document.getElementById('latencyBody');
+let latencyRows = [];
+
+function fmtUs(value) {
+  if (!Number.isFinite(value)) return '—';
+  return value >= 1000 ? (value / 1000).toFixed(value >= 10000 ? 1 : 2) + ' ms' : value.toFixed(1) + ' µs';
+}
+function fmtOps(value) { return Number(value || 0).toLocaleString('en-US', { maximumFractionDigits: 0 }); }
+
+// One small, fixed-height chart per run's own p50/p99/p999 (log scale),
+// rendered right under that run's numbers instead of one combined chart
+// that keeps growing taller with every run added.
+function miniLatencyChart(row) {
+  const names = ['p50', 'p99', 'p999'];
+  const colors = ['#a78bfa', '#22d3ee', '#fb7185'];
+  const values = names.map(n => row.latency_us?.[n]).filter(v => Number.isFinite(v) && v > 0);
+  if (!values.length) return '';
+  const width = 420, left = 46, right = 8, barH = 14, gap = 6, top = 4;
+  const min = Math.max(1, Math.pow(10, Math.floor(Math.log10(Math.min(...values)))));
+  const max = Math.max(min * 10, Math.pow(10, Math.ceil(Math.log10(Math.max(...values)))));
+  const plotWidth = width - left - right;
+  const x = v => left + (Math.log10(Math.max(min, v)) - Math.log10(min)) / (Math.log10(max) - Math.log10(min)) * plotWidth;
+  let svg = '';
+  names.forEach((name, j) => {
+    const v = row.latency_us?.[name];
+    if (!Number.isFinite(v)) return;
+    const y = top + j * (barH + gap);
+    svg += `<text x="${left - 6}" y="${y + barH - 3}" fill="#8a8a99" font-size="10" text-anchor="end">${name}</text>`;
+    svg += `<rect x="${left}" y="${y}" width="${Math.max(2, x(v) - left)}" height="${barH}" rx="4" fill="${colors[j]}" opacity=".88"><title>${name}: ${fmtUs(v)}</title></rect>`;
+    svg += `<text x="${Math.min(width - right + 4, x(v) + 4)}" y="${y + barH - 3}" fill="#d4d4de" font-size="10">${fmtUs(v)}</text>`;
+  });
+  const height = top + names.length * (barH + gap);
+  return `<svg viewBox="0 0 ${width} ${height}" style="width:100%;height:auto;display:block;margin-top:.7rem;" role="img" aria-label="p50/p99/p999 for this run">${svg}</svg>`;
+}
+
+function renderLatencyRows() {
+  latencyResults.innerHTML = '';
+  if (!latencyRows.length) {
+    latencyResults.innerHTML = '<div class="latency-empty">Run a workload to see throughput and tail latency.</div>';
+    document.getElementById('latencyTableWrap').style.display = 'none';
+    return;
+  }
+  for (const row of latencyRows) {
+    const card = document.createElement('article');
+    card.className = 'latency-card';
+    const title = document.createElement('h3');
+    title.textContent = `${row.workload} · run ${row.run}${row.pipeline ? ` · pipeline ${row.pipeline}` : ''}`;
+    card.appendChild(title);
+    const kpis = document.createElement('div');
+    kpis.className = 'latency-kpis';
+    const values = [
+      ['Throughput', `${fmtOps(row.ops_per_second)} ops/s`],
+      ['p50', fmtUs(row.latency_us?.p50)],
+      ['p99', fmtUs(row.latency_us?.p99)],
+      ['p999', fmtUs(row.latency_us?.p999)],
+      ['Requests', fmtOps(row.operations)],
+      ['Errors', fmtOps(row.errors)],
+    ];
+    for (const [label, value] of values) {
+      const item = document.createElement('div'); item.className = 'latency-kpi';
+      const name = document.createElement('span'); name.textContent = label;
+      const number = document.createElement('strong'); number.textContent = value;
+      item.append(name, number); kpis.appendChild(item);
+    }
+    card.appendChild(kpis);
+    const chart = document.createElement('div');
+    chart.innerHTML = miniLatencyChart(row);
+    card.appendChild(chart);
+    latencyResults.appendChild(card);
+  }
+  latencyBody.innerHTML = latencyRows.map(row => `<tr><td>${row.run}</td><td>${row.workload}</td><td>${row.pipeline ?? '—'}</td><td>${row.clients}</td><td>${fmtOps(row.ops_per_second)}</td><td>${fmtUs(row.latency_us?.p50)}</td><td>${fmtUs(row.latency_us?.p99)}</td><td>${fmtUs(row.latency_us?.p999)}</td><td>${row.errors}</td></tr>`).join('');
+  document.getElementById('latencyTableWrap').style.display = 'block';
+}
+
+latRunBtn.onclick = async () => {
+  if (latencyController) latencyController.abort();
+  latencyController = new AbortController();
+  const workloads = [...document.querySelectorAll('input[name="latWorkload"]:checked')].map(input => input.value);
+  if (!workloads.length) { latStatus.textContent = 'Choose at least one workload.'; return; }
+  const params = new URLSearchParams({
+    host: document.getElementById('latHost').value.trim(),
+    port: document.getElementById('latPort').value,
+    seconds: document.getElementById('latSeconds').value,
+    runs: document.getElementById('latRuns').value,
+    clients: document.getElementById('latClients').value,
+    pipeline: document.getElementById('latPipeline').value.trim(),
+    keys: document.getElementById('latKeys').value,
+    live_subscribers: document.getElementById('latWatchers').value,
+    live_drain: document.getElementById('latLiveDrain').value,
+    workloads: workloads.join(','),
+  });
+  latencyRows = [];
+  renderLatencyRows();
+  latRunBtn.disabled = true; latStopBtn.disabled = false;
+  latStatus.textContent = 'Starting scenarios… results appear after each run.';
+  let buffer = '';
+  try {
+    const response = await fetch('/run-latency?' + params, { signal: latencyController.signal });
+    if (!response.ok || !response.body) throw new Error(`Benchmark UI returned HTTP ${response.status}`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, end).trim(); buffer = buffer.slice(end + 1);
+        if (!line) continue;
+        const row = JSON.parse(line);
+        if (row.type === 'progress') { latStatus.textContent = row.message; continue; }
+        if (row.type === 'error') throw new Error(row.message);
+        latencyRows.push(row); renderLatencyRows();
+        latStatus.textContent = `${latencyRows.length} run(s) complete · ${row.workload} · ${fmtOps(row.ops_per_second)} ops/s`;
+      }
+    }
+    if (buffer.trim()) { const row = JSON.parse(buffer); if (row.type === 'error') throw new Error(row.message); latencyRows.push(row); renderLatencyRows(); }
+    if (!latencyRows.length) latStatus.textContent = 'No results returned. Check the target and benchmark output.';
+    else latStatus.textContent += ' · complete';
+  } catch (error) {
+    if (error.name === 'AbortError') latStatus.textContent = 'Run stopped.';
+    else latStatus.textContent = 'Run failed: ' + error.message;
+  } finally {
+    latRunBtn.disabled = false; latStopBtn.disabled = true; latencyController = null;
+  }
+};
+latStopBtn.onclick = () => { if (latencyController) latencyController.abort(); };
+
+const durRunBtn = document.getElementById('durRunBtn');
+const durStopBtn = document.getElementById('durStopBtn');
+const durStatus = document.getElementById('durStatus');
+const durabilityResults = document.getElementById('durabilityResults');
+let durabilityRows = [];
+
+function renderDurabilityRows() {
+  durabilityResults.innerHTML = '';
+  if (!durabilityRows.length) {
+    durabilityResults.innerHTML = '<div class="latency-empty">Run the test to see acknowledged vs. recovered writes per policy.</div>';
+    return;
+  }
+  for (const row of durabilityRows) {
+    const card = document.createElement('article');
+    card.className = 'latency-card';
+    const title = document.createElement('h3');
+    title.textContent = `appendfsync=${row.policy}`;
+    card.appendChild(title);
+    const kpis = document.createElement('div');
+    kpis.className = 'latency-kpis';
+    const lossPct = row.acknowledged > 0 ? (100 * row.lost / row.acknowledged).toFixed(2) : '0.00';
+    const values = [
+      ['Acknowledged writes', fmtOps(row.acknowledged)],
+      ['Recovered writes', fmtOps(row.recovered)],
+      ['Lost', `${fmtOps(row.lost)} (${lossPct}%)`],
+      ['Writes/s before kill', fmtOps(row.writes_per_second)],
+      ['Restart + replay time', `${fmtOps(row.restart_ms)} ms`],
+    ];
+    for (const [label, value] of values) {
+      const item = document.createElement('div'); item.className = 'latency-kpi';
+      const name = document.createElement('span'); name.textContent = label;
+      const number = document.createElement('strong');
+      number.textContent = value;
+      if (label === 'Lost') number.style.color = row.lost > 0 ? '#fb7185' : '#4ade80';
+      item.append(name, number); kpis.appendChild(item);
+    }
+    card.appendChild(kpis);
+    durabilityResults.appendChild(card);
+  }
+}
+
+durRunBtn.onclick = async () => {
+  if (durabilityController) durabilityController.abort();
+  durabilityController = new AbortController();
+  const policies = [...document.querySelectorAll('input[name="durPolicy"]:checked')].map(input => input.value);
+  if (!policies.length) { durStatus.textContent = 'Choose at least one appendfsync policy.'; return; }
+  const params = new URLSearchParams({
+    host: document.getElementById('durHost').value.trim(),
+    port: document.getElementById('durPort').value,
+    seconds: document.getElementById('durSeconds').value,
+    policies: policies.join(','),
+  });
+  durabilityRows = [];
+  renderDurabilityRows();
+  durRunBtn.disabled = true; durStopBtn.disabled = false;
+  durStatus.textContent = 'Starting…';
+  let buffer = '';
+  try {
+    const response = await fetch('/run-durability?' + params, { signal: durabilityController.signal });
+    if (!response.ok || !response.body) throw new Error(`Benchmark UI returned HTTP ${response.status}`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, end).trim(); buffer = buffer.slice(end + 1);
+        if (!line) continue;
+        const row = JSON.parse(line);
+        if (row.type === 'progress') { durStatus.textContent = row.message; continue; }
+        if (row.type === 'error') throw new Error(row.message);
+        durabilityRows.push(row); renderDurabilityRows();
+        durStatus.textContent = `${durabilityRows.length}/${policies.length} polic${durabilityRows.length === 1 ? 'y' : 'ies'} done`;
+      }
+    }
+    if (!durabilityRows.length) durStatus.textContent = 'No results returned.';
+    else durStatus.textContent += ' · complete';
+  } catch (error) {
+    if (error.name === 'AbortError') durStatus.textContent = 'Run stopped.';
+    else durStatus.textContent = 'Run failed: ' + error.message;
+  } finally {
+    durRunBtn.disabled = false; durStopBtn.disabled = true; durabilityController = null;
+  }
+};
+durStopBtn.onclick = () => { if (durabilityController) durabilityController.abort(); };
+
+const resRunBtn = document.getElementById('resRunBtn');
+const resStopBtn = document.getElementById('resStopBtn');
+const resStatus = document.getElementById('resStatus');
+const reslimitResults = document.getElementById('reslimitResults');
+let reslimitRows = [];
+
+function renderReslimitRows() {
+  reslimitResults.innerHTML = '';
+  if (!reslimitRows.length) {
+    reslimitResults.innerHTML = '<div class="latency-empty">Run the test to see crash behavior under a real hard limit.</div>';
+    return;
+  }
+  for (const row of reslimitRows) {
+    const card = document.createElement('article');
+    card.className = 'latency-card';
+    const title = document.createElement('h3');
+    title.textContent = `RAM ${row.mem_limit_gb} GB / Disk ${row.disk_limit_gb} GB`;
+    card.appendChild(title);
+    const kpis = document.createElement('div');
+    kpis.className = 'latency-kpis';
+    const outcome = row.oom_killed ? 'OOM-killed by the kernel' : row.crashed ? `Exited (code ${row.exit_code})` : row.still_running ? 'Still running (hit safety cap)' : 'Stopped';
+    const causeLabel = { 'ram+disk': 'RAM and disk both full', ram: 'RAM limit', disk: 'Disk limit', unknown: 'Unclear', none: 'n/a (hit safety cap)' }[row.cause] || row.cause;
+    const values = [
+      ['Outcome', outcome],
+      ['Likely cause', causeLabel],
+      ['Still responsive', row.still_running ? (row.still_responsive ? 'Yes — degraded gracefully' : 'No') : 'n/a (not running)'],
+      ['Writes acknowledged', fmtOps(row.acknowledged)],
+      ['Peak resident memory', `${fmtOps(row.peak_mem_mb)} MB`],
+      ['Peak /data usage', `${fmtOps(Math.round(row.peak_disk_kb / 1024))} MB`],
+    ];
+    for (const [label, value] of values) {
+      const item = document.createElement('div'); item.className = 'latency-kpi';
+      const name = document.createElement('span'); name.textContent = label;
+      const number = document.createElement('strong'); number.textContent = value;
+      if (label === 'Outcome') number.style.color = row.oom_killed ? '#fb7185' : '#4ade80';
+      item.append(name, number); kpis.appendChild(item);
+    }
+    card.appendChild(kpis);
+    reslimitResults.appendChild(card);
+  }
+}
+
+resRunBtn.onclick = async () => {
+  if (reslimitController) reslimitController.abort();
+  reslimitController = new AbortController();
+  const params = new URLSearchParams({
+    image: document.getElementById('resImage').value.trim(),
+    port: document.getElementById('resPort').value,
+    ram_gb: document.getElementById('resRamGB').value,
+    disk_gb: document.getElementById('resDiskGB').value,
+    value_bytes: document.getElementById('resValueBytes').value,
+    max_seconds: document.getElementById('resMaxSeconds').value,
+  });
+  reslimitRows = [];
+  renderReslimitRows();
+  resRunBtn.disabled = true; resStopBtn.disabled = false;
+  resStatus.textContent = 'Starting…';
+  let buffer = '';
+  try {
+    const response = await fetch('/run-resource-limit?' + params, { signal: reslimitController.signal });
+    if (!response.ok || !response.body) throw new Error(`Benchmark UI returned HTTP ${response.status}`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, end).trim(); buffer = buffer.slice(end + 1);
+        if (!line) continue;
+        const row = JSON.parse(line);
+        if (row.type === 'progress') { resStatus.textContent = row.message; continue; }
+        if (row.type === 'error') throw new Error(row.message);
+        reslimitRows.push(row); renderReslimitRows();
+      }
+    }
+    if (!reslimitRows.length) resStatus.textContent = 'No results returned.';
+    else resStatus.textContent = 'Test complete';
+  } catch (error) {
+    if (error.name === 'AbortError') resStatus.textContent = 'Run stopped.';
+    else resStatus.textContent = 'Run failed: ' + error.message;
+  } finally {
+    resRunBtn.disabled = false; resStopBtn.disabled = true; reslimitController = null;
+  }
+};
+resStopBtn.onclick = () => { if (reslimitController) reslimitController.abort(); };
+
+const sRunBtn = document.getElementById('sRunBtn');
+const sStopBtn = document.getElementById('sStopBtn');
+const sStatus = document.getElementById('sStatus');
+const shootoutEngineGrid = document.getElementById('shootoutEngineGrid');
+const shootoutEngineStatusRow = document.getElementById('shootoutEngineStatusRow');
+const shootoutBody = document.getElementById('shootoutBody');
+const SHOOTOUT_COLORS = { redis: '#f87171', dragonfly: '#22d3ee', reflexdb: '#a78bfa' };
+const SHOOTOUT_LABELS = { redis: 'Redis', dragonfly: 'Dragonfly', reflexdb: 'ReflexDB' };
+const SHOOTOUT_ENGINE_ORDER = ['redis', 'dragonfly', 'reflexdb'];
+let shootoutRows = [];
+let shootoutEngineStatus = {};
+
+// One card per workload+pipeline combo, each holding a bar per engine —
+// so comparing engines for the same traffic is a glance at one chart
+// instead of eyeballing matching bars across three separate cards.
+function shootoutWorkloadKey(row) { return `${row.workload}::${row.pipeline ?? ''}`; }
+
+function shootoutWorkloadPanel(key, workload, pipeline) {
+  const existing = document.getElementById(`shootoutCard-${key}`);
+  if (existing) return existing;
+  if (shootoutEngineGrid.querySelector('.latency-empty')) shootoutEngineGrid.innerHTML = '';
+  const card = document.createElement('article');
+  card.className = 'shootout-engine-card';
+  card.id = `shootoutCard-${key}`;
+  const title = pipeline != null && pipeline !== '' ? `${workload} \u00b7 pipeline ${pipeline}` : workload;
+  card.innerHTML =
+    `<h3>${title}</h3>` +
+    `<svg id="shootoutCardChart-${key}" role="img" aria-label="${title} engine comparison chart"></svg>`;
+  shootoutEngineGrid.appendChild(card);
+  return card;
+}
+
+// Scaled to the max within this same workload+pipeline combo (not globally)
+// since every bar in the chart is already a direct, same-traffic comparison.
+function drawWorkloadChart(key) {
+  const chart = document.getElementById(`shootoutCardChart-${key}`);
+  if (!chart) return;
+  const rows = shootoutRows
+    .filter(r => shootoutWorkloadKey(r) === key)
+    .sort((a, b) => SHOOTOUT_ENGINE_ORDER.indexOf(a.engine) - SHOOTOUT_ENGINE_ORDER.indexOf(b.engine));
+  if (!rows.length) { chart.innerHTML = ''; return; }
+  const width = 420, left = 90, right = 56, barHeight = 16, rowGap = 10, top = 4;
+  const maxOps = Math.max(1, ...rows.map(r => r.ops_per_second || 0));
+  const plotWidth = width - left - right;
+  const barWidth = v => Math.max(2, (v / maxOps) * plotWidth);
+  let svg = '';
+  let y = top;
+  for (const row of rows) {
+    const label = row.engineLabel || SHOOTOUT_LABELS[row.engine] || row.engine;
+    svg += `<text x="${left - 6}" y="${y + barHeight - 4}" fill="#8a8a99" font-size="10" text-anchor="end">${label}</text>`;
+    svg += `<rect x="${left}" y="${y}" width="${barWidth(row.ops_per_second)}" height="${barHeight}" rx="3" fill="${SHOOTOUT_COLORS[row.engine] || '#888'}" opacity=".9"><title>${label}: ${fmtOps(row.ops_per_second)} ops/s, p99 ${fmtUs(row.latency_us?.p99)}</title></rect>`;
+    svg += `<text x="${Math.min(width - right + 5, left + barWidth(row.ops_per_second) + 5)}" y="${y + barHeight - 4}" fill="#d4d4de" font-size="10">${fmtOps(row.ops_per_second)}/s</text>`;
+    y += barHeight + rowGap;
+  }
+  chart.setAttribute('viewBox', `0 0 ${width} ${y + 4}`);
+  chart.innerHTML = svg;
+}
+
+function renderShootoutStatusRow() {
+  const engineIds = Object.keys(shootoutEngineStatus);
+  shootoutEngineStatusRow.innerHTML = engineIds
+    .map(id => {
+      const label = SHOOTOUT_LABELS[id] || id;
+      const dotColor = SHOOTOUT_COLORS[id] || '#8b5cf6';
+      return `<span class="shootout-status-chip"><span class="legend-dot" style="background:${dotColor}"></span>` +
+        `<b>${label}</b><span class="chip-status">${shootoutEngineStatus[id] || ''}</span></span>`;
+    })
+    .join('');
+}
+
+function renderShootoutRows() {
+  const knownEngines = [...new Set([...shootoutRows.map(r => r.engine), ...Object.keys(shootoutEngineStatus)])];
+  renderShootoutStatusRow();
+  if (!knownEngines.length) {
+    shootoutEngineGrid.innerHTML = '<div class="latency-empty">Run the shootout to see throughput and tail latency per engine.</div>';
+    document.getElementById('shootoutTableWrap').style.display = 'none';
+    return;
+  }
+  const workloadKeys = [...new Set(shootoutRows.map(shootoutWorkloadKey))];
+  for (const key of workloadKeys) {
+    const sample = shootoutRows.find(r => shootoutWorkloadKey(r) === key);
+    shootoutWorkloadPanel(key, sample.workload, sample.pipeline);
+    drawWorkloadChart(key);
+  }
+  if (shootoutRows.length) {
+    const sorted = [...shootoutRows].sort((a, b) => {
+      const ak = shootoutWorkloadKey(a), bk = shootoutWorkloadKey(b);
+      if (ak !== bk) return ak < bk ? -1 : 1;
+      return SHOOTOUT_ENGINE_ORDER.indexOf(a.engine) - SHOOTOUT_ENGINE_ORDER.indexOf(b.engine);
+    });
+    let prevKey = null;
+    shootoutBody.innerHTML = sorted
+      .map(row => {
+        const key = shootoutWorkloadKey(row);
+        const groupStart = key !== prevKey;
+        prevKey = key;
+        return `<tr class="${groupStart ? 'workload-group-start' : ''}"><td>${row.engineLabel}</td><td>${row.run}</td><td>${row.workload}</td><td>${row.pipeline ?? '\u2014'}</td><td>${fmtOps(row.ops_per_second)}</td><td>${fmtUs(row.latency_us?.p50)}</td><td>${fmtUs(row.latency_us?.p99)}</td><td>${fmtUs(row.latency_us?.p999)}</td><td>${row.errors}</td></tr>`;
+      })
+      .join('');
+    document.getElementById('shootoutTableWrap').style.display = 'block';
+  }
+}
+
+sRunBtn.onclick = async () => {
+  if (shootoutController) shootoutController.abort();
+  shootoutController = new AbortController();
+  const engines = [...document.querySelectorAll('input[name="sEngine"]:checked')].map(i => i.value);
+  const workloads = [...document.querySelectorAll('input[name="sWorkload"]:checked')].map(i => i.value);
+  if (!engines.length) { sStatus.textContent = 'Choose at least one engine.'; return; }
+  if (!workloads.length) { sStatus.textContent = 'Choose at least one workload.'; return; }
+  const params = new URLSearchParams({
+    mem_mb: document.getElementById('sMemMB').value,
+    cpus: document.getElementById('sCpus').value,
+    port: document.getElementById('sPort').value,
+    seconds: document.getElementById('sSeconds').value,
+    runs: document.getElementById('sRuns').value,
+    clients: document.getElementById('sClients').value,
+    pipeline: document.getElementById('sPipeline').value.trim(),
+    keys: document.getElementById('sKeys').value,
+    engines: engines.join(','),
+    workloads: workloads.join(','),
+  });
+  shootoutRows = [];
+  // Clear out any charts/table rows left over from the previous run —
+  // otherwise stale workload cards from before would just sit there
+  // alongside the new ones since they're keyed by workload+pipeline.
+  shootoutEngineGrid.innerHTML = '';
+  shootoutBody.innerHTML = '';
+  document.getElementById('shootoutTableWrap').style.display = 'none';
+  // Seed a panel per selected engine immediately — all three start at once
+  // on the backend, so the UI shouldn't wait for the first result line to
+  // show that they're running.
+  shootoutEngineStatus = Object.fromEntries(engines.map(id => [id, 'starting\u2026']));
+  renderShootoutRows();
+  sRunBtn.disabled = true; sStopBtn.disabled = false;
+  sStatus.textContent = 'Starting all engines in parallel\u2026';
+  let buffer = '';
+  try {
+    const response = await fetch('/run-shootout?' + params, { signal: shootoutController.signal });
+    if (!response.ok || !response.body) throw new Error(`Benchmark UI returned HTTP ${response.status}`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, end).trim(); buffer = buffer.slice(end + 1);
+        if (!line) continue;
+        let row;
+        try { row = JSON.parse(line); } catch { continue; }
+        const engineLabel = SHOOTOUT_LABELS[row.engine] || row.engine || '?';
+        // One engine's error (missing image, failed pull, container that
+        // never came up) doesn't stop the others — they're independent
+        // tasks on the backend — so this just updates that engine's own
+        // status line and keeps reading everyone else's results.
+        if (row.type === 'progress' || row.type === 'error') {
+          shootoutEngineStatus[row.engine] = row.message;
+          renderShootoutRows();
+          continue;
+        }
+        row.engineLabel = engineLabel;
+        shootoutRows.push(row);
+        shootoutEngineStatus[row.engine] = `${row.workload} p${row.pipeline} \u00b7 ${fmtOps(row.ops_per_second)} ops/s`;
+        renderShootoutRows();
+      }
+      sStatus.textContent = `Running\u2026 ${shootoutRows.length} result(s) so far across ${engines.length} engine(s).`;
+    }
+    if (!shootoutRows.length) sStatus.textContent = 'No results returned \u2014 check Docker and that the images are available.';
+    else sStatus.textContent = `Done \u00b7 ${shootoutRows.length} result(s) across ${engines.length} engine(s).`;
+  } catch (error) {
+    if (error.name === 'AbortError') sStatus.textContent = 'Run stopped.';
+    else sStatus.textContent = 'Run failed: ' + error.message;
+  } finally {
+    sRunBtn.disabled = false; sStopBtn.disabled = true; shootoutController = null;
+  }
+};
+sStopBtn.onclick = () => { if (shootoutController) shootoutController.abort(); };
+
+ramLimitGB.onchange = diskLimitGB.onchange = () => { if (statsPollTimer) pollStatsOnce(); };
 </script>
 </body>
 </html>"###;
@@ -1236,14 +1994,14 @@ fn try_parse_bulk(buf: &[u8]) -> Option<Vec<u8>> {
     Some(buf[data_start..data_end].to_vec())
 }
 
-/// Queries the reflexdb server's own `used_memory` (from `INFO`) over a
-/// fresh connection — more meaningful than host-wide RAM when watching how
-/// a single server process behaves under a workload.
-async fn fetch_used_memory_kb(host: &str, port: u16) -> std::io::Result<u64> {
+/// Reads one `INFO` field (e.g. `used_memory`, `tiered_disk_used_bytes`) as
+/// a raw integer, over a fresh connection.
+async fn fetch_info_u64(host: &str, port: u16, field: &str) -> std::io::Result<u64> {
     let mut stream =
         tokio::time::timeout(Duration::from_millis(800), TcpStream::connect((host, port))).await??;
     stream.write_all(b"*1\r\n$4\r\nINFO\r\n").await?;
 
+    let prefix = format!("{field}:");
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
@@ -1255,16 +2013,23 @@ async fn fetch_used_memory_kb(host: &str, port: u16) -> std::io::Result<u64> {
         if let Some(payload) = try_parse_bulk(&buf) {
             let text = String::from_utf8_lossy(&payload);
             for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("used_memory:") {
+                if let Some(rest) = line.strip_prefix(prefix.as_str()) {
                     if let Ok(v) = rest.trim().parse::<u64>() {
-                        return Ok(v / 1024);
+                        return Ok(v);
                     }
                 }
             }
             break;
         }
     }
-    Err(std::io::Error::other("used_memory not found in INFO reply"))
+    Err(std::io::Error::other(format!("{field} not found in INFO reply")))
+}
+
+/// Queries the reflexdb server's own `used_memory` (from `INFO`) over a
+/// fresh connection — more meaningful than host-wide RAM when watching how
+/// a single server process behaves under a workload.
+async fn fetch_used_memory_kb(host: &str, port: u16) -> std::io::Result<u64> {
+    fetch_info_u64(host, port, "used_memory").await.map(|v| v / 1024)
 }
 
 /// Sends a harmless `GETAT` and checks whether the server replies with the
@@ -1634,23 +2399,95 @@ async fn handle_live_autoset(query: Option<&str>, socket: &mut TcpStream) -> std
 /// workload to exceed — this issues real commands, it doesn't simulate.
 async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
     let params = query.map(parse_query).unwrap_or_default();
-    let host = params
-        .get("host")
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = params.get("port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(7379);
-    let dir = params
-        .get("dir")
-        .filter(|s| !s.is_empty())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "tiered".to_string());
-    let count = params.get("count").and_then(|s| s.parse::<usize>().ok()).unwrap_or(2000).clamp(1, 1_000_000);
-    let size = params.get("size").and_then(|s| s.parse::<usize>().ok()).unwrap_or(2000).clamp(1, 10_000_000);
+    let text = |name: &str, fallback: &str| params.get(name).cloned().unwrap_or_else(|| fallback.to_string());
+    let host = "127.0.0.1".to_string();
+    let port = text("port", "17391").parse::<u16>().unwrap_or(17391);
+    let mem_limit = text("tiered_memory_limit", "10kb");
+    let disk_limit = text("tiered_disk_limit", "");
+    let count = text("count", "2000").parse::<usize>().unwrap_or(2000).clamp(1, 1_000_000);
+    let size = text("size", "2000").parse::<usize>().unwrap_or(2000).clamp(1, 10_000_000);
     let prefix = "tiered:demo:";
 
     let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
     socket.write_all(headers.as_bytes()).await?;
+
+    // Spawns its own throwaway server (like the Durability/Resource-limit
+    // tabs) instead of requiring one already running — `tiered-storage`,
+    // `tiered-memory-limit`, and `tiered-disk-limit` can only be set at
+    // server *startup*, there's no live `CONFIG SET` for them, so this is
+    // the only way to make them UI-configurable at all.
+    let server_bin = reflexdb_server_bin();
+    let data_dir = std::env::temp_dir().join(format!("reflexdb-tiered-demo-{}-{port}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        write_chunk(
+            socket,
+            &format!(
+                "{{\"type\":\"error\",\"message\":\"could not create temp data dir: {}\"}}\n",
+                json_escape(&e.to_string())
+            ),
+        )
+        .await?;
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    write_chunk(
+        socket,
+        &format!(
+            "{{\"type\":\"progress\",\"message\":\"starting a fresh server (tiered-memory-limit={}, tiered-disk-limit={})\u{2026}\"}}\n",
+            json_escape(&mem_limit),
+            if disk_limit.is_empty() { "unbounded".to_string() } else { json_escape(&disk_limit) }
+        ),
+    )
+    .await?;
+
+    let mut args = vec![
+        "--port".to_string(),
+        port.to_string(),
+        "--dir".to_string(),
+        data_dir.to_string_lossy().into_owned(),
+        "--tiered-storage".to_string(),
+        "yes".to_string(),
+        "--tiered-memory-limit".to_string(),
+        mem_limit,
+        "--tiered-dir".to_string(),
+        "tiered".to_string(),
+    ];
+    if !disk_limit.is_empty() {
+        args.push("--tiered-disk-limit".to_string());
+        args.push(disk_limit);
+    }
+    let spawned = Command::new(&server_bin)
+        .args(&args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            write_chunk(
+                socket,
+                &format!(
+                    "{{\"type\":\"error\",\"message\":\"could not spawn {}: {}. Build it first with `cargo build --bin reflexdb-server`.\"}}\n",
+                    json_escape(&server_bin),
+                    json_escape(&e.to_string())
+                ),
+            )
+            .await?;
+            socket.write_all(b"0\r\n\r\n").await?;
+            let _ = std::fs::remove_dir_all(&data_dir);
+            return Ok(());
+        }
+    };
+    if !wait_for_server_ready(&host, port, Duration::from_secs(5)).await {
+        let _ = child.kill().await;
+        write_chunk(socket, "{\"type\":\"error\",\"message\":\"server did not become ready in time\"}\n")
+            .await?;
+        socket.write_all(b"0\r\n\r\n").await?;
+        let _ = std::fs::remove_dir_all(&data_dir);
+        return Ok(());
+    }
 
     let mut client = match RespClient::connect(&host, port).await {
         Ok(c) => c,
@@ -1661,6 +2498,8 @@ async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std:
             )
             .await;
             socket.write_all(b"0\r\n\r\n").await?;
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&data_dir);
             return Ok(());
         }
     };
@@ -1671,6 +2510,8 @@ async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std:
         if client.call(&["SET", &key, &value]).await.is_err() {
             let _ = write_chunk(socket, "{\"type\":\"error\",\"message\":\"SET failed mid-run\"}\n").await;
             socket.write_all(b"0\r\n\r\n").await?;
+            let _ = child.kill().await;
+            let _ = std::fs::remove_dir_all(&data_dir);
             return Ok(());
         }
         if i % 50 == 0 || i + 1 == count {
@@ -1695,9 +2536,16 @@ async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std:
         Ok(Reply::Integer(n)) => n,
         _ => -1,
     };
-    let disk_kb = get_dir_disk_kb(&dir).await;
+    // `du`-style filesystem size (what a user would see poking around on
+    // disk) and the self-tracked payload-byte total `tiered-disk-limit`
+    // actually enforces are two different numbers — fjall pre-allocates
+    // journal segments well ahead of real usage, so the former is often
+    // much larger. Report both rather than picking one and confusing
+    // whichever doesn't match the configured limit.
+    let disk_kb = get_dir_disk_kb(&data_dir.join("tiered").to_string_lossy()).await;
+    let tracked_bytes = fetch_info_u64(&host, port, "tiered_disk_used_bytes").await.unwrap_or(0);
     let line = format!(
-        "{{\"type\":\"summary\",\"written\":{count},\"dbsize\":{dbsize},\"tiered_disk_kb\":{disk_kb}}}\n"
+        "{{\"type\":\"summary\",\"written\":{count},\"dbsize\":{dbsize},\"tiered_disk_kb\":{disk_kb},\"tiered_disk_tracked_bytes\":{tracked_bytes}}}\n"
     );
     if write_chunk(socket, &line).await.is_err() {
         return Ok(());
@@ -1742,6 +2590,9 @@ async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std:
 
     let _ = write_chunk(socket, "{\"type\":\"done\"}\n").await;
     socket.write_all(b"0\r\n\r\n").await?;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = std::fs::remove_dir_all(&data_dir);
     Ok(())
 }
 
@@ -2149,6 +3000,970 @@ async fn handle_run_history_profiled(query: Option<&str>, socket: &mut TcpStream
     Ok(())
 }
 
+/// Runs the checked-in, dependency-free workload harness and forwards its
+/// per-run JSONL rows to the browser as they complete. Keeping the harness
+/// as the source of truth means terminal and UI runs use identical traffic.
+async fn handle_run_latency(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
+    let params = query.map(parse_query).unwrap_or_default();
+    let text = |name: &str, fallback: &str| params.get(name).cloned().unwrap_or_else(|| fallback.to_string());
+    let host = text("host", "127.0.0.1").trim().to_string();
+    let port = text("port", "7379").parse::<u16>().unwrap_or(7379);
+    let seconds = text("seconds", "5").parse::<f64>().unwrap_or(5.0).clamp(1.0, 60.0);
+    let runs = text("runs", "3").parse::<usize>().unwrap_or(3).clamp(1, 10);
+    let clients = text("clients", "16").parse::<usize>().unwrap_or(16).clamp(1, 512);
+    let keys = text("keys", "1000").parse::<usize>().unwrap_or(1000).clamp(1, 100_000);
+    let live_subscribers = text("live_subscribers", "1000").parse::<usize>().unwrap_or(1000).clamp(0, 10_000);
+    let live_drain = text("live_drain", "buffered");
+    let pipelines = text("pipeline", "1,16");
+    let valid_pipelines =
+        pipelines.split(',').all(|part| part.trim().parse::<usize>().is_ok_and(|n| (1..=1024).contains(&n)))
+            && pipelines.split(',').count() <= 4;
+    let workload_text = text("workloads", "small-mixed,hot-key,live-fanout");
+    let workloads: Vec<String> = workload_text
+        .split(',')
+        .map(str::trim)
+        .filter(|w| matches!(*w, "small-mixed" | "hot-key" | "live-fanout"))
+        .map(str::to_string)
+        .collect();
+    if host.is_empty()
+        || !valid_pipelines
+        || workloads.is_empty()
+        || !matches!(live_drain.as_str(), "buffered" | "selector")
+    {
+        socket
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await?;
+    write_chunk(
+        socket,
+        "{\"type\":\"progress\",\"message\":\"Starting selected workloads against the target server…\"}\n",
+    )
+    .await?;
+
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/run.py");
+    let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let mut child = match Command::new(python)
+        .arg(script)
+        .args(["--host", &host, "--port", &port.to_string(), "--runs", &runs.to_string()])
+        .args(["--seconds", &seconds.to_string(), "--clients", &clients.to_string()])
+        .args(["--pipeline", &pipelines, "--keys", &keys.to_string()])
+        .args(["--live-subscribers", &live_subscribers.to_string(), "--workloads", &workloads.join(",")])
+        .args(["--live-drain", &live_drain])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let row = format!(
+                "{{\"type\":\"error\",\"message\":\"Could not start benchmark harness: {}\"}}\n",
+                json_escape(&error.to_string())
+            );
+            write_chunk(socket, &row).await?;
+            socket.write_all(b"0\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        write_chunk(socket, "{\"type\":\"error\",\"message\":\"Benchmark harness has no output stream\"}\n")
+            .await?;
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(());
+    };
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line).await?;
+        if read == 0 {
+            break;
+        }
+        let row = String::from_utf8_lossy(&line);
+        if write_chunk(socket, &row).await.is_err() {
+            let _ = child.kill().await;
+            return Ok(());
+        }
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        write_chunk(socket, "{\"type\":\"error\",\"message\":\"Benchmark process exited unsuccessfully; check that Python 3 and the target server are available\"}\n").await?;
+    }
+    socket.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+/// Resolves the `reflexdb-server` binary to spawn for the durability demo:
+/// an explicit override, then a sibling of this binary (how `cargo build`
+/// lays out a workspace's binaries), then falling back to `PATH`.
+fn reflexdb_server_bin() -> String {
+    if let Ok(path) = std::env::var("REFLEXDB_SERVER_BIN") {
+        return path;
+    }
+    let name = if cfg!(windows) { "reflexdb-server.exe" } else { "reflexdb-server" };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join(name);
+            if sibling.is_file() {
+                return sibling.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name.to_string()
+}
+
+/// Polls `host:port` until a connection + `PING` succeeds or `timeout` elapses.
+async fn wait_for_server_ready(host: &str, port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(mut client) = RespClient::connect(host, port).await {
+            if client.call(&["PING"]).await.is_ok() {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// Writes `count` keys (`durability:0`..`durability:N`) over one connection,
+/// bumping `acked` after each confirmed `+OK` — a lower bound on what the
+/// server had actually accepted before it gets killed out from under this
+/// loop (the next `call` simply errors and the loop exits).
+async fn run_durability_writer(host: String, port: u16, acked: std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    let Ok(mut client) = RespClient::connect(&host, port).await else { return };
+    let mut i: u64 = 0;
+    loop {
+        let key = format!("durability:{i}");
+        let value = i.to_string();
+        match client.call(&["SET", &key, &value]).await {
+            Ok(_) => {
+                acked.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Crash-recovery demo: for each requested `appendfsync` policy, spawns a
+/// fresh `reflexdb-server` in a throwaway data dir, hammers it with `SET`s,
+/// force-kills it (`SIGKILL`/`TerminateProcess` via `Child::kill`) mid-write,
+/// restarts it pointed at the same data dir, and compares acknowledged
+/// writes against what actually came back after AOF replay. Runs are
+/// sequential (same demo port) so results aren't skewed by one policy's
+/// leftover data dir or port contention with the next.
+async fn handle_run_durability(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
+    let params = query.map(parse_query).unwrap_or_default();
+    let text = |name: &str, fallback: &str| params.get(name).cloned().unwrap_or_else(|| fallback.to_string());
+    let host = text("host", "127.0.0.1").trim().to_string();
+    let port = text("port", "17380").parse::<u16>().unwrap_or(17380);
+    let write_secs = text("seconds", "4").parse::<u64>().unwrap_or(4).clamp(1, 30);
+    let policy_text = text("policies", "always,everysec,no");
+    let policies: Vec<String> = policy_text
+        .split(',')
+        .map(str::trim)
+        .filter(|p| matches!(*p, "always" | "everysec" | "no"))
+        .map(str::to_string)
+        .collect();
+    if host.is_empty() || policies.is_empty() || policies.len() > 3 {
+        socket
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await?;
+
+    let server_bin = reflexdb_server_bin();
+    for policy in &policies {
+        write_chunk(
+            socket,
+            &format!(
+                "{{\"type\":\"progress\",\"message\":\"appendfsync={}: starting a fresh server…\"}}\n",
+                json_escape(policy)
+            ),
+        )
+        .await?;
+
+        let dir = std::env::temp_dir().join(format!(
+            "reflexdb-durability-{}-{}-{policy}",
+            std::process::id(),
+            port
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            write_chunk(
+                socket,
+                &format!(
+                    "{{\"type\":\"error\",\"message\":\"could not create temp data dir: {}\"}}\n",
+                    json_escape(&e.to_string())
+                ),
+            )
+            .await?;
+            break;
+        }
+
+        let spawn = |dir: &std::path::Path| {
+            Command::new(&server_bin)
+                .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
+                .args(["--appendonly", "yes", "--appendfsync", policy])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+        };
+
+        let mut child = match spawn(&dir) {
+            Ok(c) => c,
+            Err(e) => {
+                write_chunk(
+                    socket,
+                    &format!(
+                        "{{\"type\":\"error\",\"message\":\"could not spawn {}: {}. Set REFLEXDB_SERVER_BIN or build it first.\"}}\n",
+                        json_escape(&server_bin),
+                        json_escape(&e.to_string())
+                    ),
+                )
+                .await?;
+                break;
+            }
+        };
+        if !wait_for_server_ready(&host, port, Duration::from_secs(5)).await {
+            let _ = child.kill().await;
+            write_chunk(socket, "{\"type\":\"error\",\"message\":\"server did not become ready in time\"}\n")
+                .await?;
+            break;
+        }
+
+        write_chunk(socket, "{\"type\":\"progress\",\"message\":\"writing under load…\"}\n").await?;
+        let acked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = tokio::spawn(run_durability_writer(host.clone(), port, std::sync::Arc::clone(&acked)));
+        tokio::time::sleep(Duration::from_secs(write_secs)).await;
+
+        // Kill first, then stop the writer task — order matters: we want the
+        // acknowledged count to reflect exactly what the server saw before
+        // the kill, not a race against the writer noticing first.
+        let kill_result = child.kill().await;
+        let acknowledged = acked.load(std::sync::atomic::Ordering::Relaxed);
+        writer.abort();
+        let _ = child.wait().await;
+        if let Err(e) = kill_result {
+            write_chunk(
+                socket,
+                &format!(
+                    "{{\"type\":\"error\",\"message\":\"could not kill server: {}\"}}\n",
+                    json_escape(&e.to_string())
+                ),
+            )
+            .await?;
+            break;
+        }
+
+        write_chunk(
+            socket,
+            &format!(
+                "{{\"type\":\"progress\",\"message\":\"killed after {} acknowledged writes — restarting from the same data dir…\"}}\n",
+                acknowledged
+            ),
+        )
+        .await?;
+
+        let restart_started = Instant::now();
+        let mut restarted = match spawn(&dir) {
+            Ok(c) => c,
+            Err(e) => {
+                write_chunk(
+                    socket,
+                    &format!(
+                        "{{\"type\":\"error\",\"message\":\"could not restart server: {}\"}}\n",
+                        json_escape(&e.to_string())
+                    ),
+                )
+                .await?;
+                break;
+            }
+        };
+        let ready = wait_for_server_ready(&host, port, Duration::from_secs(10)).await;
+        let restart_ms = restart_started.elapsed().as_millis();
+        if !ready {
+            let _ = restarted.kill().await;
+            write_chunk(
+                socket,
+                "{\"type\":\"error\",\"message\":\"server did not come back up after restart\"}\n",
+            )
+            .await?;
+            break;
+        }
+
+        let recovered = match RespClient::connect(&host, port).await {
+            Ok(mut client) => match client.call(&["DBSIZE"]).await {
+                Ok(Reply::Integer(n)) => n.max(0) as u64,
+                _ => 0,
+            },
+            Err(_) => 0,
+        };
+        let lost = acknowledged.saturating_sub(recovered);
+        let writes_per_second = if write_secs > 0 { acknowledged as f64 / write_secs as f64 } else { 0.0 };
+
+        write_chunk(
+            socket,
+            &format!(
+                "{{\"type\":\"durability\",\"policy\":\"{policy}\",\"acknowledged\":{acknowledged},\"recovered\":{recovered},\"lost\":{lost},\"writes_per_second\":{writes_per_second:.0},\"restart_ms\":{restart_ms}}}\n"
+            ),
+        )
+        .await?;
+
+        let _ = restarted.kill().await;
+        let _ = restarted.wait().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    socket.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+/// `docker inspect -f '<format>' <name>`, trimmed. `None` on any failure
+/// (daemon not running, container gone, bad format, ...) — every caller
+/// treats that as "couldn't find out", not an error worth surfacing on its
+/// own; the surrounding test reports it as such.
+async fn docker_inspect_field(name: &str, format: &str) -> Option<String> {
+    let out = Command::new("docker").args(["inspect", "-f", format, name]).output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+async fn docker_container_running(name: &str) -> bool {
+    docker_inspect_field(name, "{{.State.Running}}").await.as_deref() == Some("true")
+}
+
+/// Disk used inside the container's `/data` mount, in KB — `0` if the
+/// container has no shell/`du` (e.g. a `scratch`-based image) or is gone.
+async fn docker_dir_usage_kb(name: &str) -> u64 {
+    let out = Command::new("docker")
+        .args(["exec", name, "sh", "-c", "du -sk /data 2>/dev/null | cut -f1"])
+        .output()
+        .await;
+    match out {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+/// Parses `docker stats`' `MemUsage` column (e.g. `512.3MiB / 1GiB`) into
+/// the "used" side, in MB. Good enough for a live progress readout, not
+/// meant to be exact.
+fn parse_docker_mem_usage_mb(text: &str) -> Option<f64> {
+    let used = text.split('/').next()?.trim();
+    let (number, unit) = used.split_at(used.find(|c: char| c.is_alphabetic())?);
+    let value: f64 = number.trim().parse().ok()?;
+    Some(match unit.trim() {
+        "GiB" | "GB" => value * 1024.0,
+        "MiB" | "MB" => value,
+        "KiB" | "KB" => value / 1024.0,
+        "B" => value / 1024.0 / 1024.0,
+        _ => return None,
+    })
+}
+
+async fn docker_mem_usage_mb(name: &str) -> Option<f64> {
+    let out = Command::new("docker")
+        .args(["stats", "--no-stream", "--format", "{{.MemUsage}}", name])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_docker_mem_usage_mb(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// Same writer shape as `run_durability_writer`, but with a caller-chosen
+/// value size so RAM/disk fill at a predictable, configurable rate.
+async fn run_resource_writer(
+    host: String,
+    port: u16,
+    value: String,
+    acked: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    let Ok(mut client) = RespClient::connect(&host, port).await else { return };
+    let mut i: u64 = 0;
+    loop {
+        let key = format!("fill:{i}");
+        match client.call(&["SET", &key, &value]).await {
+            Ok(_) => {
+                acked.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+                i += 1;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Hard resource-limit demo: runs `reflexdb-server` inside a single Docker
+/// container with both a real `--memory` cap and a size-capped `--tmpfs`
+/// mount applied at the same time — an actual OS-enforced ceiling, unlike
+/// `maxmemory`/`noeviction`, which is reflexdb's own graceful (non-crashing)
+/// degradation. Writes fixed-size values until the container dies or a
+/// safety timeout elapses, then reports whether the kernel OOM-killed it
+/// and/or the disk filled up, and whether it kept responding instead of
+/// crashing.
+async fn handle_run_resource_limit(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
+    let params = query.map(parse_query).unwrap_or_default();
+    let text = |name: &str, fallback: &str| params.get(name).cloned().unwrap_or_else(|| fallback.to_string());
+    let image = text("image", "reflexdb-bench:latest");
+    let port = text("port", "17385").parse::<u16>().unwrap_or(17385);
+    let mem_limit_gb = text("ram_gb", "1").parse::<f64>().unwrap_or(1.0).clamp(0.1, 64.0);
+    let disk_limit_gb = text("disk_gb", "0.25").parse::<f64>().unwrap_or(0.25).clamp(0.05, 64.0);
+    let value_bytes = text("value_bytes", "4096").parse::<usize>().unwrap_or(4096).clamp(64, 65536);
+    let max_seconds = text("max_seconds", "90").parse::<u64>().unwrap_or(90).clamp(5, 300);
+    if image.is_empty() {
+        socket
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await?;
+
+    let docker_ok =
+        Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]).output().await;
+    if !matches!(docker_ok, Ok(out) if out.status.success()) {
+        write_chunk(socket, "{\"type\":\"error\",\"message\":\"Docker isn't reachable \u{2014} start Docker Desktop (or the daemon) and try again.\"}\n").await?;
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(());
+    }
+    let image_ok = Command::new("docker").args(["image", "inspect", &image]).output().await;
+    if !matches!(image_ok, Ok(out) if out.status.success()) {
+        write_chunk(
+            socket,
+            &format!(
+                "{{\"type\":\"error\",\"message\":\"image '{}' not found \u{2014} build it first: docker build -f Dockerfile.bench -t {} .\"}}\n",
+                json_escape(&image),
+                json_escape(&image)
+            ),
+        )
+        .await?;
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    let value = "x".repeat(value_bytes);
+    let host = "127.0.0.1".to_string();
+
+    // Docker's `--memory`/`tmpfs size=` reject fractional unit suffixes
+    // (e.g. "0.1g" errors out) — pass whole megabytes instead.
+    let mem_limit_mb = ((mem_limit_gb * 1024.0).round() as u64).max(6);
+    let disk_limit_mb = ((disk_limit_gb * 1024.0).round() as u64).max(1);
+    let name = format!("reflexdb-limit-{}-{}", std::process::id(), port);
+    let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+
+    write_chunk(
+        socket,
+        &format!(
+            "{{\"type\":\"progress\",\"message\":\"starting container (memory={mem_limit_mb}m, /data tmpfs={disk_limit_mb}m)\u{2026}\"}}\n"
+        ),
+    )
+    .await?;
+
+    let spawned = Command::new("docker")
+        .args(["run", "-d", "--name", &name])
+        .args(["--memory", &format!("{mem_limit_mb}m"), "--memory-swap", &format!("{mem_limit_mb}m")])
+        .args(["--tmpfs", &format!("/data:rw,size={disk_limit_mb}m")])
+        .args(["-p", &format!("{port}:{port}")])
+        .arg(&image)
+        .args(["--port", &port.to_string(), "--dir", "/data", "--appendonly", "yes"])
+        .args(["--appendfsync", "everysec"])
+        .output()
+        .await;
+    if !matches!(&spawned, Ok(out) if out.status.success()) {
+        let msg = match spawned {
+            Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        write_chunk(
+            socket,
+            &format!("{{\"type\":\"error\",\"message\":\"docker run failed: {}\"}}\n", json_escape(&msg)),
+        )
+        .await?;
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    if !wait_for_server_ready(&host, port, Duration::from_secs(10)).await {
+        let still_running = docker_container_running(&name).await;
+        write_chunk(
+            socket,
+            &format!(
+                "{{\"type\":\"error\",\"message\":\"container did not become ready in time (still running: {still_running})\"}}\n"
+            ),
+        )
+        .await?;
+        let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    write_chunk(socket, &format!("{{\"type\":\"progress\",\"message\":\"writing {value_bytes}-byte values under load\u{2026}\"}}\n")).await?;
+    let acked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let writer =
+        tokio::spawn(run_resource_writer(host.clone(), port, value.clone(), std::sync::Arc::clone(&acked)));
+
+    let deadline = Instant::now() + Duration::from_secs(max_seconds);
+    let mut peak_mem_mb = 0.0f64;
+    let mut peak_disk_kb = 0u64;
+    let mut crashed_early = false;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        if let Some(mb) = docker_mem_usage_mb(&name).await {
+            peak_mem_mb = peak_mem_mb.max(mb);
+        }
+        peak_disk_kb = peak_disk_kb.max(docker_dir_usage_kb(&name).await);
+        if !docker_container_running(&name).await {
+            crashed_early = true;
+            break;
+        }
+        write_chunk(
+            socket,
+            &format!(
+                "{{\"type\":\"progress\",\"message\":\"{} writes acknowledged, ~{:.0} MB resident, ~{} KB on /data\"}}\n",
+                acked.load(std::sync::atomic::Ordering::Relaxed),
+                peak_mem_mb,
+                peak_disk_kb
+            ),
+        )
+        .await?;
+    }
+
+    let acknowledged = acked.load(std::sync::atomic::Ordering::Relaxed);
+    writer.abort();
+
+    let still_running = docker_container_running(&name).await;
+    let still_responsive = if still_running {
+        wait_for_server_ready(&host, port, Duration::from_millis(500)).await
+    } else {
+        false
+    };
+    let oom_killed = docker_inspect_field(&name, "{{.State.OOMKilled}}").await.as_deref() == Some("true");
+    let exit_code = docker_inspect_field(&name, "{{.State.ExitCode}}")
+        .await
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(-1);
+
+    let _ = Command::new("docker").args(["stop", "-t", "2", &name]).output().await;
+    let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+
+    let crashed = crashed_early || !still_running;
+    // Both limits are tight on the same container, so a crash could in
+    // principle be caused by either — report whichever evidence is
+    // actually there instead of guessing from which checkbox was ticked.
+    let disk_full = peak_disk_kb as f64 >= disk_limit_mb as f64 * 1024.0 * 0.9;
+    let cause = if !crashed {
+        "none"
+    } else if oom_killed && disk_full {
+        "ram+disk"
+    } else if oom_killed {
+        "ram"
+    } else if disk_full {
+        "disk"
+    } else {
+        "unknown"
+    };
+
+    write_chunk(
+        socket,
+        &format!(
+            "{{\"type\":\"resource_limit\",\"cause\":\"{cause}\",\"mem_limit_gb\":{mem_limit_gb},\"disk_limit_gb\":{disk_limit_gb},\"acknowledged\":{acknowledged},\"crashed\":{crashed},\"oom_killed\":{oom_killed},\"exit_code\":{exit_code},\"still_running\":{still_running},\"still_responsive\":{still_responsive},\"peak_mem_mb\":{peak_mem_mb:.0},\"peak_disk_kb\":{peak_disk_kb}}}\n"
+        ),
+    )
+    .await?;
+
+    socket.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+/// One competing engine in the shootout. Every engine listens on its
+/// container's `6379` — only the host-side port differs — so the harness
+/// doesn't need any engine-specific wiring beyond this struct.
+struct Engine {
+    id: &'static str,
+    label: &'static str,
+    image: &'static str,
+    /// Extra `docker run` flags, inserted *before* the image name (e.g.
+    /// Dragonfly's `--ulimit memlock=-1`) — these configure the container
+    /// itself, not the process running inside it, so they can't go after
+    /// the image name the way a CMD override does.
+    docker_flags: &'static [&'static str],
+    /// Overrides the image's default CMD, inserted *after* the image name
+    /// (e.g. disabling Redis's persistence) — passed straight to the
+    /// containerized process's own argv, not to `docker run`.
+    container_args: &'static [&'static str],
+}
+
+const SHOOTOUT_ENGINES: &[Engine] = &[
+    Engine {
+        id: "redis",
+        label: "Redis",
+        image: "redis:7-alpine",
+        docker_flags: &[],
+        container_args: &["redis-server", "--save", "", "--appendonly", "no"],
+    },
+    Engine {
+        id: "dragonfly",
+        label: "Dragonfly",
+        image: "docker.dragonflydb.io/dragonflydb/dragonfly:latest",
+        docker_flags: &["--ulimit", "memlock=-1"],
+        container_args: &[],
+    },
+    Engine {
+        id: "reflexdb",
+        label: "ReflexDB",
+        image: "reflexdb-bench:latest",
+        docker_flags: &[],
+        container_args: &[],
+    },
+];
+
+/// Inserts `"engine":"<id>",` right after a JSON object line's opening
+/// `{` — cheaper than a real JSON parse/re-serialize round trip for
+/// tagging lines that are already known to be `{...}` objects (both
+/// `benchmarks/run.py`'s `json.dumps` rows and this file's own hand-built
+/// `{"type":...}` progress/error rows always are).
+fn tag_engine_line(line: &str, engine_id: &str) -> String {
+    match line.find('{') {
+        Some(pos) => {
+            let mut out = String::with_capacity(line.len() + engine_id.len() + 14);
+            out.push_str(&line[..=pos]);
+            out.push_str(&format!("\"engine\":\"{engine_id}\","));
+            out.push_str(&line[pos + 1..]);
+            out
+        }
+        None => line.to_string(),
+    }
+}
+
+/// Runs the same fixed-workload harness (`benchmarks/run.py`, standard
+/// `GET`/`SET`/`INCR` only — no `LIVE`, so every engine actually supports
+/// the traffic) against Redis, Dragonfly, and ReflexDB **at the same
+/// time**, each in its own container under an identical `--memory`/
+/// `--cpus` cap on its own host port. Running them concurrently does mean
+/// they share the host's physical CPU/memory bandwidth while all three are
+/// active — each container's cgroup limit still caps what *it* can use,
+/// but it's no longer "nothing else was running," so treat this as a
+/// quick side-by-side, not a lab-grade isolated benchmark. The previous,
+/// one-at-a-time design was more isolated but had a real bug: navigating
+/// away from this tab mid-run aborted the whole in-flight request, so
+/// whichever engines hadn't started yet just never ran. Parallel execution
+/// also fixes that — the whole comparison finishes in roughly one engine's
+/// run time instead of three, and the frontend no longer cancels this
+/// fetch on a tab switch (see `setTab`), so leaving the tab mid-run is
+/// safe either way now.
+async fn handle_run_shootout(query: Option<&str>, socket: &mut TcpStream) -> std::io::Result<()> {
+    let params = query.map(parse_query).unwrap_or_default();
+    let text = |name: &str, fallback: &str| params.get(name).cloned().unwrap_or_else(|| fallback.to_string());
+    let mem_mb = text("mem_mb", "512").parse::<u64>().unwrap_or(512).clamp(64, 65536);
+    let cpus = text("cpus", "1").parse::<f64>().unwrap_or(1.0).clamp(0.1, 64.0);
+    let base_port = text("port", "17400").parse::<u16>().unwrap_or(17400).min(65000);
+    let seconds = text("seconds", "5").parse::<f64>().unwrap_or(5.0).clamp(1.0, 60.0);
+    let runs = text("runs", "1").parse::<usize>().unwrap_or(1).clamp(1, 10);
+    let clients = text("clients", "16").parse::<usize>().unwrap_or(16).clamp(1, 512);
+    let keys = text("keys", "1000").parse::<usize>().unwrap_or(1000).clamp(1, 100_000);
+    let pipelines = text("pipeline", "1,16");
+    let valid_pipelines =
+        pipelines.split(',').all(|part| part.trim().parse::<usize>().is_ok_and(|n| (1..=1024).contains(&n)))
+            && pipelines.split(',').count() <= 4;
+    let workload_text = text("workloads", "small-mixed,hot-key");
+    let workloads: Vec<String> = workload_text
+        .split(',')
+        .map(str::trim)
+        .filter(|w| matches!(*w, "small-mixed" | "hot-key"))
+        .map(str::to_string)
+        .collect();
+    let engine_text = text("engines", "redis,dragonfly,reflexdb");
+    let engines: Vec<&'static Engine> = engine_text
+        .split(',')
+        .map(str::trim)
+        .filter_map(|id| SHOOTOUT_ENGINES.iter().find(|e| e.id == id))
+        .collect();
+    if !valid_pipelines || workloads.is_empty() || engines.is_empty() {
+        socket
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+
+    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson; charset=utf-8\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await?;
+
+    let docker_ok =
+        Command::new("docker").args(["version", "--format", "{{.Server.Version}}"]).output().await;
+    if !matches!(docker_ok, Ok(out) if out.status.success()) {
+        write_chunk(socket, "{\"type\":\"error\",\"message\":\"Docker isn't reachable \u{2014} start Docker Desktop (or the daemon) and try again.\"}\n").await?;
+        socket.write_all(b"0\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/run.py");
+    let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+    // One task per engine, each on its own host port so they can bind
+    // concurrently — fans results in through `tx` as they're produced
+    // rather than writing to the socket directly, since multiple tasks
+    // can't share one `TcpStream` without interleaving corrupted chunks.
+    let mut handles = Vec::with_capacity(engines.len());
+    for (i, engine) in engines.into_iter().enumerate() {
+        let tx = tx.clone();
+        let script = script.clone();
+        let python = python.clone();
+        let pipelines = pipelines.clone();
+        let workloads = workloads.join(",");
+        let port = base_port.saturating_add(i as u16);
+        handles.push(tokio::spawn(async move {
+            run_shootout_engine(ShootoutEngineRun {
+                tx,
+                engine,
+                port,
+                mem_mb,
+                cpus,
+                seconds,
+                runs,
+                clients,
+                keys,
+                pipelines,
+                workloads,
+                script,
+                python,
+            })
+            .await;
+        }));
+    }
+    drop(tx);
+
+    while let Some(line) = rx.recv().await {
+        if write_chunk(socket, &line).await.is_err() {
+            // Client actually gone (not just a tab switch — the frontend
+            // no longer aborts this fetch for that): stop waiting on the
+            // remaining engines. Each one's own `finally`-equivalent still
+            // runs (it's not aborted, just no longer being awaited here),
+            // so in-flight containers still get cleaned up; we just don't
+            // delay the HTTP response for it.
+            for handle in handles {
+                handle.abort();
+            }
+            return Ok(());
+        }
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    socket.write_all(b"0\r\n\r\n").await?;
+    Ok(())
+}
+
+struct ShootoutEngineRun {
+    tx: mpsc::UnboundedSender<String>,
+    engine: &'static Engine,
+    port: u16,
+    mem_mb: u64,
+    cpus: f64,
+    seconds: f64,
+    runs: usize,
+    clients: usize,
+    keys: usize,
+    pipelines: String,
+    workloads: String,
+    script: std::path::PathBuf,
+    python: String,
+}
+
+/// One engine's full lifecycle — pull/check the image, run its container,
+/// wait for it to accept connections, run the benchmark harness against
+/// it, and clean the container up — sending every line it would otherwise
+/// have written to the HTTP response through `tx` instead, tagged with
+/// this engine's id so the frontend can route it to the right chart.
+/// Independent of every other engine's run: failure here just stops this
+/// one engine's lines, not the whole comparison.
+async fn run_shootout_engine(run: ShootoutEngineRun) {
+    let ShootoutEngineRun {
+        tx,
+        engine,
+        port,
+        mem_mb,
+        cpus,
+        seconds,
+        runs,
+        clients,
+        keys,
+        pipelines,
+        workloads,
+        script,
+        python,
+    } = run;
+    let send = |line: String| {
+        let _ = tx.send(line);
+    };
+    let host = "127.0.0.1".to_string();
+
+    let image_ok = Command::new("docker").args(["image", "inspect", engine.image]).output().await;
+    if !matches!(image_ok, Ok(out) if out.status.success()) {
+        // ReflexDB's image has to be built from this checkout — there's
+        // nowhere to pull it from. Redis/Dragonfly are published images,
+        // so pull them on the spot instead of making the user leave the
+        // UI to run a command by hand.
+        if engine.id == "reflexdb" {
+            send(tag_engine_line(
+                "{\"type\":\"error\",\"message\":\"image 'reflexdb-bench:latest' not found \u{2014} run: docker build -f Dockerfile.bench -t reflexdb-bench:latest .\"}\n",
+                engine.id,
+            ));
+            return;
+        }
+        send(tag_engine_line(
+            &format!(
+                "{{\"type\":\"progress\",\"message\":\"Pulling {} (first run only, may take a minute)\u{2026}\"}}\n",
+                engine.image
+            ),
+            engine.id,
+        ));
+        let pulled = Command::new("docker").args(["pull", engine.image]).output().await;
+        if !matches!(&pulled, Ok(out) if out.status.success()) {
+            let msg = match pulled {
+                Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            send(tag_engine_line(
+                &format!(
+                    "{{\"type\":\"error\",\"message\":\"docker pull {} failed: {}\"}}\n",
+                    json_escape(engine.image),
+                    json_escape(&msg)
+                ),
+                engine.id,
+            ));
+            return;
+        }
+    }
+
+    let name = format!("reflexdb-shootout-{}-{}-{port}", std::process::id(), engine.id);
+    let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+
+    send(tag_engine_line(
+        &format!(
+            "{{\"type\":\"progress\",\"message\":\"Starting {} on port {port} (memory={mem_mb}m, cpus={cpus})\u{2026}\"}}\n",
+            engine.label
+        ),
+        engine.id,
+    ));
+
+    let mut cmd = Command::new("docker");
+    cmd.args(["run", "-d", "--name", &name])
+        .args(["--memory", &format!("{mem_mb}m"), "--cpus", &cpus.to_string()])
+        .args(["-p", &format!("{port}:6379")])
+        .args(engine.docker_flags)
+        .arg(engine.image)
+        .args(engine.container_args);
+    // Dragonfly sizes its io-thread pool to the cgroup cpu count by default,
+    // then refuses to start unless there's ~256MiB of the memory cap per
+    // thread (independent of `--memory` itself) — e.g. `--cpus 4` with the
+    // default 512MiB demands 1GiB and exits immediately, which otherwise
+    // just looks like a silent 15s readiness timeout. Cap its thread count
+    // to what the memory budget can actually support (with some margin —
+    // the check is against cgroup-available memory, which is a bit less
+    // than the raw `--memory` value).
+    if engine.id == "dragonfly" {
+        let threads = ((mem_mb / 300).max(1)).min(cpus.floor().max(1.0) as u64);
+        cmd.arg(format!("--proactor_threads={threads}"));
+    }
+    let spawned = cmd.output().await;
+    if !matches!(&spawned, Ok(out) if out.status.success()) {
+        let msg = match spawned {
+            Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        send(tag_engine_line(
+            &format!("{{\"type\":\"error\",\"message\":\"docker run failed: {}\"}}\n", json_escape(&msg)),
+            engine.id,
+        ));
+        let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+        return;
+    }
+
+    if !wait_for_server_ready(&host, port, Duration::from_secs(15)).await {
+        // Surface the container's own log tail instead of a bare timeout —
+        // e.g. this is also where Dragonfly's "N threads, so XGiB required"
+        // startup check would show up if the margin above wasn't enough.
+        let logs = Command::new("docker").args(["logs", "--tail", "5", &name]).output().await;
+        let detail = match logs {
+            Ok(out) if !out.stdout.is_empty() || !out.stderr.is_empty() => {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                format!(" \u{2014} {}", combined.trim().replace('\n', " / "))
+            }
+            _ => String::new(),
+        };
+        send(tag_engine_line(
+            &format!(
+                "{{\"type\":\"error\",\"message\":\"container did not become ready in time{}\"}}\n",
+                json_escape(&detail)
+            ),
+            engine.id,
+        ));
+        let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+        return;
+    }
+
+    let mut child = match Command::new(&python)
+        .arg(&script)
+        .args(["--host", &host, "--port", &port.to_string(), "--runs", &runs.to_string()])
+        .args(["--seconds", &seconds.to_string(), "--clients", &clients.to_string()])
+        .args(["--pipeline", &pipelines, "--keys", &keys.to_string()])
+        .args(["--workloads", &workloads])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            send(tag_engine_line(
+                &format!(
+                    "{{\"type\":\"error\",\"message\":\"could not start benchmark harness: {}\"}}\n",
+                    json_escape(&error.to_string())
+                ),
+                engine.id,
+            ));
+            let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+            return;
+        }
+    };
+    if let Some(stdout) = child.stdout.take() {
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = match tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line).await {
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if read == 0 {
+                break;
+            }
+            send(tag_engine_line(&String::from_utf8_lossy(&line), engine.id));
+        }
+    }
+    let _ = child.wait().await;
+    let _ = Command::new("docker").args(["stop", "-t", "2", &name]).output().await;
+    let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
+}
+
 async fn handle_connection(socket: &mut TcpStream) -> std::io::Result<()> {
     let mut buf = [0u8; 8192];
     let mut request = Vec::new();
@@ -2181,6 +3996,10 @@ async fn handle_connection(socket: &mut TcpStream) -> std::io::Result<()> {
         ("GET", "/") => handle_root(socket).await,
         ("GET", "/logo.png") => handle_logo(socket).await,
         ("GET", "/run-profiled") => handle_run_profiled(query, socket).await,
+        ("GET", "/run-latency") => handle_run_latency(query, socket).await,
+        ("GET", "/run-durability") => handle_run_durability(query, socket).await,
+        ("GET", "/run-resource-limit") => handle_run_resource_limit(query, socket).await,
+        ("GET", "/run-shootout") => handle_run_shootout(query, socket).await,
         ("GET", "/run-history-profiled") => handle_run_history_profiled(query, socket).await,
         ("GET", "/history-status") => handle_history_status(query, socket).await,
         ("GET", "/live-watch") => handle_live_watch(query, socket).await,

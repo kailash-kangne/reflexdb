@@ -14,7 +14,7 @@
 //! whichever thread doesn't hold the lock isn't just waiting, it's parked,
 //! so *every other connection scheduled on that worker* stalls too, not
 //! just the one doing the write. Measured impact: ~220k req/s SET with no
-//! persistence vs. ~64k req/s with `appendonly yes` (default `everysec`)
+//! persistence vs. ~64k req/s with `appendonly yes appendfsync everysec`
 //! on the same box — a 71% drop from lock/syscall contention, not disk
 //! bandwidth.
 //!
@@ -58,6 +58,12 @@ use keyspace::{Store, Value};
 use tokio_util::codec::Decoder;
 
 /// How aggressively the AOF is fsync'd to disk.
+///
+/// | Policy     | fsync frequency        | Max data loss on crash | Throughput |
+/// |------------|-------------------------|-------------------------|------------|
+/// | `always`   | every write             | lowest (~none)          | slowest    |
+/// | `everysec` | ~once a second          | up to ~1s of writes     | good       |
+/// | `no`       | left to the OS          | higher (OS-dependent)   | fastest    |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fsync {
     /// fsync after every batch the writer thread flushes — slowest,
@@ -66,9 +72,13 @@ pub enum Fsync {
     Always,
     /// fsync roughly once a second from a background tick (the caller is
     /// responsible for calling `AofWriter::fsync` on that cadence).
-    #[default]
     EverySec,
-    /// Never fsync explicitly; let the OS flush on its own schedule.
+    /// Never fsync explicitly; let the OS flush on its own schedule —
+    /// fastest, and the default, since `appendonly` itself is already off
+    /// by default and opting into it is already an explicit durability
+    /// choice. Set `appendfsync everysec`/`always` if you want a tighter
+    /// bound on data loss.
+    #[default]
     No,
 }
 
@@ -146,7 +156,7 @@ impl AofWriter {
     }
 
     fn send(&self, job: Job) -> io::Result<()> {
-        self.tx.lock().unwrap().send(job).map_err(|_| writer_gone())
+        self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(job).map_err(|_| writer_gone())
     }
 
     /// Blocks until everything already queued before this call has been
@@ -527,6 +537,16 @@ mod tests {
     fn replay_missing_file_returns_empty() {
         let path = std::env::temp_dir().join("reflexdb-aof-does-not-exist.aof");
         assert_eq!(replay(&path).unwrap(), Vec::<Vec<Bytes>>::new());
+    }
+
+    #[test]
+    fn replay_rejects_malformed_frames_without_panicking() {
+        let path = std::env::temp_dir().join(format!("reflexdb-aof-malformed-{}.aof", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, b"*1\r\n$999999999999999999999\r\n").unwrap();
+        let error = replay(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
     }
 
     /// Many threads hammering `append` concurrently (the group-commit path)
