@@ -65,6 +65,12 @@ pub fn deserialize(payload: &[u8], store: &Store) -> io::Result<()> {
         .with_limit(payload.len() as u64)
         .deserialize(payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if file.version != FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported RDB format version {}", file.version),
+        ));
+    }
     for (index, entries) in file.databases.into_iter().enumerate() {
         let Some(db) = store.db(index) else { continue };
         for entry in entries {
@@ -159,6 +165,19 @@ mod tests {
         let path = std::env::temp_dir().join("reflexdb-does-not-exist.rdb");
         let store = Store::new(1);
         assert!(!load(&path, &store).unwrap());
+    }
+
+    #[test]
+    fn malformed_and_unsupported_snapshots_return_errors_without_panicking() {
+        let store = Store::new(1);
+        for payload in [&[][..], &[0xff; 32][..], &[1, 0, 0][..]] {
+            assert!(deserialize(payload, &store).is_err());
+        }
+
+        let unsupported =
+            bincode::serialize(&RdbFile { version: FORMAT_VERSION + 1, databases: vec![] }).unwrap();
+        let error = deserialize(&unsupported, &store).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     /// `Value::Stream` carries consumer-group state (`ConsumerGroup`/

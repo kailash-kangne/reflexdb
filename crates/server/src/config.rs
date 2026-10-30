@@ -23,6 +23,9 @@ pub struct Config {
     pub appendonly: bool,
     /// AOF filename within `dir`, used when `appendonly` is enabled.
     pub appendfilename: String,
+    /// `appendfsync always/everysec/no` — see `Fsync` for the tradeoffs.
+    /// Defaults to `no` (fastest, OS decides when to flush); set it
+    /// explicitly in the config file for a tighter durability bound.
     pub appendfsync: Fsync,
     /// `tiered-storage yes/no` — evicted keys spill to an on-disk LSM tier
     /// (via the `tiered` crate / `fjall`) instead of being dropped.
@@ -32,6 +35,20 @@ pub struct Config {
     /// `tiered-dir`: where the tier's files land, relative to `dir` if not
     /// absolute.
     pub tiered_dir: PathBuf,
+    /// `tiered-disk-limit`: once the disk tier itself exceeds this, cold
+    /// tiered entries get dropped outright (real data loss, not a RAM/disk
+    /// move) to keep it bounded. `None` (default) means unbounded — the
+    /// previous behavior, kept for backward compatibility.
+    pub tiered_disk_limit: Option<u64>,
+    /// `eviction-tick-ms`: how often the background task re-checks
+    /// `maxmemory`/`tiered-memory-limit`/`tiered-disk-limit` and runs TTL
+    /// active-expire. Lowering this reacts to a write burst faster (lower
+    /// peak RAM/disk overshoot) for free — it's a background task, not on
+    /// the request path, so it costs a bit of extra idle-tick CPU, not
+    /// request latency. Keep it well above 0; an interval of a few ms
+    /// would just burn CPU spinning between ticks that mostly find
+    /// nothing to do.
+    pub eviction_tick_ms: u64,
     /// `singleflight-max-wait-ms`: hard cap on how long a `GET ...
     /// SINGLEFLIGHT` caller blocks before getting a timeout error.
     pub singleflight_max_wait_ms: u64,
@@ -57,6 +74,11 @@ pub struct Config {
     /// `history-retention-ms`: how long a recorded version is kept before
     /// the periodic sweep (`main.rs`) reclaims it. Default 24h.
     pub history_retention_ms: u64,
+    /// `slowlog-log-slower-than`: microseconds a command must take to be
+    /// logged; `-1` disables logging, `0` logs everything.
+    pub slowlog_log_slower_than_us: i64,
+    /// `slowlog-max-len`: oldest entries drop once the log exceeds this.
+    pub slowlog_max_len: usize,
 }
 
 impl Default for Config {
@@ -72,10 +94,12 @@ impl Default for Config {
             dbfilename: "dump.rdb".to_string(),
             appendonly: false,
             appendfilename: "appendonly.aof".to_string(),
-            appendfsync: Fsync::EverySec,
+            appendfsync: Fsync::No,
             tiered_storage: false,
             tiered_memory_limit: 250 * 1024 * 1024,
             tiered_dir: PathBuf::from("tiered"),
+            tiered_disk_limit: None,
+            eviction_tick_ms: 100,
             singleflight_max_wait_ms: 10_000,
             replicaof: None,
             tls_port: 0,
@@ -85,6 +109,8 @@ impl Default for Config {
             history_enabled: false,
             history_dir: PathBuf::from("history"),
             history_retention_ms: 24 * 60 * 60 * 1000,
+            slowlog_log_slower_than_us: 10_000,
+            slowlog_max_len: 128,
         }
     }
 }
@@ -183,6 +209,14 @@ impl Config {
             "tiered-storage" => self.tiered_storage = value.eq_ignore_ascii_case("yes"),
             "tiered-memory-limit" => self.tiered_memory_limit = parse_memory(value)?,
             "tiered-dir" => self.tiered_dir = PathBuf::from(value),
+            "tiered-disk-limit" => {
+                self.tiered_disk_limit =
+                    (!value.is_empty() && value != "0").then(|| parse_memory(value)).transpose()?
+            }
+            "eviction-tick-ms" => {
+                self.eviction_tick_ms =
+                    value.parse().map_err(|_| format!("invalid eviction-tick-ms: {value}"))?
+            }
             "singleflight-max-wait-ms" => {
                 self.singleflight_max_wait_ms =
                     value.parse().map_err(|_| format!("invalid singleflight-max-wait-ms: {value}"))?
@@ -206,6 +240,14 @@ impl Config {
             "history-retention-ms" => {
                 self.history_retention_ms =
                     value.parse().map_err(|_| format!("invalid history-retention-ms: {value}"))?
+            }
+            "slowlog-log-slower-than" => {
+                self.slowlog_log_slower_than_us =
+                    value.parse().map_err(|_| format!("invalid slowlog-log-slower-than: {value}"))?
+            }
+            "slowlog-max-len" => {
+                self.slowlog_max_len =
+                    value.parse().map_err(|_| format!("invalid slowlog-max-len: {value}"))?
             }
             other => {
                 tracing::warn!("ignoring unsupported config directive: {other}");

@@ -3,6 +3,7 @@
 //! key it reads changes. See `docs/04-reactivity-live.md`.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use crc::{Crc, CRC_64_XZ};
@@ -20,6 +21,7 @@ pub struct LiveSub {
     pub inner_req: Request,
     pub key: Bytes,
     pub clients: HashSet<u64>,
+    pub latest: Arc<Value>,
 }
 
 /// Read-only commands allowed as a `LIVE` handler. Each one takes the
@@ -107,10 +109,12 @@ pub fn cmd_live(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) ->
         _ => Value::NullBulk,
     };
 
-    ctx.live_subscribe(fp, state.db_index, inner_req, key.clone(), state.id);
+    let initial = Arc::new(push_value(&fp_hex, initial));
+    ctx.live_subscribe(fp, state.db_index, inner_req, key.clone(), state.id, initial.clone());
+    state.live_fingerprints.insert(fp);
     state.subscriptions += 1;
 
-    reply(push_value(&fp_hex, initial))
+    reply((*initial).clone())
 }
 
 pub fn cmd_unlive(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Outcome {
@@ -123,6 +127,7 @@ pub fn cmd_unlive(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) 
         let Ok(fp) = u64::from_str_radix(text, 16) else { continue };
         if ctx.live_unsubscribe(fp, state.id) {
             removed += 1;
+            state.live_fingerprints.remove(&fp);
             state.subscriptions = state.subscriptions.saturating_sub(1);
         }
     }
@@ -165,7 +170,6 @@ fn push_live_update(ctx: &ServerContext, fp: u64) {
     let Some(sub) = ctx.live_subs.get(&fp) else { return };
     let db_index = sub.db_index;
     let inner_req = sub.inner_req.clone();
-    let clients: Vec<u64> = sub.clients.iter().copied().collect();
     drop(sub);
 
     let mut scratch = ClientState::with_id(0, false);
@@ -175,9 +179,10 @@ fn push_live_update(ctx: &ServerContext, fp: u64) {
         _ => Value::NullBulk,
     };
     let fp_hex = format!("{fp:016x}");
-    let message = push_value(&fp_hex, result);
-    for client_id in clients {
-        ctx.push_to(client_id, message.clone());
+    let latest = Arc::new(push_value(&fp_hex, result));
+    if let Some(mut sub) = ctx.live_subs.get_mut(&fp) {
+        sub.latest = latest;
+        let _ = ctx.live_events.send(fp);
     }
 }
 
@@ -189,10 +194,17 @@ impl ServerContext {
         inner_req: Request,
         key: Bytes,
         client_id: u64,
+        initial: Arc<Value>,
     ) {
         self.live_subs
             .entry(fingerprint)
-            .or_insert_with(|| LiveSub { db_index, inner_req, key: key.clone(), clients: HashSet::new() })
+            .or_insert_with(|| LiveSub {
+                db_index,
+                inner_req,
+                key: key.clone(),
+                clients: HashSet::new(),
+                latest: initial,
+            })
             .clients
             .insert(client_id);
         match self.key_watchers.entry((db_index, key)) {

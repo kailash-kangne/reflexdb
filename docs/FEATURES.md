@@ -80,6 +80,8 @@ and promoted back to RAM on the next read — so the working set can exceed the 
 | `tiered-memory-limit` | 250MB | RAM budget before tiering kicks in |
 | `tiered-dir` | `./tiered` | where LSM files land |
 | `tiered-promotion` | `on-access` | when to pull a key back to RAM |
+| `tiered-disk-limit` | unset (unbounded) | once the disk tier itself exceeds this, the oldest-evicted entries are dropped outright, oldest-first, down to 50% of the limit (real data loss — there's nowhere left to move them) |
+| `eviction-tick-ms` | 100 | how often the background task re-checks `maxmemory`/`tiered-memory-limit`/`tiered-disk-limit` and runs TTL active-expire — a background task, not the request path, so lowering it reacts to write bursts faster for free (small extra idle-tick CPU, not request latency) |
 
 A tiered key and its RAM copy never coexist (promotion is a move, not a copy). `EXISTS` answers
 truthfully for tiered keys without a disk read. Tier I/O is synchronous (not off-loaded to a
@@ -159,4 +161,4 @@ MVCC snapshot reads (`SNAPSHOT BEGIN`/`END`) and dependency-tracked invalidation
 | `reflexdb-cli` | Interactive client. |
 | `reflexdb-sentinel` | Failover watcher for a monitored primary/replica group. |
 | `reflexdb-proxy` | Dumb `--listen`/`--upstream` byte-splice pass-through in front of an existing RESP-compatible server — no RESP parsing, no feature on its own, foundation for a future proxy-side `LIVE`/single-flight layer. |
-| `reflexdb-bench-ui` | Local web UI (`BENCH_UI_BIND`, default `127.0.0.1:8080`) that drives `redis-benchmark` against a running server and charts RPS/latency/RAM/disk live, one card per command — plus standalone tabs to watch `LIVE`/`UNLIVE` pushes (multi-key, optional auto-randomized values) and to demo tiered storage eviction/promotion. |
+| `reflexdb-bench-ui` | Local web UI (`BENCH_UI_BIND`, default `127.0.0.1:8080`) that drives command benchmarks against a running server and charts RPS/latency/RAM/disk live, one card per command. Its Latency Lab exposes editable scenarios for mixed small keys, hot-key contention, pipeline depth, repeated runs, and `LIVE` fan-out with p50/p99/p999 charts. Separate tabs watch `LIVE`/`UNLIVE` updates and demo tiered storage eviction/promotion. |

@@ -56,6 +56,20 @@ pub fn cmd_info(ctx: &ServerContext, _args: &[Bytes]) -> Outcome {
     out.push_str(&format!("maxmemory_policy:{policy}\r\n"));
     out.push_str("\r\n");
 
+    out.push_str("# Tiering\r\n");
+    out.push_str(&format!("tiered_memory_limit:{}\r\n", ctx.tiered_limit.unwrap_or(0)));
+    match ctx.store.tiered_disk_usage_bytes() {
+        // `du`-style directory size includes fjall's pre-allocated journal
+        // segments (can be tens of MB even near-empty) — this is the same
+        // self-tracked payload-byte estimate `tiered_disk_limit`
+        // enforcement actually checks against, so it's the number to
+        // compare against the limit, not a filesystem walk.
+        Some(used) => out.push_str(&format!("tiered_disk_used_bytes:{used}\r\n")),
+        None => out.push_str("tiered_disk_used_bytes:0\r\n"),
+    }
+    out.push_str(&format!("tiered_disk_limit:{}\r\n", ctx.tiered_disk_limit.unwrap_or(0)));
+    out.push_str("\r\n");
+
     out.push_str("# Persistence\r\n");
     out.push_str(&format!("rdb_last_save_time:{}\r\n", ctx.last_save()));
     out.push_str(&format!("aof_enabled:{}\r\n", ctx.aof_enabled() as i32));

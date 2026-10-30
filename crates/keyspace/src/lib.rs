@@ -180,6 +180,25 @@ pub trait TieringHandler: Send + Sync {
     fn keys_snapshot(&self) -> Vec<Bytes> {
         Vec::new()
     }
+    /// Bytes currently used on disk by this tier, if the implementation can
+    /// report it — used to enforce `tiered-disk-limit`. `None` means "don't
+    /// know", which disables that enforcement rather than treating it as
+    /// zero (an implementation that can't measure its own usage shouldn't
+    /// silently look empty and never get capacity-evicted from).
+    fn disk_usage_bytes(&self) -> Option<u64> {
+        None
+    }
+    /// Up to `max` of the tier's keys, oldest-evicted-first — used by
+    /// `tiered-disk-limit` so capacity eviction drops genuinely stale
+    /// entries first instead of a random pick. Default falls back to an
+    /// arbitrary (not actually age-ordered) `max` keys from
+    /// `keys_snapshot`, for implementations that don't track eviction
+    /// age — correct but not age-aware.
+    fn oldest_keys(&self, max: usize) -> Vec<Bytes> {
+        let mut keys = self.keys_snapshot();
+        keys.truncate(max);
+        keys
+    }
     /// Remove every key held in the tier.
     fn clear(&self) {
         for key in self.keys_snapshot() {
@@ -226,6 +245,16 @@ impl Db {
         }
     }
 
+    /// `tier_ops` only exists to serialize key mutations against tier
+    /// moves (see its doc comment) — with no tiering handler configured
+    /// (the common case), there's no tier to race with, so every write
+    /// path skips the lock entirely instead of needlessly serializing all
+    /// writes to this `Db` through one mutex regardless of key.
+    #[inline]
+    fn tier_guard(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.tiering.is_some().then(|| self.tier_ops.lock())
+    }
+
     /// Like `new`, but keys evicted via `evict_to_tier` land in `handler`
     /// instead of being dropped, and reads transparently promote them back.
     pub fn with_tiering(handler: Arc<dyn TieringHandler>) -> Self {
@@ -250,7 +279,7 @@ impl Db {
     /// clear the RAM copy, leaving the stale tiered value to resurrect on
     /// the next `GET`).
     pub fn set(&self, key: Bytes, value: Value, expires_at: Option<Instant>) {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         if let Some(handler) = &self.tiering {
             handler.remove(&key);
         }
@@ -262,7 +291,7 @@ impl Db {
     /// found, rehydrate it into RAM. Returns whether a promotion happened.
     /// Sliding TTLs don't currently survive a trip through the disk tier.
     fn try_promote(&self, key: &[u8]) -> bool {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         self.try_promote_locked(key)
     }
 
@@ -346,7 +375,7 @@ impl Db {
     }
 
     pub fn del(&self, keys: &[Bytes]) -> usize {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         let mut removed = 0;
         for key in keys {
@@ -547,7 +576,7 @@ impl Db {
     /// promotion applied the same way as `with_value`. Does *not* create the
     /// key if it's missing from both RAM and the tier — see `with_entry_mut`.
     pub fn with_value_mut<R>(&self, key: &[u8], f: impl FnOnce(&mut Value) -> R) -> Option<R> {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         if let Some(lock) = self.map.get(key, &guard) {
             let mut entry = lock.write();
@@ -584,7 +613,7 @@ impl Db {
         key: &[u8],
         f: impl FnOnce(&mut Value, &mut Option<Instant>) -> R,
     ) -> Option<R> {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         if let Some(lock) = self.map.get(key, &guard) {
             let mut entry = lock.write();
@@ -636,7 +665,7 @@ impl Db {
         default: impl FnOnce() -> Value,
         f: impl FnOnce(&mut Value, &mut Option<Instant>, bool) -> R,
     ) -> R {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         // Hot path (key already present and live, which is the common case
         // once a collection key has been created) only needs this one
@@ -668,30 +697,40 @@ impl Db {
     /// Returns `false` if there's no tiering handler, the key doesn't
     /// exist, or it had already expired.
     pub fn evict_to_tier(&self, key: &[u8]) -> bool {
-        let _tier_guard = self.tier_ops.lock();
-        let Some(handler) = &self.tiering else { return false };
+        self.evict_to_tier_sized(key).is_some()
+    }
+
+    /// Same as `evict_to_tier`, but also reports the freed entry's
+    /// approximate RAM footprint on success — lets a caller evicting many
+    /// keys in a row track a running total locally instead of recomputing
+    /// `Store::approx_bytes()` (an O(total keys) scan) after every single
+    /// eviction.
+    pub fn evict_to_tier_sized(&self, key: &[u8]) -> Option<usize> {
+        let _tier_guard = self.tier_guard();
+        let handler = self.tiering.as_ref()?;
         let guard = self.map.guard();
-        let Some(lock) = self.map.get(key, &guard) else { return false };
+        let lock = self.map.get(key, &guard)?;
         let entry = lock.write();
         if entry.is_expired() {
             drop(entry);
             self.map.remove(key, &guard);
-            return false;
+            return None;
         }
         let ttl = entry.expires_at.map(|at| at.saturating_duration_since(Instant::now()));
         if let Err(error) = handler.evict(&Bytes::copy_from_slice(key), &entry.value, ttl) {
             tracing::warn!(?key, %error, "failed to persist evicted key; keeping it in RAM");
-            return false;
+            return None;
         }
+        let freed = key.len() + 48 + entry.value.approx_bytes();
         drop(entry);
         self.map.remove(key, &guard);
-        true
+        Some(freed)
     }
 
     /// Drop a key if its container value has become empty (see
     /// `Value::is_empty_container`). Call after pop/remove-style mutations.
     pub fn remove_if_empty(&self, key: &[u8]) {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         let empty =
             self.map.get(key, &guard).map(|lock| lock.read().value.is_empty_container()).unwrap_or(false);
@@ -708,7 +747,7 @@ impl Db {
     /// commands. Phase 2's scan is a simple single-pass snapshot rather than
     /// a true resumable cursor over a resizing hash table.
     pub fn keys_snapshot(&self) -> Vec<Bytes> {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         let mut keys: std::collections::HashSet<Bytes> = self.map.keys(&guard).cloned().collect();
         if let Some(handler) = &self.tiering {
@@ -721,6 +760,39 @@ impl Db {
     pub fn ram_keys_snapshot(&self) -> Vec<Bytes> {
         let guard = self.map.guard();
         self.map.keys(&guard).cloned().collect()
+    }
+
+    /// Keys currently sitting in the disk tier (not RAM), used by
+    /// `tiered-disk-limit` eviction selection. Empty if there's no tiering
+    /// handler or it can't enumerate its own keys.
+    pub fn tiered_keys_snapshot(&self) -> Vec<Bytes> {
+        self.tiering.as_ref().map(|t| t.keys_snapshot()).unwrap_or_default()
+    }
+
+    /// Up to `max` of the disk tier's keys, oldest-evicted-first — see
+    /// `TieringHandler::oldest_keys`.
+    pub fn tiered_oldest_keys(&self, max: usize) -> Vec<Bytes> {
+        self.tiering.as_ref().map(|t| t.oldest_keys(max)).unwrap_or_default()
+    }
+
+    /// Bytes used by the disk tier, if the handler can report it.
+    pub fn tiered_disk_usage_bytes(&self) -> Option<u64> {
+        self.tiering.as_ref().and_then(|t| t.disk_usage_bytes())
+    }
+
+    /// Drop a key from the disk tier outright — unlike `evict_to_tier`,
+    /// this is real data loss (the `tiered-disk-limit` equivalent of
+    /// `allkeys-random`: once the disk tier itself is full, something has
+    /// to give). Returns `false` if there's no tiering handler or the key
+    /// isn't actually tiered.
+    pub fn remove_tiered_key_outright(&self, key: &[u8]) -> bool {
+        let _tier_guard = self.tier_guard();
+        let Some(handler) = &self.tiering else { return false };
+        if !handler.contains(key) {
+            return false;
+        }
+        handler.remove(key);
+        true
     }
 
     /// `(last_access, access_count)` for `maxmemory-policy
@@ -741,7 +813,7 @@ impl Db {
     }
 
     pub fn flush(&self) {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         self.map.clear(&guard);
         if let Some(handler) = &self.tiering {
@@ -753,7 +825,7 @@ impl Db {
     /// that have expired. Returns the number of keys removed. Intended to be
     /// called periodically from a background tick.
     pub fn active_expire_cycle(&self, sample_size: usize) -> usize {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         let guard = self.map.guard();
         let len = self.map.len();
         if len == 0 || sample_size == 0 {
@@ -806,7 +878,7 @@ impl Db {
     /// (if any) to `Instant::now()`. Sliding-TTL mode doesn't currently
     /// survive a save/load round trip.
     pub fn load_entry(&self, key: Bytes, value: Value, ttl: Option<Duration>) {
-        let _tier_guard = self.tier_ops.lock();
+        let _tier_guard = self.tier_guard();
         if let Some(handler) = &self.tiering {
             handler.remove(&key);
         }
@@ -845,6 +917,25 @@ impl Store {
 
     pub fn db(&self, index: usize) -> Option<&Db> {
         self.dbs.get(index)
+    }
+
+    /// The disk tier is one shared handler across every db index (see
+    /// `new_with_tiering`), so these three just need to ask whichever `Db`
+    /// happens to be first — any of them would report the same thing.
+    pub fn tiered_disk_usage_bytes(&self) -> Option<u64> {
+        self.dbs.first()?.tiered_disk_usage_bytes()
+    }
+
+    pub fn tiered_keys_snapshot(&self) -> Vec<Bytes> {
+        self.dbs.first().map(Db::tiered_keys_snapshot).unwrap_or_default()
+    }
+
+    pub fn tiered_oldest_keys(&self, max: usize) -> Vec<Bytes> {
+        self.dbs.first().map(|db| db.tiered_oldest_keys(max)).unwrap_or_default()
+    }
+
+    pub fn remove_tiered_key_outright(&self, key: &[u8]) -> bool {
+        self.dbs.first().is_some_and(|db| db.remove_tiered_key_outright(key))
     }
 
     /// Run an active expire cycle across every database.

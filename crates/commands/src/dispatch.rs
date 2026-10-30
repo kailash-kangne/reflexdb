@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -62,6 +63,28 @@ impl MaxMemoryPolicy {
     }
 }
 
+/// Once a `tiered_limit`/`tiered_disk_limit` eviction pass starts, it
+/// drains down to this fraction of the configured limit rather than just
+/// back under it — otherwise the very next write immediately re-crosses
+/// the limit and re-triggers eviction (thrashing right at the line, with
+/// no room to absorb a burst). At the default 0.5, a cleanup pass leaves
+/// roughly the limit's own size free again.
+const EVICTION_LOW_WATERMARK: f64 = 0.5;
+
+fn low_watermark(limit: u64) -> u64 {
+    (limit as f64 * EVICTION_LOW_WATERMARK) as u64
+}
+
+/// Hard per-tick cap on how many keys one eviction pass will move/drop,
+/// regardless of how far over budget things are — the 100ms background
+/// tick (`server/src/main.rs`) also runs TTL active-expire and scheduled
+/// commands right after eviction, so one catastrophic overshoot shouldn't
+/// be able to monopolize it indefinitely. High enough that it's very
+/// unlikely to matter in practice now that `drain_to_tier`/
+/// `drain_tiered_disk` are O(keys touched) rather than O(keys touched *
+/// total keys) — see their docs.
+const MAX_EVICTIONS_PER_TICK: usize = 10_000;
+
 /// Parsed `notify-keyspace-events` flags — see `notify_keyspace_event`'s
 /// docs for how these gate `__keyspace@<db>__`/`__keyevent@<db>__` pub/sub
 /// notifications. Default (empty string) means nothing is enabled, same as
@@ -112,11 +135,14 @@ pub struct ServerContext {
     /// Outbound push channel per connected client, used to deliver pub/sub
     /// messages and LIVE updates asynchronously from whichever connection
     /// triggered them.
-    pub(crate) clients: DashMap<u64, UnboundedSender<Value>>,
+    pub(crate) clients: DashMap<u64, UnboundedSender<Arc<Value>>>,
     pub(crate) channels: DashMap<Bytes, HashSet<u64>>,
     pub(crate) patterns: DashMap<Bytes, HashSet<u64>>,
     /// fingerprint -> subscription (one per distinct `LIVE <cmd> <args>`).
     pub(crate) live_subs: DashMap<u64, LiveSub>,
+    /// Shared event signal. Writes publish a fingerprint once; interested
+    /// connection tasks read that subscription's latest cached value.
+    pub(crate) live_events: tokio::sync::broadcast::Sender<u64>,
     /// Serializes LIVE's initial read plus registration against post-write
     /// notifications, so a mutation cannot slip into the subscription gap.
     pub(crate) live_sync: std::sync::Mutex<()>,
@@ -182,6 +208,10 @@ pub struct ServerContext {
     /// `store` was built with a tiering handler (`Store::new_with_tiering`);
     /// otherwise there's nowhere to move them and this is ignored.
     pub tiered_limit: Option<u64>,
+    /// `tiered-disk-limit`: once the disk tier's own usage exceeds this,
+    /// cold tiered entries get dropped outright (real loss, not a RAM
+    /// move — there's nowhere left to move them). `None` means unbounded.
+    pub tiered_disk_limit: Option<u64>,
     /// `SCHEDULE AT`/`SCHEDULE IN` queue, drained by `run_due_scheduled`.
     pub(crate) scheduler: Scheduler,
     /// Active `GET ... SINGLEFLIGHT` leases, keyed by (db, key).
@@ -261,6 +291,7 @@ impl ServerContext {
     /// a tiering handler (`Store::new_with_tiering`), since constructing
     /// that handler lives outside this crate (see the `tiered` crate).
     pub fn with_store(store: Store, requirepass: Option<String>) -> Self {
+        let (live_events, _) = tokio::sync::broadcast::channel(1024);
         Self {
             store,
             acl_users: ServerContext::init_acl(requirepass.as_deref()),
@@ -271,6 +302,7 @@ impl ServerContext {
             channels: DashMap::new(),
             patterns: DashMap::new(),
             live_subs: DashMap::new(),
+            live_events,
             live_sync: std::sync::Mutex::new(()),
             key_watchers: DashMap::new(),
             key_watchers_len: AtomicUsize::new(0),
@@ -290,6 +322,7 @@ impl ServerContext {
             config_overrides: DashMap::new(),
             approx_memory: AtomicUsize::new(0),
             tiered_limit: None,
+            tiered_disk_limit: None,
             scheduler: Scheduler::default(),
             singleflight: DashMap::new(),
             singleflight_len: AtomicUsize::new(0),
@@ -327,7 +360,7 @@ impl ServerContext {
             duration_us: micros,
             args: req.to_vec(),
         };
-        let mut log = self.slowlog.lock().unwrap();
+        let mut log = self.slowlog.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         log.push_front(entry);
         while log.len() > self.slowlog_max_len {
             log.pop_back();
@@ -351,6 +384,17 @@ impl ServerContext {
 
     pub fn with_tiered_limit(mut self, limit: Option<u64>) -> Self {
         self.tiered_limit = limit;
+        self
+    }
+
+    pub fn with_tiered_disk_limit(mut self, limit: Option<u64>) -> Self {
+        self.tiered_disk_limit = limit;
+        self
+    }
+
+    pub fn with_slowlog(mut self, threshold_us: i64, max_len: usize) -> Self {
+        self.slowlog_threshold_us = threshold_us;
+        self.slowlog_max_len = max_len;
         self
     }
 
@@ -438,6 +482,14 @@ impl ServerContext {
         self.clients.len()
     }
 
+    pub fn subscribe_live_events(&self) -> tokio::sync::broadcast::Receiver<u64> {
+        self.live_events.subscribe()
+    }
+
+    pub fn latest_live_value(&self, fingerprint: u64) -> Option<Arc<Value>> {
+        self.live_subs.get(&fingerprint).map(|sub| sub.latest.clone())
+    }
+
     /// Active `GET ... SINGLEFLIGHT` leases right now — a proxy for
     /// "waiters", not an exact count of blocked connections (a lease can
     /// exist with zero current waiters, between the leaseholder taking it
@@ -468,39 +520,62 @@ impl ServerContext {
             .unwrap_or(self.maxmemory_policy)
     }
 
-    /// Refresh the memory estimate and run both eviction mechanisms,
-    /// bounded to avoid one tick doing unbounded work on a huge overshoot:
+    /// Refresh the memory estimate and run all three eviction mechanisms.
+    /// A burst of writes can push well past a limit between 100ms ticks
+    /// (see `server/src/main.rs`'s background tick), so each mechanism
+    /// below drains down to `EVICTION_LOW_WATERMARK` of its limit — not
+    /// just back under it — so there's headroom for the next burst
+    /// instead of immediately re-triggering eviction on the very next
+    /// write (thrashing right at the line). Order matters:
     ///
-    /// 1. If `tiered_limit` is set and the store has a tiering handler,
-    ///    move keys to the disk tier first — transparent to clients (`GET`
+    /// 1. `tiered_disk_limit` cleanup runs *first*: if the disk tier is
+    ///    already near its own cap, free that space before step 2 asks it
+    ///    to accept more keys moving down from RAM — otherwise step 2
+    ///    just keeps hitting "disk write failed, keeping it in RAM" for
+    ///    no reason.
+    /// 2. If `tiered_limit` is set and the store has a tiering handler,
+    ///    move keys to the disk tier — transparent to clients (`GET`
     ///    still works, just promotes them back), so no LIVE/WATCH
     ///    notification fires for this.
-    /// 2. If still (or separately) over `maxmemory`, fall back to the
+    /// 3. If still (or separately) over `maxmemory`, fall back to the
     ///    harder `maxmemory_policy`: delete keys, or reject writes under
     ///    `noeviction` (see the OOM check in `dispatch`).
+    ///
+    /// None of this is a hard, instant guarantee against OOM — it's a
+    /// best-effort background mitigation, bounded to `MAX_EVICTIONS_PER_TICK`
+    /// per tick so one huge overshoot can't starve the same tick's TTL
+    /// active-expire and scheduled-command work. Write throughput that
+    /// sustainably outpaces what eviction can drain will still outrun it;
+    /// `maxmemory` with a non-`noeviction` policy (or plain `noeviction`,
+    /// which rejects writes instead of evicting) is the actual hard
+    /// backstop — set it alongside these if "never OOM" is the goal.
     pub fn run_eviction_tick(&self) -> usize {
         let mut evicted = 0;
 
-        if let Some(limit) = self.tiered_limit {
-            for _ in 0..64 {
-                let used = self.refresh_memory_usage();
-                if used as u64 <= limit || !self.tier_one() {
-                    break;
-                }
-                evicted += 1;
-            }
+        if let Some(limit) = self.tiered_disk_limit {
+            let target = low_watermark(limit);
+            evicted += self.drain_tiered_disk(target);
         }
 
+        if let Some(limit) = self.tiered_limit {
+            let target = low_watermark(limit);
+            evicted += self.drain_to_tier(target);
+        }
+
+        // Always refresh the estimate the inline OOM check on the write
+        // path (`maxmemory_exceeded`) reads, even if nothing further is
+        // evicted below — `drain_to_tier` above already keeps it current
+        // when it ran, but this covers the case where it didn't.
+        let used = self.refresh_memory_usage();
         if let Some(limit) = self.effective_maxmemory() {
-            for _ in 0..64 {
-                let used = self.refresh_memory_usage();
-                if used as u64 <= limit {
-                    break;
+            if used as u64 > limit && self.effective_maxmemory_policy() != MaxMemoryPolicy::NoEviction {
+                let target = low_watermark(limit);
+                for _ in 0..MAX_EVICTIONS_PER_TICK {
+                    if self.refresh_memory_usage() as u64 <= target || !self.delete_one() {
+                        break;
+                    }
+                    evicted += 1;
                 }
-                if self.effective_maxmemory_policy() == MaxMemoryPolicy::NoEviction || !self.delete_one() {
-                    break;
-                }
-                evicted += 1;
             }
         }
 
@@ -513,20 +588,60 @@ impl ServerContext {
         used
     }
 
-    /// Move one random key from RAM to the disk tier. Returns `false` if
-    /// there's nothing left to move.
-    fn tier_one(&self) -> bool {
+    /// Moves keys from RAM to the disk tier until `approx_memory` drops to
+    /// `target` or `MAX_EVICTIONS_PER_TICK` keys have moved. Takes one key
+    /// snapshot per database up front (not one per key moved, the way a
+    /// naive "pick one, repeat" loop would) and tracks the running total
+    /// locally via `evict_to_tier_sized`'s freed-bytes return — so this is
+    /// O(total RAM keys + keys moved), not O(total RAM keys * keys moved),
+    /// which matters once `MAX_EVICTIONS_PER_TICK` is in the thousands.
+    fn drain_to_tier(&self, target: u64) -> usize {
         let mut rng = rand::thread_rng();
+        let mut used = self.refresh_memory_usage() as u64;
+        let mut moved = 0;
         for db_index in 0..self.store.len() {
+            if used <= target || moved >= MAX_EVICTIONS_PER_TICK {
+                break;
+            }
             let db = self.store.db(db_index).expect("index within store.len()");
-            let keys = db.ram_keys_snapshot();
-            if let Some(victim) = keys.choose(&mut rng) {
-                if db.evict_to_tier(victim) {
-                    return true;
+            let mut keys = db.ram_keys_snapshot();
+            keys.shuffle(&mut rng);
+            for key in keys {
+                if used <= target || moved >= MAX_EVICTIONS_PER_TICK {
+                    break;
+                }
+                if let Some(freed) = db.evict_to_tier_sized(&key) {
+                    used = used.saturating_sub(freed as u64);
+                    moved += 1;
                 }
             }
         }
-        false
+        self.approx_memory.store(used as usize, Ordering::Relaxed);
+        moved
+    }
+
+    /// Drops keys from the disk tier outright, oldest-evicted-first (see
+    /// `TieringHandler::oldest_keys`), until its usage drops to `target`
+    /// or `MAX_EVICTIONS_PER_TICK` keys have been dropped — enforces
+    /// `tiered_disk_limit`. `disk_usage_bytes()` is an O(1) atomic read
+    /// (see `tiered::FjallTier`), so unlike `drain_to_tier` this can just
+    /// re-check it directly each iteration.
+    fn drain_tiered_disk(&self, target: u64) -> usize {
+        let keys = self.store.tiered_oldest_keys(MAX_EVICTIONS_PER_TICK);
+        let mut dropped = 0;
+        for key in keys {
+            if dropped >= MAX_EVICTIONS_PER_TICK {
+                break;
+            }
+            match self.store.tiered_disk_usage_bytes() {
+                Some(used) if used > target => {}
+                _ => break,
+            }
+            if self.store.remove_tiered_key_outright(&key) {
+                dropped += 1;
+            }
+        }
+        dropped
     }
 
     /// Delete one key chosen per `maxmemory_policy`. Returns `false` if
@@ -583,7 +698,7 @@ impl ServerContext {
     /// Register a new connection's outbound push channel, returning its id
     /// and the receiving half the connection loop should poll alongside its
     /// socket reads.
-    pub fn register_client(&self) -> (u64, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+    pub fn register_client(&self) -> (u64, tokio::sync::mpsc::UnboundedReceiver<Arc<Value>>) {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         self.clients.insert(id, tx);
@@ -650,7 +765,7 @@ impl ServerContext {
 
     pub(crate) fn push_to(&self, client_id: u64, value: Value) {
         if let Some(sender) = self.clients.get(&client_id) {
-            let _ = sender.send(value);
+            let _ = sender.send(Arc::new(value));
         }
     }
 }
@@ -699,6 +814,10 @@ pub struct ClientState {
     pub client_name: String,
     /// `CLIENT TRACKING ON` — see `ServerContext::tracking_table`'s docs.
     pub tracking: bool,
+    /// Fingerprints of this connection's own `LIVE` subscriptions — lets
+    /// the connection loop cheaply tell whether a broadcast `ctx.live_events`
+    /// notification is one it cares about, without touching `ctx.live_subs`.
+    pub live_fingerprints: HashSet<u64>,
 }
 
 impl ClientState {
@@ -723,6 +842,7 @@ impl ClientState {
             block_forever: false,
             client_name: String::new(),
             tracking: false,
+            live_fingerprints: HashSet::new(),
         }
     }
 
@@ -2096,6 +2216,11 @@ mod tests {
         (ctx, state)
     }
 
+    fn recv_live_value(ctx: &ServerContext, rx: &mut tokio::sync::broadcast::Receiver<u64>) -> Arc<Value> {
+        let fingerprint = rx.blocking_recv().expect("subscriber should receive a LIVE event");
+        ctx.latest_live_value(fingerprint).expect("subscription should retain its latest result")
+    }
+
     fn fresh_with_notify(spec: &str) -> (ServerContext, ClientState) {
         let ctx = ServerContext::new(16, None).with_notify_keyspace_events(NotifyFlags::parse(spec));
         let (id, _rx) = ctx.register_client();
@@ -2135,7 +2260,7 @@ mod tests {
         let mut got_keyevent_set = false;
         let mut got_keyspace_lpush = false;
         while let Ok(msg) = sub_rx.try_recv() {
-            if let Value::Push(parts) = msg {
+            if let Value::Push(parts) = msg.as_ref() {
                 if let [_, Value::Bulk(channel), Value::Bulk(payload)] = parts.as_slice() {
                     if channel.as_ref() == b"__keyevent@0__:set" && payload.as_ref() == b"k" {
                         got_keyevent_set = true;
@@ -2860,8 +2985,8 @@ mod tests {
 
         let pushed = rx.try_recv().expect("subscriber should have received a push");
         assert_eq!(
-            pushed,
-            Value::Push(vec![
+            pushed.as_ref(),
+            &Value::Push(vec![
                 Value::bulk(&b"message"[..]),
                 Value::bulk(&b"news"[..]),
                 Value::bulk(&b"hello"[..]),
@@ -2882,8 +3007,8 @@ mod tests {
 
         let pushed = rx.try_recv().expect("pattern subscriber should receive a push");
         assert_eq!(
-            pushed,
-            Value::Push(vec![
+            pushed.as_ref(),
+            &Value::Push(vec![
                 Value::bulk(&b"pmessage"[..]),
                 Value::bulk(&b"news.*"[..]),
                 Value::bulk(&b"news.sports"[..]),
@@ -2895,7 +3020,8 @@ mod tests {
     #[test]
     fn live_pushes_updated_result_on_write() {
         let ctx = ServerContext::new(16, None);
-        let (watcher_id, mut rx) = ctx.register_client();
+        let mut events = ctx.subscribe_live_events();
+        let (watcher_id, _rx) = ctx.register_client();
         let mut watcher = ClientState::with_id(watcher_id, false);
 
         let initial = run(&ctx, &mut watcher, &["LIVE", "GET", "user:name"]);
@@ -2921,10 +3047,10 @@ mod tests {
         let mut writer = ClientState::with_id(writer_id, false);
         run(&ctx, &mut writer, &["SET", "user:name", "Alice"]);
 
-        let pushed = rx.try_recv().expect("watcher should receive a LIVE push after the write");
+        let pushed = recv_live_value(&ctx, &mut events);
         assert_eq!(
-            pushed,
-            Value::Array(vec![
+            pushed.as_ref(),
+            &Value::Array(vec![
                 Value::bulk(&b"live"[..]),
                 Value::bulk(&b"fingerprint"[..]),
                 Value::bulk(fingerprint_hex),
@@ -2935,9 +3061,43 @@ mod tests {
     }
 
     #[test]
+    fn live_fanout_delivers_the_latest_state_after_a_write_burst() {
+        let ctx = ServerContext::new(16, None);
+        let mut events = ctx.subscribe_live_events();
+        let (watcher_id, _rx) = ctx.register_client();
+        let mut watcher = ClientState::with_id(watcher_id, false);
+        run(&ctx, &mut watcher, &["LIVE", "GET", "burst:key"]);
+
+        let (writer_id, _) = ctx.register_client();
+        let mut writer = ClientState::with_id(writer_id, false);
+        for value in 0..500 {
+            run(&ctx, &mut writer, &["SET", "burst:key", &value.to_string()]);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut received_latest = false;
+        while Instant::now() < deadline {
+            if let Ok(fp) = events.try_recv() {
+                if let Some(push) = ctx.latest_live_value(fp) {
+                    if let Value::Array(parts) = push.as_ref() {
+                        if matches!(parts.get(4), Some(Value::Bulk(value)) if value.as_ref() == b"499") {
+                            received_latest = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        assert!(received_latest, "coalesced fan-out must eventually deliver the latest observed value");
+    }
+
+    #[test]
     fn unlive_stops_further_pushes() {
         let ctx = ServerContext::new(16, None);
-        let (watcher_id, mut rx) = ctx.register_client();
+        let mut events = ctx.subscribe_live_events();
+        let (watcher_id, _rx) = ctx.register_client();
         let mut watcher = ClientState::with_id(watcher_id, false);
 
         let initial = run(&ctx, &mut watcher, &["LIVE", "GET", "k"]);
@@ -2955,7 +3115,7 @@ mod tests {
         let mut writer = ClientState::with_id(writer_id, false);
         run(&ctx, &mut writer, &["SET", "k", "v"]);
 
-        assert!(rx.try_recv().is_err(), "should not receive a push after UNLIVE");
+        assert!(events.try_recv().is_err(), "should not receive an event after UNLIVE");
     }
 
     #[test]
@@ -3276,12 +3436,12 @@ mod tests {
 
         // First push should be a SELECT for this replica's first command...
         let first = rx.try_recv().expect("expected a SELECT push");
-        assert_eq!(first, Value::Array(vec![Value::bulk(&b"SELECT"[..]), Value::bulk(&b"0"[..])]));
+        assert_eq!(first.as_ref(), &Value::Array(vec![Value::bulk(&b"SELECT"[..]), Value::bulk(&b"0"[..])]));
         // ...then the replicated command itself.
         let second = rx.try_recv().expect("expected the replicated SET");
         assert_eq!(
-            second,
-            Value::Array(vec![Value::bulk(&b"SET"[..]), Value::bulk(&b"k"[..]), Value::bulk(&b"v"[..])])
+            second.as_ref(),
+            &Value::Array(vec![Value::bulk(&b"SET"[..]), Value::bulk(&b"k"[..]), Value::bulk(&b"v"[..])])
         );
         assert_eq!(ctx.master_repl_offset(), 1);
     }
@@ -3655,19 +3815,24 @@ mod tests {
 
     /// Trivial in-memory stand-in for the real `tiered::FjallTier`, just to
     /// exercise the full `ServerContext`/`dispatch()` integration without
-    /// pulling the `tiered` crate (and fjall) into this one.
+    /// pulling the `tiered` crate (and fjall) into this one. Tracks an
+    /// eviction-order counter per entry (like the real tier's
+    /// `evicted_at_ms`) so `oldest_keys` can be tested too, not just
+    /// `keys_snapshot`'s arbitrary order.
     #[derive(Default)]
     struct MockTier {
-        disk: DashMap<Bytes, (keyspace::Value, Option<Duration>)>,
+        disk: DashMap<Bytes, (keyspace::Value, Option<Duration>, u64)>,
+        next_seq: AtomicU64,
     }
 
     impl keyspace::TieringHandler for MockTier {
         fn evict(&self, key: &Bytes, value: &keyspace::Value, ttl: Option<Duration>) -> Result<(), String> {
-            self.disk.insert(key.clone(), (value.clone(), ttl));
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            self.disk.insert(key.clone(), (value.clone(), ttl, seq));
             Ok(())
         }
         fn promote(&self, key: &[u8]) -> Option<(keyspace::Value, Option<Duration>)> {
-            self.disk.remove(key).map(|(_, v)| v)
+            self.disk.remove(key).map(|(_, (v, ttl, _))| (v, ttl))
         }
         fn contains(&self, key: &[u8]) -> bool {
             self.disk.contains_key(key)
@@ -3677,6 +3842,18 @@ mod tests {
         }
         fn keys_snapshot(&self) -> Vec<Bytes> {
             self.disk.iter().map(|entry| entry.key().clone()).collect()
+        }
+        fn oldest_keys(&self, max: usize) -> Vec<Bytes> {
+            let mut by_age: Vec<(Bytes, u64)> =
+                self.disk.iter().map(|entry| (entry.key().clone(), entry.value().2)).collect();
+            by_age.sort_by_key(|(_, seq)| *seq);
+            by_age.truncate(max);
+            by_age.into_iter().map(|(key, _)| key).collect()
+        }
+        fn disk_usage_bytes(&self) -> Option<u64> {
+            // Fixed per-entry size is enough to deterministically exercise
+            // `tiered_disk_limit` without needing real byte accounting.
+            Some(self.disk.len() as u64 * 100)
         }
     }
 
@@ -3707,6 +3884,99 @@ mod tests {
             Value::bulk(&b"some reasonably sized value here"[..])
         );
         assert_eq!(ctx.store.db(0).unwrap().ram_keys_snapshot().len(), ram_count + 1);
+    }
+
+    #[test]
+    fn tiered_disk_limit_drops_cold_entries_once_the_disk_tier_is_full() {
+        let tier = std::sync::Arc::new(MockTier::default());
+        let store = Store::new_with_tiering(16, tier.clone());
+        // tiered_limit tiny enough that every SET below gets moved to disk;
+        // tiered_disk_limit (300 bytes, 100/entry per MockTier) keeps the
+        // tier well under 10 entries even though we're about to write 10
+        // (drains toward the 50%-of-limit low watermark, not just back
+        // under the raw limit — see `EVICTION_LOW_WATERMARK`).
+        let ctx = ServerContext::with_store(store, None)
+            .with_tiered_limit(Some(1))
+            .with_tiered_disk_limit(Some(300));
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, false);
+
+        for i in 0..10 {
+            run(&ctx, &mut st, &["SET", &format!("k{i}"), "some reasonably sized value here"]);
+            ctx.run_eviction_tick();
+        }
+
+        assert!(
+            tier.disk.len() <= 3,
+            "expected tiered_disk_limit to cap the disk tier at 3 entries, found {}",
+            tier.disk.len()
+        );
+        // The dropped keys are really gone — not just demoted somewhere
+        // else — since MockTier has nowhere further to move them.
+        let total_present: usize = (0..10)
+            .filter(|i| run(&ctx, &mut st, &["EXISTS", &format!("k{i}")]) == Value::Integer(1))
+            .count();
+        assert!(total_present < 10, "expected some keys to have been dropped outright");
+    }
+
+    #[test]
+    fn tiered_disk_limit_drops_the_oldest_entries_first_not_random_ones() {
+        let tier = std::sync::Arc::new(MockTier::default());
+        let store = Store::new_with_tiering(16, tier.clone());
+        let ctx = ServerContext::with_store(store, None)
+            .with_tiered_limit(Some(1))
+            .with_tiered_disk_limit(Some(300));
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, false);
+
+        // Write and tier one key at a time so each has a distinct,
+        // increasing eviction-order sequence number (MockTier's stand-in
+        // for the real tier's `evicted_at_ms`) — `k0` is always the
+        // oldest, `k9` always the newest.
+        for i in 0..10 {
+            run(&ctx, &mut st, &["SET", &format!("k{i}"), "some reasonably sized value here"]);
+            ctx.run_eviction_tick();
+        }
+
+        // Only the newest keys should have survived — if eviction were
+        // still picking randomly, there'd be no reason for the surviving
+        // keys to be a contiguous newest-first suffix like this.
+        let survivors: Vec<usize> = (0..10)
+            .filter(|i| run(&ctx, &mut st, &["EXISTS", &format!("k{i}")]) == Value::Integer(1))
+            .collect();
+        assert!(!survivors.is_empty(), "expected at least one key to survive");
+        let newest_n = 10 - survivors.len();
+        assert_eq!(
+            survivors,
+            (newest_n..10).collect::<Vec<_>>(),
+            "expected the surviving keys to be exactly the newest ones, got {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn eviction_drains_to_the_low_watermark_not_just_under_the_limit() {
+        let tier = std::sync::Arc::new(MockTier::default());
+        let store = Store::new_with_tiering(16, tier.clone());
+        // A burst well past the limit (50) — one tick should drain all the
+        // way down toward the 50%-of-limit watermark (25), not stop the
+        // instant it first dips under 50, which would leave ~0 headroom
+        // for the next write.
+        let ctx = ServerContext::with_store(store, None).with_tiered_limit(Some(50));
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, false);
+
+        for i in 0..200 {
+            run(&ctx, &mut st, &["SET", &format!("burst{i}"), "x"]);
+        }
+        ctx.run_eviction_tick();
+
+        let used = ctx.store.approx_bytes() as u64;
+        assert!(used <= 50, "expected to be back under the limit, got {used}");
+        assert!(
+            used <= 35,
+            "expected to drain toward the ~25-byte low watermark (with some slack for the last \
+             entry's own size), got {used}"
+        );
     }
 
     #[test]
