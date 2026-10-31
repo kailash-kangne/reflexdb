@@ -19,7 +19,7 @@ from collections import Counter
 def encode(*parts):
     out = [f"*{len(parts)}\r\n".encode()]
     for part in parts:
-        data = str(part).encode()
+        data = part if isinstance(part, bytes) else str(part).encode()
         out.extend((f"${len(data)}\r\n".encode(), data, b"\r\n"))
     return b"".join(out)
 
@@ -93,8 +93,9 @@ def summarize(name, run, pipeline, clients, elapsed, samples, ops, errors=0, **e
     return row
 
 
-def run_requests(host, port, workload, run, seconds, clients, pipeline, keys):
+def run_requests(host, port, workload, run, seconds, clients, pipeline, keys, value_size=0):
     stop = time.monotonic() + seconds
+    value = b"x" * value_size if value_size else 0
     lock = threading.Lock()
     all_samples, totals, errors = [], Counter(), Counter()
 
@@ -111,7 +112,7 @@ def run_requests(host, port, workload, run, seconds, clients, pipeline, keys):
                     if workload == "hot-key":
                         cmd = ("GET", key) if counter % 2 == 0 else ("INCR", key)
                     else:
-                        cmd = ("GET", key) if counter % 10 < 7 else ("SET", key, counter)
+                        cmd = ("GET", key) if counter % 10 < 7 else ("SET", key, value)
                     batch.append(encode(*cmd))
                     sent_at.append(time.perf_counter())
                     counter += 1
@@ -136,7 +137,7 @@ def run_requests(host, port, workload, run, seconds, clients, pipeline, keys):
     setup = Connection(host, port)
     setup.command("SET", key, "0")
     for i in range(min(keys, 10000)):
-        setup.command("SET", f"bench:{i}", "0")
+        setup.command("SET", f"bench:{i}", value if value_size else "0")
     setup.close()
     start = time.monotonic()
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(clients)]
@@ -227,6 +228,8 @@ def main():
     parser.add_argument("--clients", type=int, default=16)
     parser.add_argument("--pipeline", default="1,16", help="comma-separated pipeline depths")
     parser.add_argument("--keys", type=int, default=1000)
+    parser.add_argument("--value-size", type=int, default=0,
+                        help="SET payload size in bytes; 0 uses a small counter")
     parser.add_argument("--live-subscribers", type=int, default=1000)
     parser.add_argument("--live-drain", choices=("buffered", "selector"), default="buffered",
                         help="buffer watcher pushes in kernel sockets or drain them in a selector")
@@ -238,7 +241,8 @@ def main():
     allowed = {"small-mixed", "hot-key", "live-fanout"}
     unknown = set(workloads) - allowed
     if (unknown or args.runs < 1 or args.seconds <= 0 or args.clients < 1 or args.keys < 1
-            or args.live_subscribers < 0 or any(pipeline < 1 for pipeline in pipelines)):
+            or args.live_subscribers < 0 or args.value_size < 0
+            or any(pipeline < 1 for pipeline in pipelines)):
         parser.error(f"invalid workload/options: {', '.join(sorted(unknown))}")
 
     output = open(args.output, "a", encoding="utf-8") if args.output else None
@@ -251,7 +255,7 @@ def main():
                 else:
                     for pipeline in pipelines:
                         row = run_requests(args.host, args.port, workload, run, args.seconds,
-                                           args.clients, pipeline, args.keys)
+                                           args.clients, pipeline, args.keys, args.value_size)
                         line = json.dumps(row, sort_keys=True)
                         print(line, flush=True) if output is None else output.write(line + "\n")
                         if output:

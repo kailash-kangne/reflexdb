@@ -85,7 +85,7 @@ async fn try_link_once(ctx: &Arc<ServerContext>, host: &str, port: u16, epoch: u
 
     // From here, the primary streams plain RESP command arrays — identical
     // framing to a normal client request, so the same decoder applies.
-    let mut commands = FramedRead::new(reader, resp::RequestDecoder);
+    let mut commands = FramedRead::new(reader, resp::RequestDecoder::default());
     let mut scratch = ClientState::for_replication_link();
 
     loop {

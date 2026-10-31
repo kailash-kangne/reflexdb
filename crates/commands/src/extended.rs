@@ -247,10 +247,7 @@ pub fn cmd_bitop(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Ou
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let mut values = Vec::with_capacity(sources.len());
     for key in sources {
-        match db.with_value(key, |v| match v {
-            KVal::String(s) => Ok(s.clone()),
-            _ => Err(()),
-        }) {
+        match db.with_value(key, |v| v.string_bytes().ok_or(())) {
             None => values.push(Bytes::new()),
             Some(Ok(v)) => values.push(v),
             Some(Err(())) => return wrong_type(),
@@ -300,10 +297,7 @@ pub fn cmd_bitpos(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         Err(error) => return error,
     };
     let db = ctx.store.db(state.db_index).expect("valid db index");
-    let value = match db.with_value(&args[0], |v| match v {
-        KVal::String(s) => Ok(s.clone()),
-        _ => Err(()),
-    }) {
+    let value = match db.with_value(&args[0], |v| v.string_bytes().ok_or(())) {
         None => Bytes::new(),
         Some(Ok(v)) => v,
         Some(Err(())) => return wrong_type(),
@@ -375,9 +369,9 @@ pub fn cmd_bitfield(ctx: &ServerContext, state: &ClientState, args: &[Bytes], re
         let Some(offset) = parse_bit_offset(&args[i + 2], width) else {
             return err("ERR bit offset is not an integer or out of range");
         };
-        // Match the RESP maximum bulk argument and prevent a tiny command
-        // from forcing a 512 MiB allocation for one bitfield offset.
-        if offset.saturating_add(width as u64) > (64u64 * 1024 * 1024 * 8) {
+        // Match the configured `proto-max-bulk-len` and prevent a tiny
+        // command from forcing an outsized allocation for one bitfield offset.
+        if offset.saturating_add(width as u64) > (ctx.proto_max_bulk_len as u64 * 8) {
             return err("ERR bit offset is out of range");
         }
         let value = if op == FieldOp::Set {
@@ -405,10 +399,7 @@ pub fn cmd_bitfield(ctx: &ServerContext, state: &ClientState, args: &[Bytes], re
     let key = args[0].clone();
     let db = ctx.store.db(state.db_index).expect("valid db index");
     if read_only {
-        let result = match db.with_value(&key, |v| match v {
-            KVal::String(s) => Ok(s.clone()),
-            _ => Err(()),
-        }) {
+        let result = match db.with_value(&key, |v| v.string_bytes().ok_or(())) {
             None => Bytes::new(),
             Some(Ok(v)) => v,
             Some(Err(())) => return wrong_type(),
@@ -425,44 +416,35 @@ pub fn cmd_bitfield(ctx: &ServerContext, state: &ClientState, args: &[Bytes], re
     let result = db.with_entry_mut(
         key.clone(),
         || KVal::String(Bytes::new()),
-        |v| match v {
-            KVal::String(bytes) => {
-                let mut data = bytes.to_vec();
-                let mut replies = Vec::with_capacity(ops.len());
-                for cmd in &ops {
-                    let old = read_bits(&data, cmd.offset, cmd.width);
-                    match cmd.op {
-                        FieldOp::Get => {
-                            replies.push(Value::Integer(decode_field(old, cmd.signed, cmd.width)))
-                        }
-                        FieldOp::Set => {
-                            write_bits(&mut data, cmd.offset, cmd.width, cmd.value.unwrap_or(0));
-                            replies.push(Value::Integer(decode_field(old, cmd.signed, cmd.width)));
-                            changed = true;
-                        }
-                        FieldOp::Incr => {
-                            let next = increment_field(
-                                old,
-                                cmd.signed,
-                                cmd.width,
-                                cmd.delta.unwrap_or(0),
-                                cmd.overflow,
-                            );
-                            match next {
-                                None => replies.push(Value::NullBulk),
-                                Some(raw) => {
-                                    write_bits(&mut data, cmd.offset, cmd.width, raw);
-                                    replies.push(Value::Integer(decode_field(raw, cmd.signed, cmd.width)));
-                                    changed = true;
-                                }
+        |v| {
+            let Some(bytes) = v.string_bytes_mut() else { return Err(()) };
+            let mut data = bytes.to_vec();
+            let mut replies = Vec::with_capacity(ops.len());
+            for cmd in &ops {
+                let old = read_bits(&data, cmd.offset, cmd.width);
+                match cmd.op {
+                    FieldOp::Get => replies.push(Value::Integer(decode_field(old, cmd.signed, cmd.width))),
+                    FieldOp::Set => {
+                        write_bits(&mut data, cmd.offset, cmd.width, cmd.value.unwrap_or(0));
+                        replies.push(Value::Integer(decode_field(old, cmd.signed, cmd.width)));
+                        changed = true;
+                    }
+                    FieldOp::Incr => {
+                        let next =
+                            increment_field(old, cmd.signed, cmd.width, cmd.delta.unwrap_or(0), cmd.overflow);
+                        match next {
+                            None => replies.push(Value::NullBulk),
+                            Some(raw) => {
+                                write_bits(&mut data, cmd.offset, cmd.width, raw);
+                                replies.push(Value::Integer(decode_field(raw, cmd.signed, cmd.width)));
+                                changed = true;
                             }
                         }
                     }
                 }
-                *bytes = Bytes::from(data);
-                Ok(replies)
             }
-            _ => Err(()),
+            *bytes = Bytes::from(data);
+            Ok(replies)
         },
     );
     match result {
@@ -782,9 +764,5 @@ fn sort_lookup(db: &keyspace::Db, pattern: &[u8], member: &[u8]) -> Option<Bytes
     } else {
         key.extend_from_slice(pattern);
     }
-    db.with_value(&key, |value| match value {
-        KVal::String(value) => Some(value.clone()),
-        _ => None,
-    })
-    .flatten()
+    db.with_value(&key, |value| value.string_bytes()).flatten()
 }

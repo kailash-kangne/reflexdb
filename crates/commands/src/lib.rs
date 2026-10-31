@@ -31,7 +31,8 @@ mod txn;
 mod zset;
 
 pub use dispatch::{
-    dispatch, request_may_write, ClientState, MaxMemoryPolicy, NotifyFlags, Outcome, ServerContext,
+    dispatch, request_may_write, ClientPush, ClientState, ClientWriter, MaxMemoryPolicy, NotifyFlags,
+    Outcome, ServerContext,
 };
 pub use replication::ReplicaMessage;
 pub use singleflight::SingleFlightLease;

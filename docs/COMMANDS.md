@@ -2,7 +2,9 @@
 
 Commands tagged **[cut]** are deliberately not being built (see [ROADMAP.md](ROADMAP.md) for
 why). Commands tagged **[planned]** are designed but not implemented yet (see
-[ROADMAP.md](ROADMAP.md) for the design).
+[ROADMAP.md](ROADMAP.md) for the design). Every command below works over RESP2/RESP3 and the
+optional [RFX](RFX.md) binary framing — RFX changes only the wire encoding, not command
+semantics.
 
 ## Generic (keyspace)
 
@@ -85,10 +87,13 @@ Not being built.
 
 `ACL` (see [FEATURES.md](FEATURES.md#security)), `BGREWRITEAOF`, `BGSAVE`, `COMMAND` (`COUNT`,
 `DOCS`, `GETKEYS`, `GETKEYSANDFLAGS`, `INFO`, `LIST`), `CONFIG` (`GET`, `REWRITE`, `RESETSTAT`,
-`SET`), `DBSIZE`, `FAILOVER`, `FLUSHALL`, `FLUSHDB`, `INFO`, `LASTSAVE`, `LATENCY` (`DOCTOR`,
-`GRAPH`, `HISTOGRAM`, `HISTORY`, `LATEST`, `RESET`), `LOLWUT`, `MEMORY` (`DOCTOR`,
-`MALLOC-STATS`, `PURGE`, `STATS`, `USAGE`), `MONITOR`, `ROLE`, `SAVE`, `SHUTDOWN`, `SLOWLOG`
-(`GET`, `HELP`, `LEN`, `RESET`), `SWAPDB`, `TIME`
+`SET`), `DBSIZE`, `FLUSHALL`, `FLUSHDB`, `INFO`, `LASTSAVE`, `LATENCY` (`DOCTOR`,
+`GRAPH`, `HISTOGRAM`, `HISTORY`, `LATEST`, `RESET`), `MEMORY` (`DOCTOR`,
+`MALLOC-STATS`, `PURGE`, `STATS`, `USAGE`), `SAVE`, `SLOWLOG`
+(`GET`, `HELP`, `LEN`, `RESET`), `TIME`
+
+`FAILOVER`, `LOLWUT`, `MONITOR`, `ROLE`, `SHUTDOWN`, `SWAPDB` — **[planned]** (listed in Redis'
+server group; not implemented yet — verified 2026-11-01, they return `ERR unknown command`).
 
 `MODULE` — parsed but no-op (extensions are compiled-in Rust crates, not `.so` modules).
 
@@ -105,8 +110,10 @@ Not being built.
 
 ## HA / Replication
 
-`PSYNC`, `REPLICAOF` (`SLAVEOF` alias), `REPLCONF`, `ROLE`, `SYNC`, `WAIT`, `WAITAOF`,
-`FAILOVER`
+`PSYNC`, `REPLICAOF` (`SLAVEOF` alias), `REPLCONF`, `WAIT`, `WAITAOF`
+
+`FAILOVER`, `ROLE`, `SYNC` — **[planned]** (`PSYNC` covers the replica handshake; plain `SYNC`,
+`ROLE`, and `FAILOVER` return `ERR unknown command` — verified 2026-11-01).
 
 `ASKING`/`READONLY`/`READWRITE`/`RESTORE-ASKING` — **[cut]** (cluster-mode).
 

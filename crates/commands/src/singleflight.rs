@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry as DashEntry;
-use keyspace::Value as KVal;
 use resp::Value;
 use tokio::sync::Notify;
 
@@ -53,10 +52,7 @@ pub fn cmd_get(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outc
     let db = ctx.store.db(state.db_index).expect("valid db index");
     // `with_value`, not `get`: avoid cloning a potentially huge
     // List/Hash/Set/ZSet just to discover it's the wrong type.
-    match db.with_value(key, |v| match v {
-        KVal::String(s) => Ok(s.clone()),
-        _ => Err(()),
-    }) {
+    match db.with_value(key, |v| v.string_bytes().ok_or(())) {
         Some(Ok(s)) => reply(Value::bulk(s)),
         Some(Err(())) => wrong_type(),
         None => take_or_wait(ctx, state.db_index, key, ms),

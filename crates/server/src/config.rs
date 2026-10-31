@@ -15,6 +15,24 @@ pub struct Config {
     pub requirepass: Option<String>,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
+    /// `maxclients`: hard ceiling on simultaneously open connections — once
+    /// reached, new connections wait for a slot to free up rather than
+    /// being accepted unbounded. Default `10,000`, same as real Redis.
+    /// Pro of raising it: supports more concurrent clients. Con: each
+    /// connection holds a tokio task plus its own read/write buffers, so a
+    /// much higher value raises worst-case memory/fd usage if clients
+    /// actually use all of it; too low rejects legitimate traffic under
+    /// a connection spike.
+    pub maxclients: usize,
+    /// `proto-max-bulk-len`: largest single bulk-string element the RESP
+    /// decoder accepts, and the largest value `APPEND`/`SETRANGE`/`SET`/
+    /// `BITFIELD` will build or operate on. Default `64 MiB`, matching
+    /// real Redis. Pro of raising it: large-value workloads (big blobs
+    /// stored as strings) stop being rejected. Con: raises the worst-case
+    /// memory a single client command can force the server to allocate
+    /// before any application-level check runs — don't raise this past
+    /// what you're willing to let one connection allocate at once.
+    pub proto_max_bulk_len: usize,
     /// Directory RDB/AOF files are written to.
     pub dir: PathBuf,
     /// RDB snapshot filename within `dir`.
@@ -49,6 +67,24 @@ pub struct Config {
     /// would just burn CPU spinning between ticks that mostly find
     /// nothing to do.
     pub eviction_tick_ms: u64,
+    /// `eviction-low-watermark`: once an eviction pass starts, how far
+    /// below the triggering limit it drains to (as a fraction of that
+    /// limit) instead of stopping right at it. Default `0.5`, valid range
+    /// `(0.0, 1.0]`. Pro of a lower value (e.g. `0.3`): more headroom
+    /// after a cleanup pass, so a write burst takes longer to re-trigger
+    /// eviction. Con: each pass does more work (moves/drops more keys) and
+    /// briefly holds less of the working set in the faster tier. `1.0`
+    /// ("drain exactly to the limit") is cheapest per pass but can
+    /// re-trigger on the very next write under sustained load.
+    pub eviction_low_watermark: f64,
+    /// `eviction-max-per-tick`: hard cap on how many keys one background
+    /// eviction pass will move or drop, regardless of how far over budget
+    /// things are. Default `10,000`. Pro of a higher value: a huge
+    /// overshoot drains in fewer ticks. Con: one catastrophic overshoot
+    /// can monopolize a tick's CPU, delaying that tick's TTL active-expire
+    /// and scheduled-command work. Pro of a lower value: bounds worst-case
+    /// per-tick latency; con: a large overshoot takes many ticks to drain.
+    pub max_evictions_per_tick: usize,
     /// `singleflight-max-wait-ms`: hard cap on how long a `GET ...
     /// SINGLEFLIGHT` caller blocks before getting a timeout error.
     pub singleflight_max_wait_ms: u64,
@@ -72,13 +108,53 @@ pub struct Config {
     /// relative to `dir` if not absolute.
     pub history_dir: PathBuf,
     /// `history-retention-ms`: how long a recorded version is kept before
-    /// the periodic sweep (`main.rs`) reclaims it. Default 24h.
+    /// the periodic sweep (`main.rs`) reclaims it. Default 24h; 0 disables
+    /// age-based expiry (the per-key version cap still applies).
     pub history_retention_ms: u64,
+    /// `history-max-versions-per-key`: maximum past versions retained for
+    /// each key. Must be between 1 and 1,000,000. Default 200.
+    pub history_max_versions_per_key: usize,
     /// `slowlog-log-slower-than`: microseconds a command must take to be
     /// logged; `-1` disables logging, `0` logs everything.
     pub slowlog_log_slower_than_us: i64,
     /// `slowlog-max-len`: oldest entries drop once the log exceeds this.
     pub slowlog_max_len: usize,
+    /// `repl-backlog-size`: per-replica outbound queue depth (number of
+    /// pending values), set when a replica attaches via `PSYNC`. Default
+    /// `32,768`. Pro of a larger value: absorbs a longer write burst
+    /// before a replica is flagged slow. Con: a slow replica can hold
+    /// that many unflushed values in memory on the primary first.
+    pub replica_backlog_size: usize,
+    /// `repl-backlog-max-bytes`: total bytes of queued commands one
+    /// replica may hold before it's treated as slow and further writes to
+    /// it are dropped. Default `64 MiB`. Pro of a larger value: tolerates
+    /// a slower/further-away replica. Con: that many bytes are held in
+    /// memory per lagging replica — real Redis's comparable default
+    /// (`client-output-buffer-limit replica`, `1 GiB`) is intentionally
+    /// much looser; this default trades replica tolerance for primary
+    /// memory safety.
+    pub replica_backlog_max_bytes: usize,
+    /// `repl-slow-disconnect-delay-ms`: how long a replica can stay
+    /// flagged slow before its connection is actually dropped (forcing a
+    /// full resync on reconnect). Default `5000` (5s). Pro of a longer
+    /// delay: survives a brief network blip without losing the link. Con:
+    /// a replica that's behind keeps counting as connected (for `WAIT`/
+    /// `CLIENT LIST`) for longer before being cut loose.
+    pub replica_slow_disconnect_ms: u64,
+    /// `live-sweep-ms`: idle gap between LIVE fan-out sweeps — writes
+    /// landing in the gap dedup into one re-evaluation. Default `10`.
+    /// Pro of a larger value: less fan-out CPU under a sustained write
+    /// storm. Con: subscribers see staler intermediate values. `0` runs
+    /// every dirty batch immediately.
+    pub live_sweep_ms: u64,
+    /// `live-pace-chunk`: after this many subscriber socket writes inside
+    /// one sweep, the fan-out thread yields `live-pace-ms`. Default `64`;
+    /// `0` disables pacing entirely. Pro of a smaller chunk: smoother CPU,
+    /// writers never queue behind a push burst. Con: a large subscriber
+    /// set takes longer to fully drain.
+    pub live_pace_chunk: usize,
+    /// `live-pace-ms`: yield length per `live-pace-chunk` writes. Default `1`.
+    pub live_pace_ms: u64,
 }
 
 impl Default for Config {
@@ -90,6 +166,8 @@ impl Default for Config {
             requirepass: None,
             maxmemory: None,
             maxmemory_policy: MaxMemoryPolicy::NoEviction,
+            maxclients: 10_000,
+            proto_max_bulk_len: 64 * 1024 * 1024,
             dir: PathBuf::from("."),
             dbfilename: "dump.rdb".to_string(),
             appendonly: false,
@@ -100,6 +178,8 @@ impl Default for Config {
             tiered_dir: PathBuf::from("tiered"),
             tiered_disk_limit: None,
             eviction_tick_ms: 100,
+            eviction_low_watermark: 0.5,
+            max_evictions_per_tick: 10_000,
             singleflight_max_wait_ms: 10_000,
             replicaof: None,
             tls_port: 0,
@@ -109,8 +189,15 @@ impl Default for Config {
             history_enabled: false,
             history_dir: PathBuf::from("history"),
             history_retention_ms: 24 * 60 * 60 * 1000,
+            history_max_versions_per_key: 200,
             slowlog_log_slower_than_us: 10_000,
             slowlog_max_len: 128,
+            replica_backlog_size: 32_768,
+            replica_backlog_max_bytes: 64 * 1024 * 1024,
+            replica_slow_disconnect_ms: 5_000,
+            live_sweep_ms: 10,
+            live_pace_chunk: 64,
+            live_pace_ms: 1,
         }
     }
 }
@@ -194,6 +281,14 @@ impl Config {
                 self.maxmemory_policy = MaxMemoryPolicy::parse(value)
                     .ok_or_else(|| format!("invalid maxmemory-policy: {value}"))?
             }
+            "maxclients" => {
+                let limit: usize = value.parse().map_err(|_| format!("invalid maxclients: {value}"))?;
+                if limit == 0 {
+                    return Err("maxclients must be at least 1".into());
+                }
+                self.maxclients = limit;
+            }
+            "proto-max-bulk-len" => self.proto_max_bulk_len = parse_memory(value)? as usize,
             "dir" => self.dir = PathBuf::from(value),
             "dbfilename" => self.dbfilename = value.to_string(),
             "appendonly" => self.appendonly = value.eq_ignore_ascii_case("yes"),
@@ -216,6 +311,18 @@ impl Config {
             "eviction-tick-ms" => {
                 self.eviction_tick_ms =
                     value.parse().map_err(|_| format!("invalid eviction-tick-ms: {value}"))?
+            }
+            "eviction-low-watermark" => {
+                let watermark: f64 =
+                    value.parse().map_err(|_| format!("invalid eviction-low-watermark: {value}"))?;
+                if !(watermark > 0.0 && watermark <= 1.0) {
+                    return Err("eviction-low-watermark must be in (0.0, 1.0]".into());
+                }
+                self.eviction_low_watermark = watermark;
+            }
+            "eviction-max-per-tick" => {
+                self.max_evictions_per_tick =
+                    value.parse().map_err(|_| format!("invalid eviction-max-per-tick: {value}"))?
             }
             "singleflight-max-wait-ms" => {
                 self.singleflight_max_wait_ms =
@@ -241,6 +348,14 @@ impl Config {
                 self.history_retention_ms =
                     value.parse().map_err(|_| format!("invalid history-retention-ms: {value}"))?
             }
+            "history-max-versions-per-key" => {
+                let limit: usize =
+                    value.parse().map_err(|_| format!("invalid history-max-versions-per-key: {value}"))?;
+                if !(1..=1_000_000).contains(&limit) {
+                    return Err("history-max-versions-per-key must be between 1 and 1000000".into());
+                }
+                self.history_max_versions_per_key = limit;
+            }
             "slowlog-log-slower-than" => {
                 self.slowlog_log_slower_than_us =
                     value.parse().map_err(|_| format!("invalid slowlog-log-slower-than: {value}"))?
@@ -248,6 +363,25 @@ impl Config {
             "slowlog-max-len" => {
                 self.slowlog_max_len =
                     value.parse().map_err(|_| format!("invalid slowlog-max-len: {value}"))?
+            }
+            "repl-backlog-size" => {
+                self.replica_backlog_size =
+                    value.parse().map_err(|_| format!("invalid repl-backlog-size: {value}"))?
+            }
+            "repl-backlog-max-bytes" => self.replica_backlog_max_bytes = parse_memory(value)? as usize,
+            "repl-slow-disconnect-delay-ms" => {
+                self.replica_slow_disconnect_ms =
+                    value.parse().map_err(|_| format!("invalid repl-slow-disconnect-delay-ms: {value}"))?
+            }
+            "live-sweep-ms" => {
+                self.live_sweep_ms = value.parse().map_err(|_| format!("invalid live-sweep-ms: {value}"))?
+            }
+            "live-pace-chunk" => {
+                self.live_pace_chunk =
+                    value.parse().map_err(|_| format!("invalid live-pace-chunk: {value}"))?
+            }
+            "live-pace-ms" => {
+                self.live_pace_ms = value.parse().map_err(|_| format!("invalid live-pace-ms: {value}"))?
             }
             other => {
                 tracing::warn!("ignoring unsupported config directive: {other}");
@@ -266,4 +400,57 @@ fn parse_memory(value: &str) -> Result<u64, String> {
         v => (v, 1),
     };
     num.trim().parse::<u64>().map(|n| n * mult).map_err(|_| format!("invalid maxmemory: {value}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(pairs: &[(&str, &str)]) -> impl Iterator<Item = String> {
+        pairs
+            .iter()
+            .flat_map(|(flag, value)| [format!("--{flag}"), value.to_string()])
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn new_knobs_parse_and_override_their_defaults() {
+        let cfg = Config::from_args(args(&[
+            ("maxclients", "500"),
+            ("proto-max-bulk-len", "128mb"),
+            ("eviction-low-watermark", "0.25"),
+            ("eviction-max-per-tick", "2000"),
+            ("repl-backlog-size", "1024"),
+            ("repl-backlog-max-bytes", "16mb"),
+            ("repl-slow-disconnect-delay-ms", "1500"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.maxclients, 500);
+        assert_eq!(cfg.proto_max_bulk_len, 128 * 1024 * 1024);
+        assert_eq!(cfg.eviction_low_watermark, 0.25);
+        assert_eq!(cfg.max_evictions_per_tick, 2000);
+        assert_eq!(cfg.replica_backlog_size, 1024);
+        assert_eq!(cfg.replica_backlog_max_bytes, 16 * 1024 * 1024);
+        assert_eq!(cfg.replica_slow_disconnect_ms, 1500);
+    }
+
+    #[test]
+    fn rejects_out_of_range_values() {
+        assert!(Config::from_args(args(&[("maxclients", "0")])).is_err());
+        assert!(Config::from_args(args(&[("eviction-low-watermark", "0")])).is_err());
+        assert!(Config::from_args(args(&[("eviction-low-watermark", "1.5")])).is_err());
+    }
+
+    #[test]
+    fn defaults_match_documented_values() {
+        let cfg = Config::default();
+        assert_eq!(cfg.maxclients, 10_000);
+        assert_eq!(cfg.proto_max_bulk_len, 64 * 1024 * 1024);
+        assert_eq!(cfg.eviction_low_watermark, 0.5);
+        assert_eq!(cfg.max_evictions_per_tick, 10_000);
+        assert_eq!(cfg.replica_backlog_size, 32_768);
+        assert_eq!(cfg.replica_backlog_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.replica_slow_disconnect_ms, 5_000);
+    }
 }

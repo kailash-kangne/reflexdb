@@ -7,7 +7,7 @@ use crate::value::{Protocol, Value};
 #[test]
 fn decodes_multibulk_set_command() {
     let mut buf = BytesMut::from(&b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"[..]);
-    let mut decoder = RequestDecoder;
+    let mut decoder = RequestDecoder::default();
     let req = decoder.decode(&mut buf).unwrap().unwrap();
     assert_eq!(req.len(), 3);
     assert_eq!(&req[0][..], b"SET");
@@ -19,7 +19,7 @@ fn decodes_multibulk_set_command() {
 #[test]
 fn decodes_inline_command() {
     let mut buf = BytesMut::from(&b"PING\r\n"[..]);
-    let mut decoder = RequestDecoder;
+    let mut decoder = RequestDecoder::default();
     let req = decoder.decode(&mut buf).unwrap().unwrap();
     assert_eq!(req.len(), 1);
     assert_eq!(&req[0][..], b"PING");
@@ -31,7 +31,7 @@ fn decodes_inline_command_with_bare_lf() {
     // a bare `\n`, not `\r\n` — regression test for a bug where multiple
     // `\n`-separated commands got glued into one bad command.
     let mut buf = BytesMut::from(&b"SET a 1\nSET b 2\nGET a\n"[..]);
-    let mut decoder = RequestDecoder;
+    let mut decoder = RequestDecoder::default();
 
     let req = decoder.decode(&mut buf).unwrap().unwrap();
     assert_eq!(req, vec![Bytes::from_static(b"SET"), Bytes::from_static(b"a"), Bytes::from_static(b"1")]);
@@ -51,7 +51,7 @@ fn skips_a_blank_inline_line_without_waiting_on_more_io() {
     // stall the connection until more bytes arrive from the socket, even
     // though the next request is already fully buffered.
     let mut buf = BytesMut::from(&b"\r\n*1\r\n$4\r\nPING\r\n"[..]);
-    let mut decoder = RequestDecoder;
+    let mut decoder = RequestDecoder::default();
     let req = decoder.decode(&mut buf).unwrap().unwrap();
     assert_eq!(req, vec![Bytes::from_static(b"PING")]);
     assert!(buf.is_empty());
@@ -60,7 +60,7 @@ fn skips_a_blank_inline_line_without_waiting_on_more_io() {
 #[test]
 fn returns_none_on_partial_frame() {
     let mut buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfo"[..]);
-    let mut decoder = RequestDecoder;
+    let mut decoder = RequestDecoder::default();
     assert!(decoder.decode(&mut buf).unwrap().is_none());
 }
 
@@ -74,7 +74,7 @@ fn returns_none_on_partial_frame() {
 #[test]
 fn rejects_an_absurd_multibulk_count_instead_of_allocating_it() {
     let mut buf = BytesMut::from(&b"*99999999999999\r\n"[..]);
-    let mut decoder = RequestDecoder;
+    let mut decoder = RequestDecoder::default();
     assert!(decoder.decode(&mut buf).is_err());
 }
 
@@ -87,7 +87,7 @@ fn rejects_an_absurd_multibulk_count_instead_of_allocating_it() {
 #[test]
 fn rejects_an_absurd_bulk_length() {
     let mut buf = BytesMut::from(&b"*1\r\n$99999999999999\r\n"[..]);
-    let mut decoder = RequestDecoder;
+    let mut decoder = RequestDecoder::default();
     assert!(decoder.decode(&mut buf).is_err());
 }
 
@@ -145,6 +145,58 @@ fn encodes_integer_edge_cases_without_the_to_string_helper() {
     out.clear();
     Value::Integer(i64::MAX).encode(&mut out, Protocol::Resp2);
     assert_eq!(&out[..], format!(":{}\r\n", i64::MAX).as_bytes());
+}
+
+#[test]
+fn decodes_an_rfx_frame_and_latches_the_wire_format() {
+    // `!` + ver:u8 + nargs:u16 + per-arg len:u32 + bytes — `SET foo bar`:
+    let mut frame = BytesMut::from(&b"!\x01\x00\x03"[..]);
+    for arg in [b"SET", b"foo", b"bar"] {
+        frame.extend_from_slice(&(arg.len() as u32).to_be_bytes());
+        frame.extend_from_slice(arg);
+    }
+    let mut decoder = RequestDecoder::default();
+    let req = decoder.decode(&mut frame).unwrap().unwrap();
+    assert_eq!(req, vec![Bytes::from_static(b"SET"), Bytes::from_static(b"foo"), Bytes::from_static(b"bar")]);
+    assert_eq!(decoder.wire(), crate::Wire::Rfx);
+
+    // Once RFX is latched a RESP frame on the same connection is an error.
+    let mut mixed = BytesMut::from(&b"*1\r\n$4\r\nPING\r\n"[..]);
+    assert!(decoder.decode(&mut mixed).is_err());
+}
+
+#[test]
+fn rejects_an_rfx_arg_over_the_bulk_cap() {
+    let mut frame = BytesMut::from(&b"!\x01\x00\x01"[..]);
+    frame.extend_from_slice(&u32::MAX.to_be_bytes());
+    let mut decoder = RequestDecoder::default();
+    assert!(decoder.decode(&mut frame).is_err());
+}
+
+#[test]
+fn rejects_an_unknown_rfx_version() {
+    let mut frame = BytesMut::from(&b"!\x02\x00\x01\x00\x00\x00\x03SET"[..]);
+    let mut decoder = RequestDecoder::default();
+    assert!(decoder.decode(&mut frame).is_err());
+}
+
+#[test]
+fn rfx_reply_encoding_uses_tags_and_binary_lengths() {
+    let mut out = BytesMut::new();
+    crate::encode_rfx_reply(&Value::ok(), &mut out);
+    assert_eq!(&out[..], b"+\x00\x00\x00\x02OK");
+
+    out.clear();
+    crate::encode_rfx_reply(&Value::Integer(-1), &mut out);
+    assert_eq!(&out[..], b":\xff\xff\xff\xff\xff\xff\xff\xff");
+
+    out.clear();
+    crate::encode_rfx_reply(&Value::NullBulk, &mut out);
+    assert_eq!(&out[..], b"_");
+
+    out.clear();
+    crate::encode_rfx_reply(&Value::Array(vec![Value::bulk(&b"ab"[..])]), &mut out);
+    assert_eq!(&out[..], b"*\x00\x00\x00\x01$\x00\x00\x00\x02ab");
 }
 
 /// `Map`/`Set`/`Push` downgrade to a plain RESP2 array by writing items

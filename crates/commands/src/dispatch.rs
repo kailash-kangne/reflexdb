@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,7 +8,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use keyspace::{Db, Store, Ttl, Value as KVal};
 use rand::seq::SliceRandom;
-use resp::{Protocol, Request, Value};
+use resp::{Protocol, Request, Value, Wire};
+use tokio::io::AsyncWrite;
 use tokio::sync::mpsc::Sender;
 
 use crate::live::LiveSub;
@@ -28,6 +29,37 @@ use crate::{
 /// scan every key in the DB to find the best candidate rather than
 /// sampling a handful, which is fine at this scale but wouldn't be at
 /// millions of keys — same trade-off `SCAN` already makes.
+/// An out-of-band push delivered on a client's bounded per-connection
+/// queue (the channel `register_client` hands back).
+pub enum ClientPush {
+    /// Pub/sub message (or tracking invalidation) — encoded per the
+    /// connection's negotiated protocol at write time.
+    Value(Arc<Value>),
+    /// `LIVE` update — already encoded once per wire variant, shared by
+    /// every subscriber; the connection just picks its format's bytes.
+    Live(Arc<live::LiveEncoded>),
+}
+
+/// A connection's socket writer, shared between its own task (reply
+/// writes, under `lock`) and the `live-fanout` thread (LIVE pushes via
+/// `try_lock` + a non-blocking write — so a subscriber push never needs
+/// a task wakeup and a stalled socket just gets flagged slow).
+pub struct ClientWriter {
+    pub w: tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    /// Last wire/proto the conn task observed (`note_format`); the
+    /// fan-out picks the matching pre-encoded variant. 0 = RESP2 /
+    /// RESP, 1 = RESP3 / RFX.
+    pub wire: AtomicU8,
+    pub proto: AtomicU8,
+}
+
+impl ClientWriter {
+    pub fn note_format(&self, wire: Wire, proto: Protocol) {
+        self.wire.store(wire as u8, Ordering::Relaxed);
+        self.proto.store(proto as u8, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MaxMemoryPolicy {
     #[default]
@@ -63,16 +95,8 @@ impl MaxMemoryPolicy {
     }
 }
 
-/// Once a `tiered_limit`/`tiered_disk_limit` eviction pass starts, it
-/// drains down to this fraction of the configured limit rather than just
-/// back under it — otherwise the very next write immediately re-crosses
-/// the limit and re-triggers eviction (thrashing right at the line, with
-/// no room to absorb a burst). At the default 0.5, a cleanup pass leaves
-/// roughly the limit's own size free again.
-const EVICTION_LOW_WATERMARK: f64 = 0.5;
-
-fn low_watermark(limit: u64) -> u64 {
-    (limit as f64 * EVICTION_LOW_WATERMARK) as u64
+fn low_watermark(limit: u64, watermark: f64) -> u64 {
+    (limit as f64 * watermark) as u64
 }
 
 /// Keep the coldest `limit` keys under a database's eviction policy. Shared
@@ -105,9 +129,12 @@ fn order_eviction_candidates(
             candidates
         }
         MaxMemoryPolicy::NoEviction | MaxMemoryPolicy::AllKeysLru | MaxMemoryPolicy::VolatileLru => {
+            // `last_access` is second-granular (same resolution as Redis's own
+            // ~1s LRU clock) — `access_count` breaks same-second ties so
+            // ranking stays deterministic for keys touched in one burst.
             let mut ranked: Vec<_> = candidates
                 .into_iter()
-                .filter_map(|key| db.access_stats(&key).map(|(last, _)| (key, last)))
+                .filter_map(|key| db.access_stats(&key).map(|stats| (key, stats)))
                 .collect();
             sort_coldest(&mut ranked, limit);
             ranked.into_iter().map(|(key, _)| key).collect()
@@ -115,7 +142,7 @@ fn order_eviction_candidates(
         MaxMemoryPolicy::AllKeysLfu | MaxMemoryPolicy::VolatileLfu => {
             let mut ranked: Vec<_> = candidates
                 .into_iter()
-                .filter_map(|key| db.access_stats(&key).map(|(_, count)| (key, count)))
+                .filter_map(|key| db.access_stats(&key).map(|(last, count)| (key, (count, last))))
                 .collect();
             sort_coldest(&mut ranked, limit);
             ranked.into_iter().map(|(key, _)| key).collect()
@@ -141,16 +168,6 @@ fn sort_coldest<T: Ord + Copy>(ranked: &mut Vec<(Bytes, T)>, limit: usize) {
     }
     ranked.sort_unstable_by_key(|(_, rank)| *rank);
 }
-
-/// Hard per-tick cap on how many keys one eviction pass will move/drop,
-/// regardless of how far over budget things are — the 100ms background
-/// tick (`server/src/main.rs`) also runs TTL active-expire and scheduled
-/// commands right after eviction, so one catastrophic overshoot shouldn't
-/// be able to monopolize it indefinitely. High enough that it's very
-/// unlikely to matter in practice now that `drain_to_tier`/
-/// `drain_tiered_disk` are O(keys touched) rather than O(keys touched *
-/// total keys) — see their docs.
-const MAX_EVICTIONS_PER_TICK: usize = 10_000;
 
 /// Parsed `notify-keyspace-events` flags — see `notify_keyspace_event`'s
 /// docs for how these gate `__keyspace@<db>__`/`__keyevent@<db>__` pub/sub
@@ -202,7 +219,11 @@ pub struct ServerContext {
     /// Outbound push channel per connected client, used to deliver pub/sub
     /// messages and LIVE updates asynchronously from whichever connection
     /// triggered them.
-    pub(crate) clients: DashMap<u64, Sender<Arc<Value>>>,
+    pub(crate) clients: DashMap<u64, Sender<ClientPush>>,
+    /// Socket write halves per connected client — lets `live-fanout`
+    /// write LIVE pushes straight to the socket instead of waking every
+    /// subscriber's connection task once per update.
+    pub(crate) client_writers: DashMap<u64, Arc<ClientWriter>>,
     pub(crate) slow_clients: DashMap<u64, ()>,
     pub(crate) slow_replicas: DashMap<u64, Instant>,
     pub(crate) replica_receivers: DashMap<
@@ -219,8 +240,21 @@ pub struct ServerContext {
     /// Serializes LIVE's initial read plus registration against post-write
     /// notifications, so a mutation cannot slip into the subscription gap.
     pub(crate) live_sync: std::sync::Mutex<()>,
+    /// Deduplicating dirty-set + dedicated thread that runs LIVE
+    /// re-evaluation/broadcast off the write path — see `live::LiveFanout`.
+    pub(crate) live_fanout: Arc<live::LiveFanout>,
+    /// `Weak` self-reference installed by `bind_live_fanout` once the server
+    /// wraps the context in an `Arc`; unset in unit tests, which then run
+    /// LIVE wakes inline via `enqueue_live_wake`'s fallback.
+    pub(crate) live_self: std::sync::OnceLock<std::sync::Weak<ServerContext>>,
     /// (db, key) -> fingerprints of LIVE subscriptions that depend on that key.
     pub(crate) key_watchers: DashMap<(usize, Bytes), HashSet<u64>>,
+    /// `live-sweep-ms`: idle gap between fan-out sweeps (see `live::SWEEP`).
+    pub(crate) live_sweep: Duration,
+    /// `live-pace-chunk`/`live-pace-ms`: per-sweep send pacing (see
+    /// `live::PACE_CHUNK`/`live::PACE`). `live_pace_chunk == 0` disables pacing.
+    pub(crate) live_pace_chunk: usize,
+    pub(crate) live_pace: Duration,
     /// Mirrors `key_watchers.len()`, but as a single atomic instead of a
     /// `DashMap` length (which sums every shard's length under its own
     /// lock). `on_key_changed` runs on *every* write, including plain
@@ -270,6 +304,16 @@ pub struct ServerContext {
     pub(crate) aof_path: Option<PathBuf>,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
+    /// `proto-max-bulk-len`: largest value a single `String` command
+    /// (`APPEND`/`SETRANGE`/`GETRANGE`/`SET`) will build or accept, and
+    /// also the largest single element the RESP decoder will allocate for
+    /// (see `resp::RequestDecoder`). Default `64 MiB`, same as real
+    /// Redis's default. Pro of raising it: lets large-value workloads
+    /// (big blobs stored as strings) through. Con: raises the worst-case
+    /// memory one client can force the server to allocate for a single
+    /// command/value — a buggy or malicious client can send a bulk string
+    /// up to this size before any application-level check runs.
+    pub proto_max_bulk_len: usize,
     /// Runtime overrides exposed by CONFIG. The startup configuration remains
     /// immutable; only explicitly supported live settings are stored here.
     pub(crate) config_overrides: DashMap<String, String>,
@@ -285,6 +329,29 @@ pub struct ServerContext {
     /// cold tiered entries get dropped outright (real loss, not a RAM
     /// move — there's nowhere left to move them). `None` means unbounded.
     pub tiered_disk_limit: Option<u64>,
+    /// `eviction-low-watermark`: once a `maxmemory`/`tiered-limit`/
+    /// `tiered-disk-limit` eviction pass starts, it drains down to this
+    /// fraction of the configured limit rather than just back under it —
+    /// otherwise the very next write immediately re-crosses the limit and
+    /// re-triggers eviction (thrashing right at the line, with no room to
+    /// absorb a burst). Default `0.5`, valid range `(0.0, 1.0]`.
+    /// Pro of a lower value (e.g. `0.3`): more headroom after a cleanup
+    /// pass, so a write burst takes longer to re-trigger eviction. Con: a
+    /// single pass does more work (moves/drops more keys) and briefly
+    /// holds less of the working set in RAM/the faster tier. `1.0` is
+    /// "drain exactly back to the limit, no headroom" — cheapest per pass,
+    /// but re-triggers on the very next write under sustained load.
+    pub eviction_low_watermark: f64,
+    /// `eviction-max-per-tick`: hard cap on how many keys one background
+    /// eviction pass (see `run_eviction_tick`, called every
+    /// `eviction-tick-ms`) will move or drop, regardless of how far over
+    /// budget things are. Default `10,000`. Pro of a higher value: a huge
+    /// overshoot gets drained in fewer ticks. Con: one catastrophic
+    /// overshoot can monopolize a tick's CPU, delaying that same tick's
+    /// TTL active-expire and scheduled-command work. Pro of a lower value:
+    /// bounds worst-case per-tick latency; con: a large overshoot takes
+    /// many ticks to fully drain.
+    pub max_evictions_per_tick: usize,
     /// `SCHEDULE AT`/`SCHEDULE IN` queue, drained by `run_due_scheduled`.
     pub(crate) scheduler: Scheduler,
     /// Active `GET ... SINGLEFLIGHT` leases, keyed by (db, key).
@@ -297,6 +364,31 @@ pub struct ServerContext {
     /// keeps retrying a blocked `SINGLEFLIGHT` wait before giving up.
     pub singleflight_max_wait: Duration,
 
+    /// `repl-backlog-size`: per-replica outbound queue depth (number of
+    /// pending RESP values), set when a replica registers via `PSYNC`.
+    /// Default `32,768`. Pro of a larger value: absorbs a longer burst of
+    /// writes before a replica is flagged slow/disconnected. Con: a slow
+    /// replica can hold that many unflushed values in memory on the
+    /// primary before `repl-backlog-max-bytes` or the slow-disconnect
+    /// delay kicks in.
+    pub replica_queue_capacity: usize,
+    /// `repl-backlog-max-bytes`: total bytes of commands one replica may
+    /// have queued before it's treated as slow (further writes to it are
+    /// dropped and it's marked for disconnect). Default `64 MiB`. Pro of a
+    /// larger value: tolerates a slower/further-away replica without
+    /// cutting it off. Con: that many unflushed bytes are held in memory
+    /// per lagging replica, and real Redis's default (`1 GiB` via
+    /// `client-output-buffer-limit replica`) is intentionally far looser
+    /// than this — lower here trades replica tolerance for primary memory
+    /// safety.
+    pub replica_queue_max_bytes: usize,
+    /// `repl-slow-disconnect-delay-ms`: how long a replica can stay flagged
+    /// slow before the connection is actually dropped. Default `5s`. Pro
+    /// of a longer delay: survives a brief network blip without losing the
+    /// replica link (it has to fully resync after a drop). Con: a replica
+    /// that's reconnected but still behind keeps counting as "connected"
+    /// for `WAIT`/`CLIENT LIST` purposes for longer.
+    pub replica_slow_disconnect_delay: Duration,
     /// Connected replicas (clients that sent `PSYNC`), keyed by client id.
     pub(crate) replicas: DashMap<u64, ReplicaState>,
     /// Logical replication offset: incremented once per replicated write
@@ -372,6 +464,7 @@ impl ServerContext {
             start_time: Instant::now(),
             next_client_id: AtomicU64::new(1),
             clients: DashMap::new(),
+            client_writers: DashMap::new(),
             slow_clients: DashMap::new(),
             slow_replicas: DashMap::new(),
             replica_receivers: DashMap::new(),
@@ -380,7 +473,12 @@ impl ServerContext {
             live_subs: DashMap::new(),
             live_events,
             live_sync: std::sync::Mutex::new(()),
+            live_fanout: live::LiveFanout::new(),
+            live_self: std::sync::OnceLock::new(),
             key_watchers: DashMap::new(),
+            live_sweep: live::SWEEP,
+            live_pace_chunk: live::PACE_CHUNK,
+            live_pace: live::PACE,
             key_watchers_len: AtomicUsize::new(0),
             watchers: DashMap::new(),
             watchers_len: AtomicUsize::new(0),
@@ -395,14 +493,20 @@ impl ServerContext {
             aof_path: None,
             maxmemory: None,
             maxmemory_policy: MaxMemoryPolicy::NoEviction,
+            proto_max_bulk_len: 64 * 1024 * 1024,
             config_overrides: DashMap::new(),
             approx_memory: AtomicUsize::new(0),
             tiered_limit: None,
             tiered_disk_limit: None,
+            eviction_low_watermark: 0.5,
+            max_evictions_per_tick: 10_000,
             scheduler: Scheduler::default(),
             singleflight: DashMap::new(),
             singleflight_len: AtomicUsize::new(0),
             singleflight_max_wait: Duration::from_secs(10),
+            replica_queue_capacity: 32_768,
+            replica_queue_max_bytes: 64 * 1024 * 1024,
+            replica_slow_disconnect_delay: Duration::from_secs(5),
             replicas: DashMap::new(),
             master_repl_offset: AtomicU64::new(0),
             replid: generate_replid(),
@@ -448,6 +552,29 @@ impl ServerContext {
         self
     }
 
+    pub fn with_proto_max_bulk_len(mut self, limit: usize) -> Self {
+        self.proto_max_bulk_len = limit;
+        self
+    }
+
+    pub fn with_eviction_tuning(mut self, low_watermark: f64, max_per_tick: usize) -> Self {
+        self.eviction_low_watermark = low_watermark;
+        self.max_evictions_per_tick = max_per_tick;
+        self
+    }
+
+    pub fn with_replica_backpressure(
+        mut self,
+        queue_capacity: usize,
+        queue_max_bytes: usize,
+        slow_disconnect_delay: Duration,
+    ) -> Self {
+        self.replica_queue_capacity = queue_capacity;
+        self.replica_queue_max_bytes = queue_max_bytes;
+        self.replica_slow_disconnect_delay = slow_disconnect_delay;
+        self
+    }
+
     pub fn with_notify_keyspace_events(mut self, flags: NotifyFlags) -> Self {
         self.notify_keyspace_events = flags;
         self
@@ -471,6 +598,14 @@ impl ServerContext {
     pub fn with_slowlog(mut self, threshold_us: i64, max_len: usize) -> Self {
         self.slowlog_threshold_us = threshold_us;
         self.slowlog_max_len = max_len;
+        self
+    }
+
+    /// `live-sweep-ms`/`live-pace-chunk`/`live-pace-ms` config knobs.
+    pub fn with_live_pacing(mut self, sweep_ms: u64, pace_chunk: usize, pace_ms: u64) -> Self {
+        self.live_sweep = Duration::from_millis(sweep_ms);
+        self.live_pace_chunk = pace_chunk;
+        self.live_pace = Duration::from_millis(pace_ms);
         self
     }
 
@@ -570,6 +705,13 @@ impl ServerContext {
         self.live_subs.get(&fingerprint).map(|sub| sub.latest.clone())
     }
 
+    /// The subscription's latest push reply, pre-encoded per wire format —
+    /// the connection loop's LIVE delivery path uses this so N subscribers
+    /// share one encoding instead of each re-encoding the same `Value`.
+    pub fn latest_live_encoded(&self, fingerprint: u64) -> Option<Arc<live::LiveEncoded>> {
+        self.live_subs.get(&fingerprint).map(|sub| sub.encoded.clone())
+    }
+
     /// Active `GET ... SINGLEFLIGHT` leases right now — a proxy for
     /// "waiters", not an exact count of blocked connections (a lease can
     /// exist with zero current waiters, between the leaseholder taking it
@@ -643,12 +785,12 @@ impl ServerContext {
         let mut evicted = 0;
 
         if let Some(limit) = self.tiered_disk_limit {
-            let target = low_watermark(limit);
+            let target = low_watermark(limit, self.eviction_low_watermark);
             evicted += self.drain_tiered_disk(target);
         }
 
         if let Some(limit) = self.tiered_limit {
-            let target = low_watermark(limit);
+            let target = low_watermark(limit, self.eviction_low_watermark);
             evicted += self.drain_to_tier(target);
         }
 
@@ -659,7 +801,7 @@ impl ServerContext {
         let used = self.refresh_memory_usage();
         if let Some(limit) = self.effective_maxmemory() {
             if used as u64 > limit && self.effective_maxmemory_policy() != MaxMemoryPolicy::NoEviction {
-                let target = low_watermark(limit);
+                let target = low_watermark(limit, self.eviction_low_watermark);
                 evicted += self.drain_hard_eviction(target, used as u64);
                 // Reconcile once after the batch for concurrent writes and
                 // approximate-size drift; never rescan the whole store for
@@ -687,18 +829,19 @@ impl ServerContext {
     /// this avoids rescanning all keys once per move.
     fn drain_to_tier(&self, target: u64) -> usize {
         let policy = self.effective_maxmemory_policy();
+        let max_per_tick = self.max_evictions_per_tick;
         let mut rng = rand::thread_rng();
         let mut used = self.refresh_memory_usage() as u64;
         let mut moved = 0;
         for db_index in 0..self.store.len() {
-            if used <= target || moved >= MAX_EVICTIONS_PER_TICK {
+            if used <= target || moved >= max_per_tick {
                 break;
             }
             let db = self.store.db(db_index).expect("index within store.len()");
-            let remaining = MAX_EVICTIONS_PER_TICK - moved;
+            let remaining = max_per_tick - moved;
             let keys = order_eviction_candidates(db, db.ram_keys_snapshot(), policy, remaining, &mut rng);
             for key in keys {
-                if used <= target || moved >= MAX_EVICTIONS_PER_TICK {
+                if used <= target || moved >= max_per_tick {
                     break;
                 }
                 if let Some(freed) = db.evict_to_tier_sized(&key) {
@@ -719,18 +862,19 @@ impl ServerContext {
         if policy == MaxMemoryPolicy::NoEviction {
             return 0;
         }
+        let max_per_tick = self.max_evictions_per_tick;
         let mut rng = rand::thread_rng();
         let mut evicted = 0;
         for db_index in 0..self.store.len() {
-            if estimated_used <= target || evicted >= MAX_EVICTIONS_PER_TICK {
+            if estimated_used <= target || evicted >= max_per_tick {
                 break;
             }
             let db = self.store.db(db_index).expect("index within store.len()");
-            let remaining = MAX_EVICTIONS_PER_TICK - evicted;
+            let remaining = max_per_tick - evicted;
             let candidates =
                 order_eviction_candidates(db, db.ram_keys_snapshot(), policy, remaining, &mut rng);
             for victim in candidates {
-                if estimated_used <= target || evicted >= MAX_EVICTIONS_PER_TICK {
+                if estimated_used <= target || evicted >= max_per_tick {
                     break;
                 }
                 let (removed, freed) = db.del_sized(std::slice::from_ref(&victim));
@@ -751,10 +895,11 @@ impl ServerContext {
     /// (see `tiered::FjallTier`), so unlike `drain_to_tier` this can just
     /// re-check it directly each iteration.
     fn drain_tiered_disk(&self, target: u64) -> usize {
-        let keys = self.store.tiered_oldest_keys(MAX_EVICTIONS_PER_TICK);
+        let max_per_tick = self.max_evictions_per_tick;
+        let keys = self.store.tiered_oldest_keys(max_per_tick);
         let mut dropped = 0;
         for key in keys {
-            if dropped >= MAX_EVICTIONS_PER_TICK {
+            if dropped >= max_per_tick {
                 break;
             }
             match self.store.tiered_disk_usage_bytes() {
@@ -794,11 +939,28 @@ impl ServerContext {
     /// Register a new connection's outbound push channel, returning its id
     /// and the receiving half the connection loop should poll alongside its
     /// socket reads.
-    pub fn register_client(&self) -> (u64, tokio::sync::mpsc::Receiver<Arc<Value>>) {
+    pub fn register_client(&self) -> (u64, tokio::sync::mpsc::Receiver<ClientPush>) {
         let id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
         self.clients.insert(id, tx);
         (id, rx)
+    }
+
+    /// Called by the connection loop after `register_client`, once the
+    /// stream's write half exists. Returns the shared writer the conn
+    /// task must lock for its own replies.
+    pub fn attach_writer(
+        &self,
+        client_id: u64,
+        w: impl AsyncWrite + Send + Unpin + 'static,
+    ) -> Arc<ClientWriter> {
+        let writer = Arc::new(ClientWriter {
+            w: tokio::sync::Mutex::new(Box::new(w)),
+            wire: AtomicU8::new(0),
+            proto: AtomicU8::new(0),
+        });
+        self.client_writers.insert(client_id, writer.clone());
+        writer
     }
 
     /// Drop every subscription (channels, patterns, LIVE) a disconnecting
@@ -806,6 +968,7 @@ impl ServerContext {
     /// index subscriptions per-client to avoid the full scan.
     pub fn disconnect_client(&self, id: u64) {
         self.clients.remove(&id);
+        self.client_writers.remove(&id);
         self.slow_clients.remove(&id);
         self.slow_replicas.remove(&id);
         self.replica_receivers.remove(&id);
@@ -863,8 +1026,48 @@ impl ServerContext {
     }
 
     pub(crate) fn push_to(&self, client_id: u64, value: Value) {
+        self.push_msg(client_id, ClientPush::Value(Arc::new(value)));
+    }
+
+    /// LIVE delivery: write the pre-encoded push straight to the
+    /// subscriber's socket from the calling (fan-out) thread — no
+    /// per-subscriber task wakeup at all (the old mpsc version still
+    /// paid ~one task poll + kqueue re-registration per subscriber per
+    /// write, which is what actually capped 1000 subs at ~80 ops/s).
+    /// Contended writer → fall back to the client's queue; stalled
+    /// socket → flag slow, the conn loop disconnects it.
+    pub(crate) fn push_live(&self, client_id: u64, encoded: Arc<live::LiveEncoded>) {
+        let Some(writer) = self.client_writers.get(&client_id).map(|w| w.clone()) else {
+            self.push_msg(client_id, ClientPush::Live(encoded));
+            return;
+        };
+        let Ok(mut w) = writer.w.try_lock() else {
+            self.push_msg(client_id, ClientPush::Live(encoded));
+            return;
+        };
+        let wire = if writer.wire.load(Ordering::Relaxed) == 1 { Wire::Rfx } else { Wire::Resp };
+        let proto = if writer.proto.load(Ordering::Relaxed) == 1 { Protocol::Resp3 } else { Protocol::Resp2 };
+        let bytes = encoded.for_wire(wire, proto);
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut sent = 0;
+        let stalled = loop {
+            if sent >= bytes.len() {
+                break false;
+            }
+            match std::pin::Pin::new(&mut *w).poll_write(&mut cx, &bytes[sent..]) {
+                Poll::Ready(Ok(n)) if n > 0 => sent += n,
+                _ => break true,
+            }
+        };
+        if stalled {
+            self.slow_clients.insert(client_id, ());
+        }
+    }
+
+    fn push_msg(&self, client_id: u64, msg: ClientPush) {
         if let Some(sender) = self.clients.get(&client_id) {
-            if sender.try_send(Arc::new(value)).is_err() {
+            if sender.try_send(msg).is_err() {
                 if self.replicas.contains_key(&client_id) {
                     self.slow_replicas.entry(client_id).or_insert_with(Instant::now);
                 } else {
@@ -885,7 +1088,16 @@ impl ServerContext {
     pub fn slow_replica_remaining(&self, client_id: u64) -> Option<Duration> {
         self.slow_replicas
             .get(&client_id)
-            .map(|since| crate::replication::REPLICA_SLOW_DISCONNECT_DELAY.saturating_sub(since.elapsed()))
+            .map(|since| self.replica_slow_disconnect_delay.saturating_sub(since.elapsed()))
+    }
+}
+
+impl Drop for ServerContext {
+    /// Signals the `live-fanout` thread (if one was spawned) to exit —
+    /// otherwise it would park on the dirty-set condvar forever after the
+    /// server context is dropped (mainly relevant in tests).
+    fn drop(&mut self) {
+        self.live_fanout.stop();
     }
 }
 
@@ -937,6 +1149,10 @@ pub struct ClientState {
     /// the connection loop cheaply tell whether a broadcast `ctx.live_events`
     /// notification is one it cares about, without touching `ctx.live_subs`.
     pub live_fingerprints: HashSet<u64>,
+    /// Which wire format replies on this connection are encoded in —
+    /// mirrors `RequestDecoder::wire()` (RESP or RFX binary, latched by
+    /// the first frame the client sends).
+    pub wire: resp::Wire,
 }
 
 impl ClientState {
@@ -962,6 +1178,7 @@ impl ClientState {
             client_name: String::new(),
             tracking: false,
             live_fingerprints: HashSet::new(),
+            wire: resp::Wire::Resp,
         }
     }
 
@@ -1071,7 +1288,12 @@ pub(crate) fn on_key_changed(ctx: &ServerContext, db_index: usize, key: Bytes) {
     if ctx.history.is_some() {
         record_history(ctx, db_index, &key);
     }
-    live::notify_key_change(ctx, db_index, key.clone());
+    // LIVE wakes go through the deduplicating fan-out queue when the ctx is
+    // `Arc`-bound (production): the re-eval + per-subscriber wakeup then run
+    // on the `live-fanout` thread instead of inflating this write's latency.
+    if ctx.key_watchers_len.load(Ordering::Relaxed) != 0 {
+        ctx.enqueue_live_wake(live::LiveWake::Key(db_index, key.clone()));
+    }
     txn::touch_watchers(ctx, db_index, key.clone());
     // `singleflight`/`tracking_table` are empty on the overwhelmingly common
     // path (most writes never had a SINGLEFLIGHT lease or a tracked read on
@@ -1118,10 +1340,7 @@ fn record_history(ctx: &ServerContext, db_index: usize, key: &Bytes) {
     // non-string value; `.flatten()` collapses both into `None` here,
     // which is exactly the distinction `GETAT`/`HISTORY` need: "string
     // with this value" (`Some`) vs. "deleted, or never a string" (`None`).
-    let snapshot = db.with_value(key, |v| match v {
-        KVal::String(s) => Some(s.clone()),
-        _ => None,
-    });
+    let snapshot = db.with_value(key, |v| v.string_bytes());
     let snapshot = snapshot.flatten();
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     writer.record(db_index, key.clone(), now_ms, snapshot);
@@ -1222,7 +1441,9 @@ pub(crate) fn clear_blocking_deadline(state: &mut ClientState) {
 
 /// Same fan-out, for whole-database resets like `FLUSHDB`.
 pub(crate) fn on_flush(ctx: &ServerContext, db_index: usize) {
-    live::notify_flush(ctx, db_index);
+    if ctx.key_watchers_len.load(Ordering::Relaxed) != 0 {
+        ctx.enqueue_live_wake(live::LiveWake::FlushDb(db_index));
+    }
     txn::touch_all_watchers(ctx, db_index);
 }
 
@@ -1718,10 +1939,7 @@ pub(crate) fn dispatch_get(ctx: &ServerContext, state: &ClientState, key: &Bytes
     // `with_value` (not `get`): a key holding a large List/Hash/Set/ZSet
     // would otherwise pay for a full deep clone of the collection on every
     // `GET` just to discover it's the wrong type and throw the clone away.
-    match db.with_value(key, |v| match v {
-        KVal::String(s) => Ok(s.clone()),
-        _ => Err(()),
-    }) {
+    match db.with_value(key, |v| v.string_bytes().ok_or(())) {
         Some(Ok(s)) => reply(Value::bulk(s)),
         Some(Err(())) => wrong_type(),
         None => reply(Value::NullBulk),
@@ -1926,6 +2144,7 @@ fn cmd_object(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outco
     }
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let encoding = db.with_value(key, |v| match v {
+        KVal::Int(_) => "int",
         KVal::String(s) => {
             if std::str::from_utf8(s).ok().and_then(|x| x.parse::<i64>().ok()).is_some() {
                 "int"
@@ -2405,6 +2624,7 @@ mod tests {
         let mut got_keyevent_set = false;
         let mut got_keyspace_lpush = false;
         while let Ok(msg) = sub_rx.try_recv() {
+            let ClientPush::Value(msg) = msg else { continue };
             if let Value::Push(parts) = msg.as_ref() {
                 if let [_, Value::Bulk(channel), Value::Bulk(payload)] = parts.as_slice() {
                     if channel.as_ref() == b"__keyevent@0__:set" && payload.as_ref() == b"k" {
@@ -3217,7 +3437,9 @@ mod tests {
 
         assert_eq!(run(&ctx, &mut publisher, &["PUBLISH", "news", "hello"]), Value::Integer(1));
 
-        let pushed = rx.try_recv().expect("subscriber should have received a push");
+        let ClientPush::Value(pushed) = rx.try_recv().expect("subscriber should have received a push") else {
+            panic!("expected a pub/sub Value push");
+        };
         assert_eq!(
             pushed.as_ref(),
             &Value::Push(vec![
@@ -3239,7 +3461,10 @@ mod tests {
         let mut publisher = ClientState::with_id(pub_id, false);
         run(&ctx, &mut publisher, &["PUBLISH", "news.sports", "goal"]);
 
-        let pushed = rx.try_recv().expect("pattern subscriber should receive a push");
+        let ClientPush::Value(pushed) = rx.try_recv().expect("pattern subscriber should receive a push")
+        else {
+            panic!("expected a pub/sub Value push");
+        };
         assert_eq!(
             pushed.as_ref(),
             &Value::Push(vec![
