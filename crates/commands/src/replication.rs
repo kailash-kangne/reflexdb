@@ -46,10 +46,6 @@ impl Drop for ReplicaMessage {
     }
 }
 
-pub(crate) const REPLICA_QUEUE_CAPACITY: usize = 32_768;
-pub(crate) const REPLICA_QUEUE_MAX_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const REPLICA_SLOW_DISCONNECT_DELAY: Duration = Duration::from_secs(5);
-
 fn decimal_len(mut n: usize) -> usize {
     let mut digits = 1;
     while n >= 10 {
@@ -67,7 +63,7 @@ fn resp_array_size(parts: &[Bytes]) -> usize {
 
 impl ServerContext {
     pub(crate) fn register_replica(&self, client_id: u64) {
-        let (tx, rx) = mpsc::channel(REPLICA_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::channel(self.replica_queue_capacity);
         self.replica_receivers.insert(client_id, Mutex::new(Some(rx)));
         self.replicas.insert(
             client_id,
@@ -118,7 +114,7 @@ impl ServerContext {
 
     fn push_replica(&self, client_id: u64, replica: &ReplicaState, value: Value, bytes: usize) {
         let current = replica.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if current.saturating_add(bytes) > REPLICA_QUEUE_MAX_BYTES {
+        if current.saturating_add(bytes) > self.replica_queue_max_bytes {
             replica.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
             self.slow_replicas.entry(client_id).or_insert_with(Instant::now);
             return;

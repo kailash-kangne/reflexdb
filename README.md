@@ -10,8 +10,9 @@ position. ReflexDB has not established a speed, memory, or cost advantage across
 production workloads. See
 [the product direction](docs/PRODUCT_DIRECTION.md) and [benchmark notes](docs/BENCHMARKS.md).
 
-RESP2/RESP3 compatibility is intended to make experiments easier; command and behavior coverage
-is limited and should be checked before use.
+RESP2/RESP3 compatibility is intended to make experiments easier; an optional binary wire
+format, [RFX](docs/RFX.md), is auto-detected per connection for clients that want it. Command
+and behavior coverage is limited and should be checked before use.
 
 Everything is original Rust code.
 
@@ -91,10 +92,12 @@ Then open `http://127.0.0.1:8080` and pick a workload tab.
 
 ### One real comparison so far
 
-On 2026-10-30, Redis, Dragonfly, and ReflexDB were tested with the same 2 GiB memory cap, 16
-clients, and workloads, running one engine at a time. Pipeline depth 16 delivered roughly 8–10×
-the throughput of depth 1. ReflexDB led two of four cases at 1 CPU; Redis led all four at 4 CPUs.
-Each case ran once, so repeat the test before drawing firm performance conclusions. See
+On 2026-11-01, Redis, Dragonfly, and ReflexDB were tested in Docker with the same 2 GiB memory
+cap, 16 clients, and workloads, running one engine at a time (median of 3 runs per case).
+Pipeline depth 16 delivered roughly 9–10× the throughput of depth 1. On an idle host ReflexDB
+led all eight cases; a second pass with an unrelated container stack running on the host split
+the lead 4–4 with Redis, all inside ~±15% of each other. Repeat the test before drawing firm
+performance conclusions. See
 [the benchmark setup and results](docs/BENCHMARKS.md#engine-shootout-reflexdb-vs-redis-vs-dragonfly).
 
 ### Where ReflexDB may fit better
@@ -108,7 +111,9 @@ when a workload needs them:
   application polling. Slow connections can miss intermediate updates; query reevaluation adds
   work to writes for watched keys.
 - **History:** optional disk-backed string versions support `GETAT` and `HISTORY` for inspection.
-  This is not a complete workflow checkpoint or rollback guarantee.
+  Age retention defaults to 24 hours (`history-retention-ms 0` disables age expiry); the per-key
+  cap defaults to 200 (`history-max-versions-per-key`). This is not a complete workflow
+  checkpoint or rollback guarantee.
 - **Persistence and replication:** compressed RDB/AOF files can reduce disk use; primary/replica
   replication supports `WAIT`/`WAITAOF` acknowledgements. Replication currently uses full resyncs.
 

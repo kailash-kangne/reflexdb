@@ -56,7 +56,7 @@ async fn handle_connection(
     masters: Arc<DashMap<String, Arc<MasterState>>>,
 ) -> std::io::Result<()> {
     let (read_half, mut write_half) = tokio::io::split(socket);
-    let mut reader = FramedRead::new(read_half, resp::RequestDecoder);
+    let mut reader = FramedRead::new(read_half, resp::RequestDecoder::default());
     let mut out = BytesMut::new();
 
     while let Some(frame) = reader.next().await {

@@ -1,4 +1,4 @@
-//! Disk-backed, time-retention store for `GETAT`/`HISTORY` (the per-key
+//! Disk-backed, bounded version store for `GETAT`/`HISTORY` (the per-key
 //! value version log — see `docs/11-time-travel.md` and
 //! `docs/18-interview-prep.md` §6 for the full design rationale). Replaces
 //! the earlier proof-of-concept, which kept every version in a plain
@@ -16,12 +16,12 @@
 //!   crate's keys (append-only + range-scan + time-based sweep, versions
 //!   deliberately outlive the live key, unlike a tiered key which is a
 //!   1:1 stand-in for it).
-//! - **Retention is by age (`sweep_older_than`), not by a per-key version
-//!   count.** A background tick (see `server/src/main.rs`) calls it
-//!   periodically with a cutoff derived from `history-retention-ms`. This
-//!   is also what fixes the old design's leak: a key's history ages out on
-//!   its own schedule, whether or not the live key still exists — no
-//!   per-delete/per-expire bookkeeping required.
+//! - History is bounded by both age (`history-retention-ms`) and a hard
+//!   per-key version cap (`history-max-versions-per-key`). A zero age
+//!   retention disables time-based expiry; the version cap still applies.
+//!   Age expiry runs in a periodic maintenance task, while count trimming
+//!   runs on the history writer thread. Limit changes compact old entries
+//!   in bounded batches.
 //! - **Writes are batched off the request path**, the same
 //!   dedicated-writer-thread-plus-channel shape as `crate::aof::AofWriter`:
 //!   `record()` just encodes a small job and pushes it to an
@@ -50,10 +50,11 @@
 //! can delete a `BY_TIME` entry and derive its matching `BY_KEY` entry's
 //! key directly from the bytes it already scanned, without an extra read.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use bytes::Bytes;
@@ -61,6 +62,11 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 
 const BY_KEY: u8 = 1;
 const BY_TIME: u8 = 2;
+const BY_COUNT: u8 = 3;
+const HISTORY_LIMIT_META: &[u8] = b"\0max_versions_per_key";
+const DEFAULT_MAX_VERSIONS_PER_KEY: usize = 200;
+const MAX_VERSIONS_PER_KEY: usize = 1_000_000;
+const COMPACT_BATCH: usize = 4096;
 
 /// One queued version append, handed to the writer thread.
 enum Job {
@@ -82,24 +88,53 @@ pub struct HistoryWriter {
     // `WriteBatch` (`Database::batch()`) without the writer thread's copy.
     db: Database,
     keyspace: Keyspace,
+    max_versions_per_key: usize,
+    write_lock: Arc<Mutex<()>>,
     // Keeps the writer thread alive for the program's lifetime.
     _worker: thread::JoinHandle<()>,
 }
 
 impl HistoryWriter {
     pub fn open(dir: &Path) -> io::Result<Self> {
+        Self::open_with_limit(dir, DEFAULT_MAX_VERSIONS_PER_KEY)
+    }
+
+    /// Open the disk history store and enforce a hard cap on the number of
+    /// versions retained per key. A limit change triggers a bounded-memory
+    /// compaction on the writer thread before it drains new record jobs.
+    pub fn open_with_limit(dir: &Path, max_versions_per_key: usize) -> io::Result<Self> {
+        if !(1..=MAX_VERSIONS_PER_KEY).contains(&max_versions_per_key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("history version limit must be between 1 and {MAX_VERSIONS_PER_KEY}"),
+            ));
+        }
         std::fs::create_dir_all(dir)?;
         let db = Database::builder(dir).open().map_err(io::Error::other)?;
         let keyspace =
             db.keyspace("reflexdb-history", KeyspaceCreateOptions::default).map_err(io::Error::other)?;
+        let limit_marker = keyspace.get(HISTORY_LIMIT_META).map_err(io::Error::other)?;
+        let expected_marker = (max_versions_per_key as u64).to_be_bytes();
+        let compact_on_start = limit_marker.as_deref() != Some(expected_marker.as_slice());
         let (tx, rx) = mpsc::sync_channel(4096);
         let worker_db = db.clone();
         let worker_keyspace = keyspace.clone();
+        let write_lock = Arc::new(Mutex::new(()));
+        let worker_write_lock = write_lock.clone();
         let worker = thread::Builder::new()
             .name("reflexdb-history-writer".into())
-            .spawn(move || writer_loop(worker_db, worker_keyspace, rx))
+            .spawn(move || {
+                writer_loop(
+                    worker_db,
+                    worker_keyspace,
+                    rx,
+                    max_versions_per_key,
+                    compact_on_start,
+                    worker_write_lock,
+                )
+            })
             .map_err(|e| io::Error::other(format!("failed to spawn history writer thread: {e}")))?;
-        Ok(Self { tx: Mutex::new(tx), db, keyspace, _worker: worker })
+        Ok(Self { tx: Mutex::new(tx), db, keyspace, max_versions_per_key, write_lock, _worker: worker })
     }
 
     /// Queue one version of `key` for the history log. Fire-and-forget —
@@ -134,7 +169,7 @@ impl HistoryWriter {
     /// was a delete / not a string.
     pub fn get_at(&self, db_index: usize, key: &[u8], ts_ms: u64) -> Option<Bytes> {
         let prefix = by_key_prefix(db_index as u16, key);
-        for guard in self.keyspace.prefix(&prefix).rev() {
+        for guard in self.keyspace.prefix(&prefix).rev().take(self.max_versions_per_key) {
             let Ok((full_key, value)) = guard.into_inner() else { continue };
             let Some(entry_ts) = parse_ts_suffix(&full_key, prefix.len()) else { continue };
             if entry_ts > ts_ms {
@@ -145,14 +180,14 @@ impl HistoryWriter {
         None
     }
 
-    /// Up to `limit` most recent `(ts_ms, value-or-none)` versions
-    /// recorded for `key`, newest first.
+    /// Up to `limit`, but never more than the configured per-key cap, most
+    /// recent `(ts_ms, value-or-none)` versions for `key`, newest first.
     pub fn history(&self, db_index: usize, key: &[u8], limit: usize) -> Vec<(u64, Option<Bytes>)> {
         let prefix = by_key_prefix(db_index as u16, key);
         self.keyspace
             .prefix(&prefix)
             .rev()
-            .take(limit)
+            .take(limit.min(self.max_versions_per_key))
             .filter_map(|guard| {
                 let (full_key, value) = guard.into_inner().ok()?;
                 let ts = parse_ts_suffix(&full_key, prefix.len())?;
@@ -168,6 +203,7 @@ impl HistoryWriter {
     /// removed. Meant to be called periodically from a background tick
     /// (`history-retention-ms`), not synchronously from a request.
     pub fn sweep_older_than(&self, cutoff_ms: u64) -> usize {
+        let _write_guard = self.write_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let lower = vec![BY_TIME];
         let mut upper = vec![BY_TIME];
         upper.extend_from_slice(&cutoff_ms.to_be_bytes());
@@ -184,10 +220,30 @@ impl HistoryWriter {
         }
 
         let mut batch = self.db.batch();
+        let mut decremented: HashMap<Vec<u8>, u64> = HashMap::new();
         for time_key in &stale {
             batch.remove(&self.keyspace, time_key.clone());
             if let Some(by_key) = by_time_to_by_key(time_key) {
+                if let Some(prefix) = by_key_prefix_from_full(&by_key) {
+                    *decremented.entry(by_count_key_from_prefix(prefix)).or_default() += 1;
+                }
                 batch.remove(&self.keyspace, by_key);
+            }
+        }
+        for (count_key, removed) in decremented {
+            let count = self
+                .keyspace
+                .get(&count_key)
+                .ok()
+                .flatten()
+                .and_then(|bytes| bytes.as_ref().try_into().ok().map(u64::from_be_bytes));
+            if let Some(count) = count {
+                let remaining = count.saturating_sub(removed);
+                if remaining == 0 {
+                    batch.remove(&self.keyspace, count_key);
+                } else {
+                    batch.insert(&self.keyspace, count_key, remaining.to_be_bytes());
+                }
             }
         }
         if let Err(e) = batch.commit() {
@@ -198,7 +254,20 @@ impl HistoryWriter {
     }
 }
 
-fn writer_loop(db: Database, keyspace: Keyspace, rx: Receiver<Job>) {
+fn writer_loop(
+    db: Database,
+    keyspace: Keyspace,
+    rx: Receiver<Job>,
+    max_versions_per_key: usize,
+    compact_on_start: bool,
+    write_lock: Arc<Mutex<()>>,
+) {
+    if compact_on_start {
+        if let Err(error) = compact_history(&db, &keyspace, max_versions_per_key, &write_lock) {
+            tracing::warn!(%error, "history version-limit compaction failed");
+        }
+    }
+
     while let Ok(first) = rx.recv() {
         const MAX_BATCH: usize = 1024;
         let mut jobs = Vec::with_capacity(MAX_BATCH.min(64));
@@ -208,25 +277,202 @@ fn writer_loop(db: Database, keyspace: Keyspace, rx: Receiver<Job>) {
             jobs.push(job);
         }
 
+        let _write_guard = write_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut batch = db.batch();
         let mut acks = Vec::new();
+        let mut pending_timestamps: HashMap<(u16, Bytes), HashSet<u64>> = HashMap::new();
         for job in jobs {
             match job {
                 Job::Record { db_index, key, ts_ms, value } => {
                     let payload = encode_value(value.as_ref());
+                    pending_timestamps.entry((db_index, key.clone())).or_default().insert(ts_ms);
                     batch.insert(&keyspace, by_key_full(db_index, &key, ts_ms), payload.clone());
                     batch.insert(&keyspace, by_time_full(db_index, &key, ts_ms), payload);
                 }
                 Job::Flush(ack) => acks.push(ack),
             }
         }
-        if let Err(e) = batch.commit() {
-            tracing::warn!(error = %e, "history writer thread failed to commit a batch");
+        let mut touched = Vec::with_capacity(pending_timestamps.len());
+        for ((db_index, key), timestamps) in pending_timestamps {
+            let mut count = read_count(&keyspace, db_index, &key);
+            for ts_ms in timestamps {
+                if keyspace.get(by_key_full(db_index, &key, ts_ms)).ok().flatten().is_none() {
+                    count = count.saturating_add(1);
+                }
+            }
+            batch.insert(&keyspace, by_count_key(db_index, &key), count.to_be_bytes());
+            touched.push((db_index, key, count));
+        }
+        match batch.commit() {
+            Ok(()) => {
+                for (db_index, key, count) in touched {
+                    if let Err(error) =
+                        trim_key_history(&db, &keyspace, db_index, &key, max_versions_per_key, count)
+                    {
+                        tracing::warn!(%error, db_index, key = ?key, "failed to enforce per-key history limit");
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "history writer thread failed to commit a batch"),
         }
         for ack in acks {
             let _ = ack.send(());
         }
     }
+}
+
+/// Compact legacy or over-limit history once when the configured cap changes.
+/// The rolling window bounds memory to `max_versions_per_key` entries while
+/// the on-disk indexes are removed in batches.
+fn compact_history(
+    db: &Database,
+    keyspace: &Keyspace,
+    max_versions_per_key: usize,
+    write_lock: &Mutex<()>,
+) -> io::Result<()> {
+    let _write_guard = write_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut current_prefix: Option<Vec<u8>> = None;
+    let mut retained = VecDeque::with_capacity(max_versions_per_key.min(1024));
+    let mut batch = db.batch();
+    let mut ops = 0usize;
+    let mut stale = 0usize;
+
+    for guard in keyspace.prefix([BY_KEY]) {
+        let Ok(raw_key) = guard.key() else { continue };
+        let full_key = raw_key.to_vec();
+        let Some(prefix) = by_key_prefix_from_full(&full_key) else { continue };
+        if current_prefix.as_deref() != Some(prefix) {
+            if let Some(previous) = current_prefix.take() {
+                batch.insert(
+                    keyspace,
+                    by_count_key_from_prefix(&previous),
+                    (retained.len() as u64).to_be_bytes(),
+                );
+                ops += 1;
+                if ops >= COMPACT_BATCH {
+                    batch.commit().map_err(io::Error::other)?;
+                    batch = db.batch();
+                    ops = 0;
+                }
+            }
+            current_prefix = Some(prefix.to_vec());
+            retained.clear();
+        }
+        retained.push_back(full_key);
+        if retained.len() > max_versions_per_key {
+            if let Some(oldest) = retained.pop_front() {
+                batch.remove(keyspace, oldest.clone());
+                if let Some(by_time) = by_key_to_by_time(&oldest) {
+                    batch.remove(keyspace, by_time);
+                }
+                stale += 1;
+                ops += 2;
+                if ops >= COMPACT_BATCH {
+                    batch.commit().map_err(io::Error::other)?;
+                    batch = db.batch();
+                    ops = 0;
+                }
+            }
+        }
+    }
+    if let Some(prefix) = current_prefix {
+        batch.insert(keyspace, by_count_key_from_prefix(&prefix), (retained.len() as u64).to_be_bytes());
+        batch.insert(keyspace, HISTORY_LIMIT_META, (max_versions_per_key as u64).to_be_bytes());
+        batch.commit().map_err(io::Error::other)?;
+    } else if stale > 0 {
+        batch.insert(keyspace, HISTORY_LIMIT_META, (max_versions_per_key as u64).to_be_bytes());
+        batch.commit().map_err(io::Error::other)?;
+    } else {
+        keyspace
+            .insert(HISTORY_LIMIT_META, (max_versions_per_key as u64).to_be_bytes())
+            .map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// Trim a key after its write batch commits. The common case removes only a
+/// small excess; chunking also bounds temporary memory when upgrading a key
+/// that accumulated many versions under an older configuration.
+fn trim_key_history(
+    db: &Database,
+    keyspace: &Keyspace,
+    db_index: u16,
+    key: &[u8],
+    max_versions_per_key: usize,
+    count: u64,
+) -> io::Result<()> {
+    if count <= max_versions_per_key as u64 {
+        return Ok(());
+    }
+    let prefix = by_key_prefix(db_index, key);
+    let count_key = by_count_key(db_index, key);
+    let mut remaining = count - max_versions_per_key as u64;
+    while remaining > 0 {
+        let stale: Vec<Vec<u8>> = keyspace
+            .prefix(&prefix)
+            .take(remaining.min(COMPACT_BATCH as u64) as usize)
+            .filter_map(|guard| guard.key().ok().map(|key| key.to_vec()))
+            .collect();
+        if stale.is_empty() {
+            break;
+        }
+        let mut batch = db.batch();
+        for by_key in &stale {
+            batch.remove(keyspace, by_key.clone());
+            if let Some(by_time) = by_key_to_by_time(by_key) {
+                batch.remove(keyspace, by_time);
+            }
+        }
+        remaining = remaining.saturating_sub(stale.len() as u64);
+        let retained_count = count.saturating_sub((count - max_versions_per_key as u64) - remaining);
+        batch.insert(keyspace, count_key.clone(), retained_count.to_be_bytes());
+        batch.commit().map_err(io::Error::other)?;
+    }
+    Ok(())
+}
+
+fn by_key_prefix_from_full(full_key: &[u8]) -> Option<&[u8]> {
+    if full_key.first() != Some(&BY_KEY) || full_key.len() < 15 {
+        return None;
+    }
+    let key_len = u32::from_be_bytes(full_key.get(3..7)?.try_into().ok()?) as usize;
+    let prefix_len = 7usize.checked_add(key_len)?;
+    (full_key.len() == prefix_len.checked_add(8)?).then_some(&full_key[..prefix_len])
+}
+
+fn by_count_key(db_index: u16, key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(1 + 2 + 4 + key.len());
+    out.push(BY_COUNT);
+    out.extend_from_slice(&db_index.to_be_bytes());
+    out.extend_from_slice(&(key.len() as u32).to_be_bytes());
+    out.extend_from_slice(key);
+    out
+}
+
+fn by_count_key_from_prefix(prefix: &[u8]) -> Vec<u8> {
+    let mut out = prefix.to_vec();
+    if let Some(tag) = out.first_mut() {
+        *tag = BY_COUNT;
+    }
+    out
+}
+
+fn read_count(keyspace: &Keyspace, db_index: u16, key: &[u8]) -> u64 {
+    keyspace
+        .get(by_count_key(db_index, key))
+        .ok()
+        .flatten()
+        .and_then(|bytes| bytes.as_ref().try_into().ok().map(u64::from_be_bytes))
+        .unwrap_or_else(|| keyspace.prefix(by_key_prefix(db_index, key)).count() as u64)
+}
+
+fn by_key_to_by_time(full_key: &[u8]) -> Option<Vec<u8>> {
+    let prefix = by_key_prefix_from_full(full_key)?;
+    let db_index = u16::from_be_bytes(full_key.get(1..3)?.try_into().ok()?);
+    let key_len = u32::from_be_bytes(full_key.get(3..7)?.try_into().ok()?) as usize;
+    let key = full_key.get(7..7 + key_len)?;
+    let ts_ms = parse_ts_suffix(full_key, prefix.len())?;
+    Some(by_time_full(db_index, key, ts_ms))
 }
 
 fn by_key_prefix(db_index: u16, key: &[u8]) -> Vec<u8> {
@@ -381,6 +627,64 @@ mod tests {
             let writer = HistoryWriter::open(&dir).unwrap();
             assert_eq!(writer.get_at(0, b"k", 200), Some(Bytes::from("v")));
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_key_version_cap_trims_the_oldest_versions() {
+        let dir = temp_dir("cap");
+        let writer = HistoryWriter::open_with_limit(&dir, 3).unwrap();
+
+        for ts in [100, 200, 300, 400, 500] {
+            writer.record(0, Bytes::from("k"), ts, Some(Bytes::from(format!("v{ts}"))));
+        }
+        writer.flush();
+
+        // Only the 3 most recent versions survive; both the forward-lookup
+        // (BY_KEY) and time-ordered (BY_TIME) indexes must agree.
+        assert_eq!(
+            writer.history(0, b"k", 10),
+            vec![
+                (500, Some(Bytes::from("v500"))),
+                (400, Some(Bytes::from("v400"))),
+                (300, Some(Bytes::from("v300"))),
+            ]
+        );
+        assert_eq!(writer.get_at(0, b"k", 200), None, "trimmed version must not be servable via GETAT");
+        assert_eq!(writer.get_at(0, b"k", 300), Some(Bytes::from("v300")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopening_with_a_lower_limit_compacts_existing_history() {
+        let dir = temp_dir("recompact");
+        {
+            let writer = HistoryWriter::open_with_limit(&dir, 10).unwrap();
+            for ts in [100, 200, 300, 400, 500] {
+                writer.record(0, Bytes::from("k"), ts, Some(Bytes::from(format!("v{ts}"))));
+            }
+            writer.flush();
+            assert_eq!(writer.history(0, b"k", 10).len(), 5);
+        }
+        {
+            // Reopening with a tighter cap must retroactively trim the
+            // already-written versions down to the new limit.
+            let writer = HistoryWriter::open_with_limit(&dir, 2).unwrap();
+            writer.flush();
+            assert_eq!(
+                writer.history(0, b"k", 10),
+                vec![(500, Some(Bytes::from("v500"))), (400, Some(Bytes::from("v400")))]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_version_limit() {
+        let dir = temp_dir("bad-limit");
+        assert!(HistoryWriter::open_with_limit(&dir, 0).is_err());
+        assert!(HistoryWriter::open_with_limit(&dir, 1_000_001).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

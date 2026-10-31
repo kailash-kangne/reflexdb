@@ -13,8 +13,6 @@ use tokio_util::codec::FramedRead;
 
 use reflexdb_server::config::Config;
 
-const MAX_CONNECTIONS: usize = 10_000;
-
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt::init();
@@ -53,10 +51,21 @@ async fn main() -> std::io::Result<()> {
         .with_tiered_disk_limit(cfg.tiered_storage.then_some(cfg.tiered_disk_limit).flatten())
         .with_slowlog(cfg.slowlog_log_slower_than_us, cfg.slowlog_max_len)
         .with_singleflight_max_wait(Duration::from_millis(cfg.singleflight_max_wait_ms))
-        .with_notify_keyspace_events(commands::NotifyFlags::parse(&cfg.notify_keyspace_events));
+        .with_notify_keyspace_events(commands::NotifyFlags::parse(&cfg.notify_keyspace_events))
+        .with_proto_max_bulk_len(cfg.proto_max_bulk_len)
+        .with_eviction_tuning(cfg.eviction_low_watermark, cfg.max_evictions_per_tick)
+        .with_replica_backpressure(
+            cfg.replica_backlog_size,
+            cfg.replica_backlog_max_bytes,
+            Duration::from_millis(cfg.replica_slow_disconnect_ms),
+        )
+        .with_live_pacing(cfg.live_sweep_ms, cfg.live_pace_chunk, cfg.live_pace_ms);
 
     if cfg.history_enabled {
-        match persistence::history::HistoryWriter::open(&cfg.history_dir_path()) {
+        match persistence::history::HistoryWriter::open_with_limit(
+            &cfg.history_dir_path(),
+            cfg.history_max_versions_per_key,
+        ) {
             Ok(writer) => ctx = ctx.with_history(writer),
             Err(e) => tracing::warn!(error = %e, "failed to open history store; GETAT/HISTORY disabled"),
         }
@@ -93,6 +102,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let ctx = Arc::new(ctx);
+    ctx.bind_live_fanout();
 
     // Background active-expire cycle, sampling a bounded number of keys.
     // The same tick also refreshes the `maxmemory` estimate and evicts keys
@@ -121,12 +131,12 @@ async fn main() -> std::io::Result<()> {
 
     // Periodic `GETAT`/`HISTORY` retention sweep: reclaims every recorded
     // version older than `history-retention-ms`, regardless of whether its
-    // live key still exists (see `persistence::history`'s module docs —
-    // this is what bounds the store's size, replacing the old in-RAM
-    // per-key version cap). A coarse interval is fine: unlike active
+    // live key still exists. A zero retention disables age expiry; the
+    // configured per-key version cap still applies. A coarse interval is
+    // fine: unlike active
     // expiry, nothing is waiting on this to free up a hot key. No-op
     // (and basically free) while `history-enabled no`.
-    if cfg.history_enabled {
+    if cfg.history_enabled && cfg.history_retention_ms > 0 {
         let ctx = ctx.clone();
         let retention_ms = cfg.history_retention_ms;
         tokio::spawn(async move {
@@ -191,7 +201,7 @@ async fn main() -> std::io::Result<()> {
         );
     }
 
-    let connection_slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let connection_slots = Arc::new(Semaphore::new(cfg.maxclients));
     if cfg.tls_port != 0 {
         match (&cfg.tls_cert_file, &cfg.tls_key_file) {
             (Some(cert), Some(key)) => match tls::build_acceptor(cert, key) {
@@ -292,11 +302,19 @@ async fn handle_connection<S>(ctx: Arc<ServerContext>, stream: S) -> std::io::Re
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    let mut reader = FramedRead::new(read_half, resp::RequestDecoder);
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut reader =
+        FramedRead::new(read_half, resp::RequestDecoder::with_max_bulk_len(ctx.proto_max_bulk_len));
 
     let (id, mut pushes) = ctx.register_client();
-    let mut live_events = ctx.subscribe_live_events();
+    // The socket stays owned by this task until the client takes out a
+    // `LIVE` subscription — only then does it move into the shared writer
+    // the live-fanout thread `try_lock`s, so plain clients keep the direct
+    // `write_all` fast path (no mutex + no `dyn` per reply). `push_live`
+    // falls back to the `pushes` queue while no writer is attached, so a
+    // subscriber can't miss pushes in the gap.
+    let mut write_half = Some(write_half);
+    let mut writer: Option<Arc<commands::ClientWriter>> = None;
     let _guard = ClientGuard { ctx: ctx.clone(), id };
 
     let mut state = ClientState::with_id(id, ctx.requirepass.is_some());
@@ -304,6 +322,16 @@ where
     let mut replica_pushes: Option<tokio::sync::mpsc::Receiver<commands::ReplicaMessage>> = None;
 
     loop {
+        // Hand the socket to the shared writer once this client has LIVE
+        // subscriptions — the only client type the fan-out thread pushes to.
+        if writer.is_none() && !state.live_fingerprints.is_empty() {
+            let w = ctx.attach_writer(
+                id,
+                write_half.take().expect("write half is moved into the writer exactly once"),
+            );
+            w.note_format(state.wire, state.protocol);
+            writer = Some(w);
+        }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(25)), if ctx.is_slow_client(id) && !ctx.has_replica_client(id) => {
                 return Ok(());
@@ -312,44 +340,56 @@ where
                 tracing::debug!(client_id = id, "disconnecting replica after its output buffer overflowed");
                 return Ok(());
             }
-            // Pub/Sub message pushed from another connection.
+            // Out-of-band pushes: pub/sub messages (encoded per this
+            // connection's protocol) and `LIVE` updates (already encoded
+            // once per wire variant — just pick the matching bytes). The
+            // queue is bounded; overflow flags the client slow instead of
+            // growing memory, same as pub/sub.
             Some(push) = pushes.recv() => {
                 out.clear();
-                resp::encode_reply(push.as_ref(), state.protocol, &mut out);
-                write_half.write_all(&out).await?;
+                let mut push = Some(push);
+                // Drain whatever else is already queued — one syscall for
+                // the whole batch instead of one per push.
+                while let Some(p) = push.take() {
+                    match p {
+                        commands::ClientPush::Value(value) => {
+                            encode_out(&value, &state, &mut out);
+                        }
+                        commands::ClientPush::Live(encoded) => {
+                            out.extend_from_slice(encoded.for_wire(state.wire, state.protocol));
+                        }
+                    }
+                    push = pushes.try_recv().ok();
+                }
+                flush(&mut writer, &mut write_half, &out).await?;
             }
             replica_push = next_replica_push(&mut replica_pushes) => {
                 if let Some(push) = replica_push {
                     out.clear();
-                    resp::encode_reply(push.value.as_ref(), state.protocol, &mut out);
-                    write_half.write_all(&out).await?;
+                    encode_out(push.value.as_ref(), &state, &mut out);
+                    // Same batching: pull any already-queued replication
+                    // frames into this one write.
+                    while let Ok(next) = replica_pushes.as_mut().unwrap().try_recv() {
+                        encode_out(next.value.as_ref(), &state, &mut out);
+                    }
+                    flush(&mut writer, &mut write_half, &out).await?;
                 } else {
                     return Ok(());
                 }
             }
-            // One of this connection's own `LIVE` subscriptions changed —
-            // fetch its latest cached result and push it. `ctx.live_events`
-            // only carries a fingerprint (cheap to broadcast on every
-            // write); a connection lagging behind a write burst just skips
-            // the intermediate values it missed, since every fingerprint
-            // resolves to whatever is currently cached, not a queued diff.
-            Ok(fp) = live_events.recv(), if !state.live_fingerprints.is_empty() => {
-                if state.live_fingerprints.contains(&fp) {
-                    if let Some(value) = ctx.latest_live_value(fp) {
-                        out.clear();
-                        resp::encode_reply(value.as_ref(), state.protocol, &mut out);
-                        write_half.write_all(&out).await?;
-                    }
-                }
-            }
+            // `LIVE` pushes arrive on the shared `pushes` queue above.
             frame = tokio_stream_next(&mut reader) => {
                 let req = match frame {
                     Some(Ok(req)) => req,
                     Some(Err(e)) => {
+                        state.wire = reader.decoder().wire();
+                        if let Some(w) = &writer {
+                            w.note_format(state.wire, state.protocol);
+                        }
                         let value = resp::Value::error(format!("ERR Protocol error: {e}"));
                         out.clear();
-                        resp::encode_reply(&value, state.protocol, &mut out);
-                        write_half.write_all(&out).await?;
+                        encode_out(&value, &state, &mut out);
+                        flush(&mut writer, &mut write_half, &out).await?;
                         return Ok(());
                     }
                     None => return Ok(()),
@@ -383,42 +423,46 @@ where
                         if is_psync {
                             replica_pushes = ctx.take_replica_receiver(id);
                         }
+                        state.wire = reader.decoder().wire();
+                        if let Some(w) = &writer {
+                            w.note_format(state.wire, state.protocol);
+                        }
                         match outcome {
-                            Outcome::Reply(value) => resp::encode_reply(&value, state.protocol, &mut out),
+                            Outcome::Reply(value) => encode_out(&value, &state, &mut out),
                             Outcome::Multi(values) => {
                                 for value in &values {
-                                    resp::encode_reply(value, state.protocol, &mut out);
+                                    encode_out(value, &state, &mut out);
                                 }
                             }
                             Outcome::CloseConnection(value) => {
-                                resp::encode_reply(&value, state.protocol, &mut out);
-                                write_half.write_all(&out).await?;
+                                encode_out(&value, &state, &mut out);
+                                flush(&mut writer, &mut write_half, &out).await?;
                                 return Ok(());
                             }
                             Outcome::SingleFlightWait(lease) => {
-                                write_half.write_all(&out).await?;
+                                flush(&mut writer, &mut write_half, &out).await?;
                                 out.clear();
                                 let req_for_retry = req_for_retry
                                     .expect("SingleFlightWait only returned for commands might_need_retry covers");
                                 let value = resolve_singleflight(&ctx, &mut state, req_for_retry, lease).await;
-                                resp::encode_reply(&value, state.protocol, &mut out);
+                                encode_out(&value, &state, &mut out);
                             }
                             // `REPLCONF ACK` — deliberately no reply; see `Outcome::NoReply`'s docs.
                             Outcome::NoReply => {}
                             Outcome::WaitForReplicas { numreplicas, target_offset, timeout, numlocal } => {
-                                write_half.write_all(&out).await?;
+                                flush(&mut writer, &mut write_half, &out).await?;
                                 out.clear();
                                 let value = resolve_wait(&ctx, numreplicas, target_offset, timeout, numlocal).await;
-                                resp::encode_reply(&value, state.protocol, &mut out);
+                                encode_out(&value, &state, &mut out);
                             }
                             Outcome::BlockWait { deadline, on_timeout } => {
-                                write_half.write_all(&out).await?;
+                                flush(&mut writer, &mut write_half, &out).await?;
                                 out.clear();
                                 let req_for_retry = req_for_retry
                                     .expect("BlockWait only returned for commands might_need_retry covers");
                                 let deadline = deadline.map(tokio::time::Instant::from_std);
                                 let value = resolve_block_wait(&ctx, &mut state, req_for_retry, deadline, on_timeout).await;
-                                resp::encode_reply(&value, state.protocol, &mut out);
+                                encode_out(&value, &state, &mut out);
                             }
                         }
                     }
@@ -429,8 +473,12 @@ where
                     match try_poll_frame(&mut reader) {
                         PolledFrame::Ready(Ok(more)) => next = Some(more),
                         PolledFrame::Ready(Err(e)) => {
+                            state.wire = reader.decoder().wire();
+                            if let Some(w) = &writer {
+                                w.note_format(state.wire, state.protocol);
+                            }
                             let value = resp::Value::error(format!("ERR Protocol error: {e}"));
-                            resp::encode_reply(&value, state.protocol, &mut out);
+                            encode_out(&value, &state, &mut out);
                             eof = true;
                         }
                         PolledFrame::Eof => eof = true,
@@ -438,12 +486,42 @@ where
                     }
                 }
 
-                write_half.write_all(&out).await?;
+                flush(&mut writer, &mut write_half, &out).await?;
                 if eof {
                     return Ok(());
                 }
             }
         }
+    }
+}
+
+/// Encodes a reply in whichever wire format this connection negotiated —
+/// RFX binary once the decoder latched `!`-framed requests, RESP
+/// (respecting the `HELLO`-negotiated version) otherwise.
+fn encode_out(value: &resp::Value, state: &ClientState, out: &mut BytesMut) {
+    match state.wire {
+        resp::Wire::Rfx => resp::encode_rfx_reply(value, out),
+        resp::Wire::Resp => resp::encode_reply(value, state.protocol, out),
+    }
+}
+
+/// Flushes `bytes` to the client: a direct write while the connection
+/// still owns its socket half, a locked shared-writer write once it's
+/// attached — the `live-fanout` thread `try_lock`s the same mutex for
+/// direct LIVE pushes, so reply and push bytes can never interleave
+/// mid-frame.
+async fn flush<S>(
+    writer: &mut Option<Arc<commands::ClientWriter>>,
+    write_half: &mut Option<tokio::io::WriteHalf<S>>,
+    bytes: &[u8],
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Send + Unpin + 'static,
+{
+    match (writer, write_half) {
+        (Some(w), _) => w.w.lock().await.write_all(bytes).await,
+        (None, Some(h)) => h.write_all(bytes).await,
+        (None, None) => unreachable!("write half is moved into the writer exactly once"),
     }
 }
 

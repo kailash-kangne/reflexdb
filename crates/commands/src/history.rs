@@ -18,7 +18,7 @@ const HISTORY_DISABLED: &str = "ERR history is disabled — set `history-enabled
 /// `GETAT key ms-epoch` — the string value `key` held at or before the
 /// given Unix-epoch-milliseconds timestamp. Replies `NullBulk` if the key
 /// didn't exist yet, was deleted, was never a string, or predates the
-/// oldest version `history-retention-ms` has kept.
+/// oldest version kept by age retention or the per-key version limit.
 pub fn cmd_getat(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let [key, ts] = args else { return wrong_args("getat") };
     let Some(writer) = &ctx.history else { return err(HISTORY_DISABLED) };

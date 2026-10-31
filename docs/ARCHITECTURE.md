@@ -79,7 +79,9 @@ victim; LRU/LFU/TTL policies preserve their ordering.
   New AOFs store independently compressed writer batches; the loader accepts legacy RESP-only
   logs, which are upgraded when `BGREWRITEAOF` replaces them.
 - `GETAT`/`HISTORY` versions go through the same fire-and-forget-to-a-writer-thread shape, on
-  `fjall` (`persistence::history::HistoryWriter`).
+  `fjall` (`persistence::history::HistoryWriter`). Age retention defaults to 24 hours (`0`
+  disables it); the writer maintains a configurable per-key cap (default 200). Changing the cap
+  compacts existing history on the writer thread in bounded batches.
 
 ## Tiered storage
 
@@ -113,12 +115,20 @@ must full-resync.
    reply includes the fingerprint for later `UNLIVE`.
 3. Subscription registered in `live_subs: fingerprint -> {db, cmd, watched_key, clients}` and
    `key_watchers: (db, key) -> {fingerprints}`.
-4. A write looks up matching fingerprints and synchronously re-runs each inner command on the
-   write path. It replaces the cached latest result and broadcasts the fingerprint on one
-   server-wide, 1,024-item event bus. Each interested connection task reads the latest result and
-   writes it to its socket. Slow connections can skip intermediate states when they lag the event
-   bus. Pub/sub and tracking use a separate 1,024-item outbound push queue, whose overflow marks a
-   client for disconnect after 25 ms.
+4. A write enqueues a `LiveWake` (deduplicated per (db, key) — a write burst collapses to one
+   re-eval per drain) and a dedicated `live-fanout` thread does the re-evaluation: it re-runs
+   each matching fingerprint's inner command, caches the latest result, pre-encodes the push
+   once per wire variant (RESP2/RESP3/RFX), then `try_lock`s each subscribed connection's shared
+   socket writer and `poll_write`s the bytes directly — no per-subscriber task wakeup. A
+   contended or missing writer falls back to the client's bounded push queue. After each drain
+   the thread idles `live-sweep-ms` (default 10 ms), so writes landing in the gap coalesce into
+   the next batch, and every `live-pace-chunk` socket writes inside a sweep it yields
+   `live-pace-ms` — that's what keeps a 1,000-subscriber key writable (~1.1k writes/s in Docker
+   benchmarks) instead of collapsing the writer behind a syscall herd. The shared writer
+   only exists once a connection has a LIVE subscription; plain connections keep a direct
+   `write_all` reply path. Slow connections can skip intermediate states; a stalled socket marks
+   the client slow and it is disconnected after 25 ms. Pub/sub and tracking use a separate
+   1,024-item outbound push queue, whose overflow marks a client for disconnect after 25 ms.
 
 Re-execution, not incremental diffing — a fast bail-out (`key_watchers_len: AtomicUsize`)
 means zero extra cost on the write path when nobody's subscribed. Work scales with distinct
@@ -138,7 +148,7 @@ miss instead of blocking (no `.await` point available in that recursive context)
 RESP2 (default) and RESP3 (`HELLO 3`). Pipelining: the connection loop drains everything already
 buffered from one `read(2)` before a single `write_all`, so a pipelined burst of N commands
 becomes one syscall instead of N (with `TCP_NODELAY`). Protocol limits in
-`crates/resp/src/codec.rs`: `MAX_MULTIBULK_COUNT` (1M) and `MAX_BULK_LEN` (512MB) cap declared
+`crates/resp/src/codec.rs`: `MAX_MULTIBULK_COUNT` (1M) and `MAX_BULK_LEN` (64 MiB) cap declared
 lengths before any allocation happens, so a bare `*99999999999\r\n` can't make the decoder try
 to allocate gigabytes.
 

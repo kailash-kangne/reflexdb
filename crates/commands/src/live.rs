@@ -3,15 +3,31 @@
 //! key it reads changes. See `docs/04-reactivity-live.md`.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use crc::{Crc, CRC_64_XZ};
-use resp::{Request, Value};
+use resp::{Protocol, Request, Value, Wire};
 
 use crate::dispatch::{dispatch, err, reply, wrong_args, ClientState, Outcome, ServerContext};
 
 const FINGERPRINT: Crc<u64> = Crc::<u64>::new(&CRC_64_XZ);
+
+/// Idle gap between fan-out sweeps: writes arriving during it pile into
+/// `dirty` and dedup into the next batch for free, so a sustained write
+/// stream coalesces to ~1/`SWEEP` re-evals per second instead of running
+/// back-to-back sweeps. Only throttles under load — the first wake after
+/// an idle period is still delivered immediately (the thread was parked
+/// on the condvar, not sleeping). `live-sweep-ms` config default.
+pub(crate) const SWEEP: Duration = Duration::from_millis(10);
+/// Every `PACE_CHUNK` socket writes inside one sweep the fan-out thread
+/// yields `PACE`, spreading a 1000-subscriber burst into ~1ms slices so
+/// writers never queue behind a syscall herd. `live-pace-chunk`/
+/// `live-pace-ms` config defaults; `PACE_CHUNK == 0` disables pacing.
+pub(crate) const PACE_CHUNK: usize = 64;
+pub(crate) const PACE: Duration = Duration::from_millis(1);
 
 /// A registered `LIVE` subscription: which read-only command to re-run, the
 /// single key it depends on, which DB it runs against, and which connected
@@ -21,7 +37,117 @@ pub struct LiveSub {
     pub inner_req: Request,
     pub key: Bytes,
     pub clients: HashSet<u64>,
+    /// The last pushed reply as a `Value` (inspection/tests).
     pub latest: Arc<Value>,
+    /// The same reply pre-encoded once per wire variant — without this every
+    /// subscriber connection re-encodes identical bytes on every push (N
+    /// encodes of the same `Value` per write, which dominated fan-out cost
+    /// at high subscriber counts).
+    pub encoded: Arc<LiveEncoded>,
+}
+
+/// One LIVE push reply, encoded once for each reply format a subscriber
+/// connection might have negotiated.
+pub struct LiveEncoded {
+    pub resp2: Bytes,
+    pub resp3: Bytes,
+    pub rfx: Bytes,
+}
+
+impl LiveEncoded {
+    fn of(value: &Value) -> Self {
+        let mut resp2 = BytesMut::new();
+        resp::encode_reply(value, Protocol::Resp2, &mut resp2);
+        let mut resp3 = BytesMut::new();
+        resp::encode_reply(value, Protocol::Resp3, &mut resp3);
+        let mut rfx = BytesMut::new();
+        resp::encode_rfx_reply(value, &mut rfx);
+        Self { resp2: resp2.freeze(), resp3: resp3.freeze(), rfx: rfx.freeze() }
+    }
+
+    pub fn for_wire(&self, wire: Wire, proto: Protocol) -> &Bytes {
+        match (wire, proto) {
+            (Wire::Rfx, _) => &self.rfx,
+            (Wire::Resp, Protocol::Resp3) => &self.resp3,
+            _ => &self.resp2,
+        }
+    }
+}
+
+/// A unit of fan-out work: re-evaluate subscriptions watching one changed
+/// key, or (after `FLUSHDB`) every subscription in a database.
+#[derive(Hash, PartialEq, Eq)]
+pub(crate) enum LiveWake {
+    Key(usize, Bytes),
+    FlushDb(usize),
+}
+
+/// Off-loads LIVE re-evaluation + broadcast from the write path. Writers
+/// just enqueue a `LiveWake` (deduplicated by the `HashSet` — a burst of
+/// writes to one key collapses to one re-eval per drain); a dedicated
+/// thread does the query re-runs and `live_events.send`, which wakes every
+/// receiver *on that thread* instead of on the writer's. Previously both
+/// ran inside the writing client's `dispatch()`, so write latency on a
+/// watched key scaled with subscriber count.
+pub(crate) struct LiveFanout {
+    dirty: std::sync::Mutex<HashSet<LiveWake>>,
+    cv: std::sync::Condvar,
+    spawned: std::sync::Once,
+    shutdown: AtomicBool,
+}
+
+impl LiveFanout {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            dirty: std::sync::Mutex::new(HashSet::new()),
+            cv: std::sync::Condvar::new(),
+            spawned: std::sync::Once::new(),
+            shutdown: AtomicBool::new(false),
+        })
+    }
+
+    fn spawn(self: &Arc<Self>, ctx: Weak<ServerContext>) {
+        self.spawned.call_once(|| {
+            let fanout = self.clone();
+            std::thread::Builder::new()
+                .name("live-fanout".into())
+                .spawn(move || fanout_loop(ctx, fanout))
+                .expect("spawn live-fanout thread");
+        });
+    }
+
+    fn enqueue(self: &Arc<Self>, ctx: Weak<ServerContext>, wake: LiveWake) {
+        self.spawn(ctx);
+        self.dirty.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(wake);
+        self.cv.notify_one();
+    }
+
+    pub(crate) fn stop(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
+        self.cv.notify_all();
+    }
+}
+
+fn fanout_loop(ctx: Weak<ServerContext>, fanout: Arc<LiveFanout>) {
+    loop {
+        let batch: Vec<LiveWake> = {
+            let mut dirty = fanout.dirty.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            loop {
+                if !dirty.is_empty() {
+                    break dirty.drain().collect();
+                }
+                if fanout.shutdown.load(Ordering::Relaxed) {
+                    return;
+                }
+                dirty = fanout.cv.wait(dirty).unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        let Some(ctx) = ctx.upgrade() else { return };
+        for wake in batch {
+            ctx.run_live_wake(wake);
+        }
+        std::thread::sleep(ctx.live_sweep);
+    }
 }
 
 /// Read-only commands allowed as a `LIVE` handler. Each one takes the
@@ -110,7 +236,15 @@ pub fn cmd_live(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) ->
     };
 
     let initial = Arc::new(push_value(&fp_hex, initial));
-    ctx.live_subscribe(fp, state.db_index, inner_req, key.clone(), state.id, initial.clone());
+    ctx.live_subscribe(
+        fp,
+        state.db_index,
+        inner_req,
+        key.clone(),
+        state.id,
+        initial.clone(),
+        Arc::new(LiveEncoded::of(&initial)),
+    );
     state.live_fingerprints.insert(fp);
     state.subscriptions += 1;
 
@@ -180,13 +314,27 @@ fn push_live_update(ctx: &ServerContext, fp: u64) {
     };
     let fp_hex = format!("{fp:016x}");
     let latest = Arc::new(push_value(&fp_hex, result));
-    if let Some(mut sub) = ctx.live_subs.get_mut(&fp) {
+    let encoded = Arc::new(LiveEncoded::of(&latest));
+    // Copy the client list out before pacing — a 1000-subscriber sweep takes
+    // ~16ms+ with pacing, and `get_mut` would hold the `live_subs` shard lock
+    // against subscribe/unlive the whole time.
+    let clients: Vec<u64> = {
+        let Some(mut sub) = ctx.live_subs.get_mut(&fp) else { return };
         sub.latest = latest;
+        sub.encoded = encoded.clone();
         let _ = ctx.live_events.send(fp);
+        sub.clients.iter().copied().collect()
+    };
+    for (i, client_id) in clients.into_iter().enumerate() {
+        if ctx.live_pace_chunk != 0 && i % ctx.live_pace_chunk == 0 && i > 0 {
+            std::thread::sleep(ctx.live_pace);
+        }
+        ctx.push_live(client_id, encoded.clone());
     }
 }
 
 impl ServerContext {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn live_subscribe(
         &self,
         fingerprint: u64,
@@ -195,6 +343,7 @@ impl ServerContext {
         key: Bytes,
         client_id: u64,
         initial: Arc<Value>,
+        encoded: Arc<LiveEncoded>,
     ) {
         self.live_subs
             .entry(fingerprint)
@@ -204,6 +353,7 @@ impl ServerContext {
                 key: key.clone(),
                 clients: HashSet::new(),
                 latest: initial,
+                encoded,
             })
             .clients
             .insert(client_id);
@@ -215,6 +365,38 @@ impl ServerContext {
             dashmap::mapref::entry::Entry::Occupied(mut slot) => {
                 slot.get_mut().insert(fingerprint);
             }
+        }
+    }
+
+    /// Called once by the server after it wraps the context in an `Arc` —
+    /// enables the async fan-out path (see `LiveFanout`). Contexts that are
+    /// never wrapped (unit tests dispatching directly) stay on the
+    /// synchronous fallback in `enqueue_live_wake`, preserving pre-existing
+    /// semantics there.
+    pub fn bind_live_fanout(self: &Arc<Self>) {
+        let _ = self.live_self.set(Arc::downgrade(self));
+    }
+
+    /// Writer-side LIVE notification: `O(1)` — inserts the wake into the
+    /// deduplicating dirty set and pokes the fan-out thread. Without a bound
+    /// `Arc` owner (tests) the wake is processed inline, exactly as before.
+    pub(crate) fn enqueue_live_wake(&self, wake: LiveWake) {
+        // With zero LIVE subscribers a wake can only be discarded anyway —
+        // don't pay a global mutex + hash insert + futex wake per write.
+        if self.key_watchers_len.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        if let Some(weak) = self.live_self.get() {
+            self.live_fanout.enqueue(weak.clone(), wake);
+        } else {
+            self.run_live_wake(wake);
+        }
+    }
+
+    pub(crate) fn run_live_wake(&self, wake: LiveWake) {
+        match wake {
+            LiveWake::Key(db_index, key) => notify_key_change(self, db_index, key),
+            LiveWake::FlushDb(db_index) => notify_flush(self, db_index),
         }
     }
 

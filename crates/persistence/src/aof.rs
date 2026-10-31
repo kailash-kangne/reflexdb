@@ -261,6 +261,9 @@ pub fn build_rewrite_base(store: &Store) -> Vec<u8> {
 fn reconstruct_commands(key: &Bytes, value: &Value) -> Vec<Vec<Bytes>> {
     match value {
         Value::String(s) => vec![vec![Bytes::from_static(b"SET"), key.clone(), s.clone()]],
+        Value::Int(i) => {
+            vec![vec![Bytes::from_static(b"SET"), key.clone(), Bytes::from(i.to_string())]]
+        }
         Value::List(list) => {
             if list.is_empty() {
                 return Vec::new();
@@ -602,7 +605,7 @@ pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
         data
     };
     let mut buf = BytesMut::from(&data[..]);
-    let mut decoder = resp::RequestDecoder;
+    let mut decoder = resp::RequestDecoder::default();
     let mut requests = Vec::new();
     loop {
         match decoder.decode(&mut buf) {

@@ -14,28 +14,26 @@ use crate::range::{normalize, parse_i64};
 
 pub fn cmd_append(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let [key, suffix] = args else { return wrong_args("append") };
-    const MAX_STRING_SIZE: usize = 64 * 1024 * 1024;
+    let max_string_size = ctx.proto_max_bulk_len;
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let key = key.clone();
 
     let result = db.with_entry_mut(
         key.clone(),
         || KVal::String(Bytes::new()),
-        |v| match v {
-            KVal::String(s) => {
-                let Some(new_len) = s.len().checked_add(suffix.len()) else {
-                    return Err(AppendError::TooLarge);
-                };
-                if new_len > MAX_STRING_SIZE {
-                    return Err(AppendError::TooLarge);
-                }
-                let mut buf = Vec::with_capacity(new_len);
-                buf.extend_from_slice(s);
-                buf.extend_from_slice(suffix);
-                *s = Bytes::from(buf);
-                Ok(s.len())
+        |v| {
+            let Some(s) = v.string_bytes_mut() else { return Err(AppendError::WrongType) };
+            let Some(new_len) = s.len().checked_add(suffix.len()) else {
+                return Err(AppendError::TooLarge);
+            };
+            if new_len > max_string_size {
+                return Err(AppendError::TooLarge);
             }
-            _ => Err(AppendError::WrongType),
+            let mut buf = Vec::with_capacity(new_len);
+            buf.extend_from_slice(s);
+            buf.extend_from_slice(suffix);
+            *s = Bytes::from(buf);
+            Ok(s.len())
         },
     );
 
@@ -69,15 +67,19 @@ fn incr_by(ctx: &ServerContext, state: &ClientState, key: &Bytes, delta: i64, ev
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let result = db.with_entry_mut(
         key.clone(),
-        || KVal::String(Bytes::from_static(b"0")),
+        || KVal::Int(0),
         |v| match v {
+            KVal::Int(i) => {
+                *i = i.checked_add(delta).ok_or(IncrError::Overflow)?;
+                Ok(*i)
+            }
             KVal::String(s) => {
                 let current: i64 = match std::str::from_utf8(s).ok().and_then(|x| x.parse().ok()) {
                     Some(n) => n,
                     None => return Err(IncrError::NotAnInteger),
                 };
                 let next = current.checked_add(delta).ok_or(IncrError::Overflow)?;
-                *s = Bytes::from(next.to_string());
+                *v = KVal::Int(next);
                 Ok(next)
             }
             _ => Err(IncrError::WrongType),
@@ -134,10 +136,7 @@ pub fn cmd_getdel(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     let db = ctx.store.db(state.db_index).expect("valid db index");
     // `with_value`, not `get`: avoid cloning a potentially huge
     // List/Hash/Set/ZSet just to discover it's the wrong type.
-    match db.with_value(key, |v| match v {
-        KVal::String(s) => Ok(s.clone()),
-        _ => Err(()),
-    }) {
+    match db.with_value(key, |v| v.string_bytes().ok_or(())) {
         Some(Ok(s)) => {
             db.del(std::slice::from_ref(key));
             on_key_changed(ctx, state.db_index, key.clone());
@@ -156,14 +155,12 @@ pub fn cmd_getset(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     let result = db.with_entry_mut_expiry(
         key.clone(),
         || KVal::String(Bytes::new()),
-        |value, expires_at, was_present| match value {
-            KVal::String(current) => {
-                let previous = was_present.then(|| current.clone());
-                *current = replacement.clone();
-                *expires_at = None;
-                Ok(previous)
-            }
-            _ => Err(()),
+        |value, expires_at, was_present| {
+            let Some(current) = value.string_bytes_mut() else { return Err(()) };
+            let previous = was_present.then(|| current.clone());
+            *current = replacement.clone();
+            *expires_at = None;
+            Ok(previous)
         },
     );
     match result {
@@ -235,17 +232,14 @@ pub fn cmd_getex(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Ou
 
     let key = args[0].clone();
     let db = ctx.store.db(state.db_index).expect("valid db index");
-    let result = db.with_existing_entry_mut_expiry(&key, |value, expires_at| match value {
-        KVal::String(current) => {
-            let result = current.clone();
-            match expiry {
-                GetExExpiry::Unchanged => {}
-                GetExExpiry::Persist => *expires_at = None,
-                GetExExpiry::At(at) => *expires_at = Some(at),
-            }
-            Ok(result)
+    let result = db.with_existing_entry_mut_expiry(&key, |value, expires_at| {
+        let Some(current) = value.string_bytes() else { return Err(()) };
+        match expiry {
+            GetExExpiry::Unchanged => {}
+            GetExExpiry::Persist => *expires_at = None,
+            GetExExpiry::At(at) => *expires_at = Some(at),
         }
-        _ => Err(()),
+        Ok(current)
     });
     match result {
         Some(Ok(value)) => {
@@ -278,21 +272,19 @@ pub fn cmd_incrbyfloat(ctx: &ServerContext, state: &ClientState, args: &[Bytes])
     let result = db.with_entry_mut(
         key.clone(),
         || KVal::String(Bytes::from_static(b"0")),
-        |v| match v {
-            KVal::String(s) => {
-                let current: f64 = match std::str::from_utf8(s).ok().and_then(|x| x.parse().ok()) {
-                    Some(n) => n,
-                    None => return Err(IncrFloatError::NotAFloat),
-                };
-                let next = current + delta;
-                if !next.is_finite() {
-                    return Err(IncrFloatError::NotAFloat);
-                }
-                let formatted = format_float(next);
-                *s = Bytes::from(formatted.clone());
-                Ok(formatted)
+        |v| {
+            let Some(s) = v.string_bytes_mut() else { return Err(IncrFloatError::WrongType) };
+            let current: f64 = match std::str::from_utf8(s).ok().and_then(|x| x.parse().ok()) {
+                Some(n) => n,
+                None => return Err(IncrFloatError::NotAFloat),
+            };
+            let next = current + delta;
+            if !next.is_finite() {
+                return Err(IncrFloatError::NotAFloat);
             }
-            _ => Err(IncrFloatError::WrongType),
+            let formatted = format_float(next);
+            *s = Bytes::from(formatted.clone());
+            Ok(formatted)
         },
     );
     match result {
@@ -373,14 +365,9 @@ pub fn cmd_mget(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     // reported as `nil`.
     let values = args
         .iter()
-        .map(|key| {
-            match db.with_value(key, |v| match v {
-                KVal::String(s) => Some(s.clone()),
-                _ => None,
-            }) {
-                Some(Some(s)) => Value::bulk(s),
-                _ => Value::NullBulk,
-            }
+        .map(|key| match db.with_value(key, |v| v.string_bytes()) {
+            Some(Some(s)) => Value::bulk(s),
+            _ => Value::NullBulk,
         })
         .collect();
     reply(Value::Array(values))
@@ -391,10 +378,7 @@ pub fn cmd_strlen(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     let db = ctx.store.db(state.db_index).expect("valid db index");
     // `with_value`, not `get`: don't clone a potentially huge
     // List/Hash/Set/ZSet just to report its length is the wrong concept.
-    match db.with_value(key, |v| match v {
-        KVal::String(s) => Ok(s.len()),
-        _ => Err(()),
-    }) {
+    match db.with_value(key, |v| v.string_bytes().map(|b| b.len()).ok_or(())) {
         Some(Ok(len)) => reply(Value::Integer(len as i64)),
         Some(Err(())) => wrong_type(),
         None => reply(Value::Integer(0)),
@@ -410,9 +394,8 @@ pub fn cmd_getbit(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     let byte_index = offset / 8;
     let bit_index = 7 - (offset % 8);
     let db = ctx.store.db(state.db_index).expect("valid db index");
-    match db.with_value(key, |v| match v {
-        KVal::String(value) => Ok(value.get(byte_index).is_some_and(|byte| (byte >> bit_index) & 1 != 0)),
-        _ => Err(()),
+    match db.with_value(key, |v| {
+        v.string_bytes().map(|b| b.get(byte_index).is_some_and(|byte| (byte >> bit_index) & 1 != 0)).ok_or(())
     }) {
         None => reply(Value::Integer(0)),
         Some(Ok(bit)) => reply(Value::Integer(bit as i64)),
@@ -431,9 +414,8 @@ pub fn cmd_setbit(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         b"1" => 1u8,
         _ => return err("ERR bit is not an integer or out of range"),
     };
-    const MAX_STRING_SIZE: usize = 64 * 1024 * 1024;
     let byte_index = offset / 8;
-    if byte_index >= MAX_STRING_SIZE {
+    if byte_index >= ctx.proto_max_bulk_len {
         return err("ERR bit offset is not an integer or out of range");
     }
     let bit_index = 7 - (offset % 8);
@@ -442,23 +424,21 @@ pub fn cmd_setbit(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     let previous = db.with_entry_mut(
         key.clone(),
         || KVal::String(Bytes::new()),
-        |v| match v {
-            KVal::String(value) => {
-                let mut bytes = value.to_vec();
-                if bytes.len() <= byte_index {
-                    bytes.resize(byte_index + 1, 0);
-                }
-                let mask = 1u8 << bit_index;
-                let old = (bytes[byte_index] & mask) != 0;
-                if bit == 0 {
-                    bytes[byte_index] &= !mask;
-                } else {
-                    bytes[byte_index] |= mask;
-                }
-                *value = Bytes::from(bytes);
-                Ok(old)
+        |v| {
+            let Some(value) = v.string_bytes_mut() else { return Err(()) };
+            let mut bytes = value.to_vec();
+            if bytes.len() <= byte_index {
+                bytes.resize(byte_index + 1, 0);
             }
-            _ => Err(()),
+            let mask = 1u8 << bit_index;
+            let old = (bytes[byte_index] & mask) != 0;
+            if bit == 0 {
+                bytes[byte_index] &= !mask;
+            } else {
+                bytes[byte_index] |= mask;
+            }
+            *value = Bytes::from(bytes);
+            Ok(old)
         },
     );
     match previous {
@@ -489,19 +469,16 @@ pub fn cmd_bitcount(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) ->
         None
     };
     let db = ctx.store.db(state.db_index).expect("valid db index");
-    match db.with_value(&args[0], |v| match v {
-        KVal::String(value) => {
-            let (start, end) = range.map_or((0, value.len() as i64 - 1), |(start, end)| {
-                normalize(start, end, value.len() as i64)
-            });
-            let count = if start > end || value.is_empty() {
-                0
-            } else {
-                value[start as usize..=end as usize].iter().map(|byte| byte.count_ones() as i64).sum()
-            };
-            Ok(count)
-        }
-        _ => Err(()),
+    match db.with_value(&args[0], |v| {
+        let Some(value) = v.string_bytes() else { return Err(()) };
+        let (start, end) = range
+            .map_or((0, value.len() as i64 - 1), |(start, end)| normalize(start, end, value.len() as i64));
+        let count = if start > end || value.is_empty() {
+            0
+        } else {
+            value[start as usize..=end as usize].iter().map(|byte| byte.count_ones() as i64).sum()
+        };
+        Ok(count)
     }) {
         None => reply(Value::Integer(0)),
         Some(Ok(count)) => reply(Value::Integer(count)),
@@ -515,20 +492,16 @@ pub fn cmd_setrange(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) ->
         Some(n) => n,
         None => return err("ERR offset is out of range"),
     };
-    const MAX_STRING_SIZE: usize = 64 * 1024 * 1024;
     let Some(end) = offset.checked_add(replacement.len()) else {
         return err("ERR string exceeds maximum allowed size");
     };
-    if end > MAX_STRING_SIZE {
+    if end > ctx.proto_max_bulk_len {
         return err("ERR string exceeds maximum allowed size");
     }
 
     let db = ctx.store.db(state.db_index).expect("valid db index");
     if replacement.is_empty() {
-        return match db.with_value(key, |v| match v {
-            KVal::String(value) => Ok(value.len()),
-            _ => Err(()),
-        }) {
+        return match db.with_value(key, |v| v.string_bytes().map(|b| b.len()).ok_or(())) {
             None => reply(Value::Integer(0)),
             Some(Ok(len)) => reply(Value::Integer(len as i64)),
             Some(Err(())) => wrong_type(),
@@ -539,15 +512,13 @@ pub fn cmd_setrange(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) ->
     let result = db.with_entry_mut(
         key_owned.clone(),
         || KVal::String(Bytes::new()),
-        |v| match v {
-            KVal::String(value) => {
-                let mut updated = vec![0; value.len().max(end)];
-                updated[..value.len()].copy_from_slice(value);
-                updated[offset..end].copy_from_slice(replacement);
-                *value = Bytes::from(updated);
-                Ok(value.len())
-            }
-            _ => Err(()),
+        |v| {
+            let Some(value) = v.string_bytes_mut() else { return Err(()) };
+            let mut updated = vec![0; value.len().max(end)];
+            updated[..value.len()].copy_from_slice(value);
+            updated[offset..end].copy_from_slice(replacement);
+            *value = Bytes::from(updated);
+            Ok(value.len())
         },
     );
     match result {
@@ -571,20 +542,18 @@ pub fn cmd_getrange(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) ->
     // range can be carved out without ever cloning the whole string — and
     // a wrong-type key doesn't pay for cloning a potentially huge
     // List/Hash/Set/ZSet either.
-    match db.with_value(key, |v| match v {
-        KVal::String(s) => {
-            let len = s.len() as i64;
-            if len == 0 {
-                return Ok(Bytes::new());
-            }
-            let (lo, hi) = normalize(start, end, len);
-            if lo > hi {
-                Ok(Bytes::new())
-            } else {
-                Ok(s.slice(lo as usize..=hi as usize))
-            }
+    match db.with_value(key, |v| {
+        let Some(s) = v.string_bytes() else { return Err(()) };
+        let len = s.len() as i64;
+        if len == 0 {
+            return Ok(Bytes::new());
         }
-        _ => Err(()),
+        let (lo, hi) = normalize(start, end, len);
+        if lo > hi {
+            Ok(Bytes::new())
+        } else {
+            Ok(s.slice(lo as usize..=hi as usize))
+        }
     }) {
         Some(Ok(slice)) => reply(Value::bulk(slice)),
         Some(Err(())) => wrong_type(),

@@ -39,17 +39,50 @@ pub enum Value {
     /// like `T` on the wire, so this doesn't change the RDB/tiered-storage
     /// format.
     Stream(Box<Stream>),
+    /// Integer-encoded string — semantically identical to `String` (same
+    /// Redis type; `GET` returns the decimal text). Written by `INCR`-
+    /// family commands only; every other string mutation demotes it back
+    /// to `String` via `string_bytes_mut`. Skips the parse + `Bytes`
+    /// alloc per increment on hot counters. LAST variant on purpose:
+    /// appending keeps the serde discriminant indices of the earlier
+    /// variants stable, so pre-`Int` snapshots/tiered data still decode.
+    Int(i64),
 }
 
 impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
-            Value::String(_) => "string",
+            Value::String(_) | Value::Int(_) => "string",
             Value::List(_) => "list",
             Value::Hash(_) => "hash",
             Value::Set(_) => "set",
             Value::ZSet(_) => "zset",
             Value::Stream(_) => "stream",
+        }
+    }
+
+    /// String-typed values as bytes: `String` cloned, `Int` formatted to
+    /// its decimal text — exactly what a client reads either way. `None`
+    /// for collection types, which are `WRONGTYPE` to string commands.
+    pub fn string_bytes(&self) -> Option<Bytes> {
+        match self {
+            Value::String(b) => Some(b.clone()),
+            Value::Int(i) => Some(Bytes::from(i.to_string())),
+            _ => None,
+        }
+    }
+
+    /// `&mut` string form for in-place edits: an `Int` is first demoted
+    /// to its decimal `String` (any non-numeric mutation loses the int
+    /// encoding, matching Redis), then yields the buffer. `None` for
+    /// collection types.
+    pub fn string_bytes_mut(&mut self) -> Option<&mut Bytes> {
+        if let Value::Int(i) = self {
+            *self = Value::String(Bytes::from(i.to_string()));
+        }
+        match self {
+            Value::String(b) => Some(b),
+            _ => None,
         }
     }
 
@@ -61,7 +94,7 @@ impl Value {
     /// have consumer groups attached), matching real Redis.
     pub fn is_empty_container(&self) -> bool {
         match self {
-            Value::String(_) => false,
+            Value::String(_) | Value::Int(_) => false,
             Value::List(l) => l.is_empty(),
             Value::Hash(h) => h.is_empty(),
             Value::Set(s) => s.is_empty(),
@@ -75,6 +108,7 @@ impl Value {
     pub fn approx_bytes(&self) -> usize {
         match self {
             Value::String(s) => s.len(),
+            Value::Int(_) => 8,
             Value::List(l) => l.iter().map(|b| b.len() + 16).sum(),
             Value::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 32).sum(),
             Value::Set(s) => s.iter().map(|b| b.len() + 16).sum(),
@@ -90,20 +124,53 @@ impl Value {
 /// farthest representable instant instead of panicking: indistinguishable
 /// from "a very long time from now" to every caller here.
 fn saturating_deadline(dur: Duration) -> Instant {
-    let now = Instant::now();
-    if let Some(t) = now.checked_add(dur) {
+    saturating_add(Instant::now(), dur)
+}
+
+fn saturating_add(base: Instant, dur: Duration) -> Instant {
+    if let Some(t) = base.checked_add(dur) {
         return t;
     }
     let mut probe = dur;
     loop {
         probe /= 2;
         if probe.is_zero() {
-            return now;
+            return base;
         }
-        if let Some(t) = now.checked_add(probe) {
+        if let Some(t) = base.checked_add(probe) {
             return t;
         }
     }
+}
+
+/// Anchor for `Instant` → compact-ms conversions in `Entry`. Monotonic,
+/// process-local — persisted formats never see these values (TTLs are
+/// exported as relative `Duration`s).
+static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+fn now_ms() -> u64 {
+    Instant::now().saturating_duration_since(*EPOCH).as_millis() as u64
+}
+
+fn now_secs() -> u32 {
+    (now_ms() / 1000).min(u32::MAX as u64) as u32
+}
+
+/// `Instant` → `expires_ms`. A past/sub-ms instant maps to `0`, which
+/// `is_expired` treats as already elapsed ("no expiry" is `u64::MAX`,
+/// not `0`, so `0` is free to mean "expired").
+fn instant_to_ms(at: Instant) -> u64 {
+    at.saturating_duration_since(*EPOCH).as_millis() as u64
+}
+
+/// `Duration` → `sliding_ms`. Same `.max(1)` sentinel rule: a sub-ms
+/// sliding window can't be allowed to read as "sliding off".
+fn duration_to_ms(d: Duration) -> u64 {
+    (d.as_millis().min(u64::MAX as u128) as u64).max(1)
+}
+
+fn ms_to_instant(ms: u64) -> Instant {
+    saturating_add(*EPOCH, Duration::from_millis(ms))
 }
 
 /// If a tiered operation contends on a synchronous lock while called from a
@@ -122,39 +189,51 @@ fn wait_without_blocking_tokio_worker<R>(f: impl FnOnce() -> R) -> R {
 #[derive(Debug, Clone)]
 struct Entry {
     value: Value,
-    expires_at: Option<Instant>,
-    /// Set by `EXPIRE key seconds SLIDING`: the original duration to reset
-    /// `expires_at` back to on every read. `PERSIST` (or a plain `EXPIRE`
-    /// without `SLIDING`) clears this.
-    sliding: Option<Duration>,
-    /// For `maxmemory-policy allkeys-lru`/`volatile-lru`: when this key was
-    /// last read or written. Updated in `touch()`, same call sites as the
-    /// sliding-TTL reset.
-    last_access: Instant,
-    /// For `allkeys-lfu`/`volatile-lfu`: a plain monotonically-increasing
-    /// access counter — a simplified LFU approximation
-    /// (that needs a background decay task we don't have), just "fewest
-    /// accesses wins" as the eviction tie-break.
-    access_count: u64,
+    /// Absolute expiry in ms since `EPOCH`; `u64::MAX` = no expiry.
+    expires_ms: u64,
+    /// `EXPIRE ... SLIDING` reset window in ms; `0` = sliding off.
+    /// `PERSIST`/plain `EXPIRE` clears it. (u64, not u32: >49-day
+    /// sliding windows are legal inputs even if absurd.)
+    sliding_ms: u64,
+    /// LRU bookkeeping: last access, whole seconds since `EPOCH` —
+    /// eviction ranking only needs ordering, not precision.
+    last_access_secs: u32,
+    /// LFU bookkeeping: saturating access counter (approximation, see
+    /// `access_stats`'s callers).
+    access_count: u32,
 }
 
 impl Entry {
     fn new(value: Value, expires_at: Option<Instant>, sliding: Option<Duration>) -> Self {
-        Self { value, expires_at, sliding, last_access: Instant::now(), access_count: 0 }
+        Self {
+            value,
+            expires_ms: expires_at.map(instant_to_ms).unwrap_or(u64::MAX),
+            sliding_ms: sliding.map(duration_to_ms).unwrap_or(0),
+            last_access_secs: now_secs(),
+            access_count: 0,
+        }
     }
 
     fn is_expired(&self) -> bool {
-        matches!(self.expires_at, Some(at) if at <= Instant::now())
+        self.expires_ms != u64::MAX && self.expires_ms <= now_ms()
+    }
+
+    fn expires_instant(&self) -> Option<Instant> {
+        (self.expires_ms != u64::MAX).then(|| ms_to_instant(self.expires_ms))
+    }
+
+    fn remaining_ttl(&self) -> Option<Duration> {
+        (self.expires_ms != u64::MAX).then(|| Duration::from_millis(self.expires_ms.saturating_sub(now_ms())))
     }
 
     /// Reset the sliding-TTL countdown on read access, if enabled, and bump
     /// the LRU/LFU access bookkeeping — called from every read/write path
     /// that touches an existing entry.
     fn touch(&mut self) {
-        if let Some(duration) = self.sliding {
-            self.expires_at = Some(saturating_deadline(duration));
+        if self.sliding_ms != 0 {
+            self.expires_ms = now_ms().saturating_add(self.sliding_ms);
         }
-        self.last_access = Instant::now();
+        self.last_access_secs = now_secs();
         self.access_count = self.access_count.saturating_add(1);
     }
 }
@@ -344,8 +423,8 @@ impl Db {
     /// lock is contended, instead of making every concurrent reader of the
     /// same key fall back to serializing on an exclusive lock just to bump
     /// a counter.
-    fn touch_entry(lock: &RwLock<Entry>, sliding: Option<Duration>) {
-        if sliding.is_some() {
+    fn touch_entry(lock: &RwLock<Entry>, sliding_ms: u64) {
+        if sliding_ms != 0 {
             lock.write().touch();
         } else if let Some(mut entry) = lock.try_write() {
             entry.touch();
@@ -370,9 +449,9 @@ impl Db {
                 return None;
             }
             let value = entry.value.clone();
-            let sliding = entry.sliding;
+            let sliding_ms = entry.sliding_ms;
             drop(entry);
-            Self::touch_entry(lock, sliding);
+            Self::touch_entry(lock, sliding_ms);
             return Some(value);
         }
         drop(guard);
@@ -453,7 +532,7 @@ impl Db {
         }
         // Preserve the existing access/sliding-TTL semantics of `get`.
         entry.touch();
-        let expires_at = entry.expires_at;
+        let expires_at = entry.expires_instant();
         let value = std::mem::replace(&mut entry.value, Value::String(Bytes::new()));
         Some((value, expires_at))
     }
@@ -508,9 +587,9 @@ impl Db {
                     self.remove_if_same(key, lock, &guard);
                     Ttl::NoKey
                 } else {
-                    match entry.expires_at {
-                        None => Ttl::Persistent,
-                        Some(at) => Ttl::Expires(at.saturating_duration_since(Instant::now())),
+                    match entry.expires_ms {
+                        u64::MAX => Ttl::Persistent,
+                        ms => Ttl::Expires(Duration::from_millis(ms.saturating_sub(now_ms()))),
                     }
                 }
             }
@@ -528,8 +607,8 @@ impl Db {
                 if entry.is_expired() {
                     false
                 } else {
-                    entry.expires_at = expires_at;
-                    entry.sliding = None;
+                    entry.expires_ms = expires_at.map(instant_to_ms).unwrap_or(u64::MAX);
+                    entry.sliding_ms = 0;
                     true
                 }
             }
@@ -552,8 +631,8 @@ impl Db {
                 if entry.is_expired() {
                     false
                 } else {
-                    entry.expires_at = Some(saturating_deadline(duration));
-                    entry.sliding = Some(duration);
+                    entry.sliding_ms = duration_to_ms(duration);
+                    entry.expires_ms = now_ms().saturating_add(entry.sliding_ms);
                     true
                 }
             }
@@ -575,7 +654,7 @@ impl Db {
                 if entry.is_expired() {
                     None
                 } else {
-                    Some(entry.expires_at)
+                    Some(entry.expires_instant())
                 }
             }
             None => {
@@ -608,9 +687,9 @@ impl Db {
                 return None;
             }
             let result = f(&entry.value);
-            let sliding = entry.sliding;
+            let sliding_ms = entry.sliding_ms;
             drop(entry);
-            Self::touch_entry(lock, sliding);
+            Self::touch_entry(lock, sliding_ms);
             return Some(result);
         }
         drop(guard);
@@ -680,8 +759,12 @@ impl Db {
                 return None;
             }
             entry.touch();
-            let Entry { value, expires_at, .. } = &mut *entry;
-            return Some(f(value, expires_at));
+            // `expires_ms` lives in the compact repr; hand the callback a
+            // real `Option<Instant>` and write it back afterward.
+            let mut exp = entry.expires_instant();
+            let result = f(&mut entry.value, &mut exp);
+            entry.expires_ms = exp.map(instant_to_ms).unwrap_or(u64::MAX);
+            return Some(result);
         }
         drop(guard);
         if self.try_promote_locked(key) {
@@ -694,8 +777,10 @@ impl Db {
                     return None;
                 }
                 entry.touch();
-                let Entry { value, expires_at, .. } = &mut *entry;
-                return Some(f(value, expires_at));
+                let mut exp = entry.expires_instant();
+                let result = f(&mut entry.value, &mut exp);
+                entry.expires_ms = exp.map(instant_to_ms).unwrap_or(u64::MAX);
+                return Some(result);
             }
         }
         None
@@ -746,8 +831,10 @@ impl Db {
             self.map.get_or_insert_with(key, || RwLock::new(Entry::new(default(), None, None)), &guard);
         let mut entry = lock.write();
         entry.touch();
-        let Entry { value, expires_at, .. } = &mut *entry;
-        f(value, expires_at, present)
+        let mut exp = entry.expires_instant();
+        let result = f(&mut entry.value, &mut exp, present);
+        entry.expires_ms = exp.map(instant_to_ms).unwrap_or(u64::MAX);
+        result
     }
 
     /// Move a key out of RAM and into the disk tier (if configured).
@@ -773,7 +860,7 @@ impl Db {
             self.map.remove(key, &guard);
             return None;
         }
-        let ttl = entry.expires_at.map(|at| at.saturating_duration_since(Instant::now()));
+        let ttl = entry.remaining_ttl();
         if let Err(error) = handler.evict(&Bytes::copy_from_slice(key), &entry.value, ttl) {
             tracing::warn!(?key, %error, "failed to persist evicted key; keeping it in RAM");
             return None;
@@ -861,7 +948,7 @@ impl Db {
         let guard = self.map.guard();
         self.map.get(key, &guard).map(|lock| {
             let entry = lock.read();
-            (entry.last_access, entry.access_count)
+            (ms_to_instant(entry.last_access_secs as u64 * 1000), entry.access_count as u64)
         })
     }
 
@@ -925,7 +1012,7 @@ impl Db {
                 if entry.is_expired() {
                     return None;
                 }
-                let ttl = entry.expires_at.map(|at| at.saturating_duration_since(Instant::now()));
+                let ttl = entry.remaining_ttl();
                 Some((k.clone(), entry.value.clone(), ttl))
             })
             .collect()
@@ -1082,7 +1169,10 @@ mod tests {
 
         let (taken, taken_expiry) = db.take(b"source").unwrap();
         assert_eq!(taken, value);
-        assert_eq!(taken_expiry, Some(expiry));
+        // `Entry` stores ms, so the round-tripped instant isn't bit-exact —
+        // within a couple ms of the original is the semantic contract.
+        let drift = taken_expiry.unwrap().max(expiry) - taken_expiry.unwrap().min(expiry);
+        assert!(drift <= Duration::from_millis(2), "expiry drifted {drift:?}");
         assert_eq!(db.exists(&[Bytes::from("source")]), 0);
     }
 
@@ -1110,7 +1200,7 @@ mod tests {
         {
             let guard = db.map.guard();
             if let Some(lock) = db.map.get(b"k".as_slice(), &guard) {
-                lock.write().expires_at = Some(Instant::now() + Duration::from_millis(10));
+                lock.write().expires_ms = instant_to_ms(Instant::now() + Duration::from_millis(10));
             }
         }
         assert!(matches!(db.ttl(b"k"), Ttl::Expires(d) if d.as_millis() <= 10));
@@ -1128,7 +1218,7 @@ mod tests {
         {
             let guard = db.map.guard();
             if let Some(lock) = db.map.get(b"k".as_slice(), &guard) {
-                lock.write().expires_at = Some(Instant::now() + Duration::from_millis(10));
+                lock.write().expires_ms = instant_to_ms(Instant::now() + Duration::from_millis(10));
             }
         }
         db.get(b"k");

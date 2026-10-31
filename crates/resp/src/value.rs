@@ -204,6 +204,66 @@ impl Value {
             },
         }
     }
+
+    /// RFX wire encoding: same tag characters as RESP, but lengths are
+    /// fixed-width big-endian integers and there are no CRLF markers.
+    /// `docs/RFX.md` is the spec clients implement against.
+    pub fn encode_rfx(&self, buf: &mut BytesMut) {
+        match self {
+            Value::Simple(s) => {
+                buf.put_u8(b'+');
+                buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            Value::Error(s) => {
+                buf.put_u8(b'-');
+                buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            Value::Integer(i) => {
+                buf.put_u8(b':');
+                buf.extend_from_slice(&i.to_be_bytes());
+            }
+            Value::Bulk(data) => {
+                buf.put_u8(b'$');
+                buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                buf.extend_from_slice(data);
+            }
+            Value::NullBulk | Value::NullArray | Value::Null => buf.put_u8(b'_'),
+            Value::Array(items) | Value::Push(items) | Value::Set(items) => {
+                buf.put_u8(match self {
+                    Value::Push(_) => b'>',
+                    Value::Set(_) => b'~',
+                    _ => b'*',
+                });
+                buf.extend_from_slice(&(items.len() as u32).to_be_bytes());
+                for item in items {
+                    item.encode_rfx(buf);
+                }
+            }
+            Value::Boolean(b) => {
+                buf.put_u8(b'#');
+                buf.put_u8(*b as u8);
+            }
+            Value::Double(d) => {
+                buf.put_u8(b',');
+                buf.extend_from_slice(&d.to_be_bytes());
+            }
+            Value::BigNumber(s) => {
+                buf.put_u8(b'(');
+                buf.extend_from_slice(&(s.len() as u32).to_be_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            Value::Map(pairs) => {
+                buf.put_u8(b'%');
+                buf.extend_from_slice(&(pairs.len() as u32).to_be_bytes());
+                for (k, v) in pairs {
+                    k.encode_rfx(buf);
+                    v.encode_rfx(buf);
+                }
+            }
+        }
+    }
 }
 
 fn format_double(d: f64) -> String {

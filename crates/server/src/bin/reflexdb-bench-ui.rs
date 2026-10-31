@@ -256,6 +256,7 @@ const HTML: &str = r###"<!DOCTYPE html>
     <div class="latency-field"><label for="latKeys">Small-key dataset size</label><input id="latKeys" type="number" value="1000" min="1" max="100000"></div>
     <div class="latency-field"><label for="latWatchers">LIVE watchers</label><input id="latWatchers" type="number" value="1000" min="0" max="10000"></div>
     <div class="latency-field"><label for="latLiveDrain">LIVE measurement</label><select id="latLiveDrain"><option value="buffered">Writer latency (buffered clients)</option><option value="selector">End-to-end delivery (selector)</option></select></div>
+    <div class="latency-field"><label for="latWire">Wire protocol</label><select id="latWire"><option value="resp">RESP</option><option value="rfx">RFX (binary)</option><option value="resp,rfx">Both — compare</option></select></div>
   </div>
   <div>
     <div class="latency-field" style="margin-bottom:.5rem;"><label>Workloads to compare</label></div>
@@ -272,7 +273,7 @@ const HTML: &str = r###"<!DOCTYPE html>
   </div>
   <div id="latencyResults" class="latency-results"><div class="latency-empty">Run a workload to see throughput and tail latency.</div></div>
   <div id="latencyTableWrap" class="latency-table-wrap" style="display:none;">
-    <table id="latencyTable"><thead><tr><th>Run</th><th>Workload</th><th>Pipeline</th><th>Clients</th><th>Ops/s</th><th>p50</th><th>p99</th><th>p999</th><th>Errors</th></tr></thead><tbody id="latencyBody"></tbody></table>
+    <table id="latencyTable"><thead><tr><th>Run</th><th>Workload</th><th>Wire</th><th>Pipeline</th><th>Clients</th><th>Ops/s</th><th>p50</th><th>p99</th><th>p999</th><th>Errors</th></tr></thead><tbody id="latencyBody"></tbody></table>
   </div>
 </section>
 
@@ -1384,7 +1385,7 @@ function renderLatencyRows() {
     const card = document.createElement('article');
     card.className = 'latency-card';
     const title = document.createElement('h3');
-    title.textContent = `${row.workload} · run ${row.run}${row.pipeline ? ` · pipeline ${row.pipeline}` : ''}`;
+    title.textContent = `${row.wire === 'rfx' ? 'RFX · ' : ''}${row.workload} · run ${row.run}${row.pipeline ? ` · pipeline ${row.pipeline}` : ''}`;
     card.appendChild(title);
     const kpis = document.createElement('div');
     kpis.className = 'latency-kpis';
@@ -1408,7 +1409,7 @@ function renderLatencyRows() {
     card.appendChild(chart);
     latencyResults.appendChild(card);
   }
-  latencyBody.innerHTML = latencyRows.map(row => `<tr><td>${row.run}</td><td>${row.workload}</td><td>${row.pipeline ?? '—'}</td><td>${row.clients}</td><td>${fmtOps(row.ops_per_second)}</td><td>${fmtUs(row.latency_us?.p50)}</td><td>${fmtUs(row.latency_us?.p99)}</td><td>${fmtUs(row.latency_us?.p999)}</td><td>${row.errors}</td></tr>`).join('');
+  latencyBody.innerHTML = latencyRows.map(row => `<tr><td>${row.run}</td><td>${row.workload}</td><td>${(row.wire ?? 'resp').toUpperCase()}</td><td>${row.pipeline ?? '—'}</td><td>${row.clients}</td><td>${fmtOps(row.ops_per_second)}</td><td>${fmtUs(row.latency_us?.p50)}</td><td>${fmtUs(row.latency_us?.p99)}</td><td>${fmtUs(row.latency_us?.p999)}</td><td>${row.errors}</td></tr>`).join('');
   document.getElementById('latencyTableWrap').style.display = 'block';
 }
 
@@ -1427,6 +1428,7 @@ latRunBtn.onclick = async () => {
     keys: document.getElementById('latKeys').value,
     live_subscribers: document.getElementById('latWatchers').value,
     live_drain: document.getElementById('latLiveDrain').value,
+    wire: document.getElementById('latWire').value,
     workloads: workloads.join(','),
   });
   latencyRows = [];
@@ -3014,6 +3016,12 @@ async fn handle_run_latency(query: Option<&str>, socket: &mut TcpStream) -> std:
     let keys = text("keys", "1000").parse::<usize>().unwrap_or(1000).clamp(1, 100_000);
     let live_subscribers = text("live_subscribers", "1000").parse::<usize>().unwrap_or(1000).clamp(0, 10_000);
     let live_drain = text("live_drain", "buffered");
+    let wires: Vec<String> = text("wire", "resp")
+        .split(',')
+        .map(str::trim)
+        .filter(|w| matches!(*w, "resp" | "rfx"))
+        .map(str::to_string)
+        .collect();
     let pipelines = text("pipeline", "1,16");
     let valid_pipelines =
         pipelines.split(',').all(|part| part.trim().parse::<usize>().is_ok_and(|n| (1..=1024).contains(&n)))
@@ -3029,6 +3037,7 @@ async fn handle_run_latency(query: Option<&str>, socket: &mut TcpStream) -> std:
         || !valid_pipelines
         || workloads.is_empty()
         || !matches!(live_drain.as_str(), "buffered" | "selector")
+        || wires.is_empty()
     {
         socket
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -3043,54 +3052,66 @@ async fn handle_run_latency(query: Option<&str>, socket: &mut TcpStream) -> std:
     )
     .await?;
 
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/run.py");
     let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let mut child = match Command::new(python)
-        .arg(script)
-        .args(["--host", &host, "--port", &port.to_string(), "--runs", &runs.to_string()])
-        .args(["--seconds", &seconds.to_string(), "--clients", &clients.to_string()])
-        .args(["--pipeline", &pipelines, "--keys", &keys.to_string()])
-        .args(["--live-subscribers", &live_subscribers.to_string(), "--workloads", &workloads.join(",")])
-        .args(["--live-drain", &live_drain])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) => {
-            let row = format!(
-                "{{\"type\":\"error\",\"message\":\"Could not start benchmark harness: {}\"}}\n",
-                json_escape(&error.to_string())
-            );
+    for wire in &wires {
+        if wires.len() > 1 {
+            let row =
+                format!("{{\"type\":\"progress\",\"message\":\"Running {} wire…\"}}\n", wire.to_uppercase());
             write_chunk(socket, &row).await?;
+        }
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks")
+            .join(if wire == "rfx" { "run_rfx.py" } else { "run.py" });
+        let mut child = match Command::new(&python)
+            .arg(script)
+            .args(["--host", &host, "--port", &port.to_string(), "--runs", &runs.to_string()])
+            .args(["--seconds", &seconds.to_string(), "--clients", &clients.to_string()])
+            .args(["--pipeline", &pipelines, "--keys", &keys.to_string()])
+            .args(["--live-subscribers", &live_subscribers.to_string(), "--workloads", &workloads.join(",")])
+            .args(["--live-drain", &live_drain])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let row = format!(
+                    "{{\"type\":\"error\",\"message\":\"Could not start benchmark harness: {}\"}}\n",
+                    json_escape(&error.to_string())
+                );
+                write_chunk(socket, &row).await?;
+                socket.write_all(b"0\r\n\r\n").await?;
+                return Ok(());
+            }
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill().await;
+            write_chunk(
+                socket,
+                "{\"type\":\"error\",\"message\":\"Benchmark harness has no output stream\"}\n",
+            )
+            .await?;
             socket.write_all(b"0\r\n\r\n").await?;
             return Ok(());
+        };
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line).await?;
+            if read == 0 {
+                break;
+            }
+            let row = tag_json_line(&String::from_utf8_lossy(&line), "wire", wire);
+            if write_chunk(socket, &row).await.is_err() {
+                let _ = child.kill().await;
+                return Ok(());
+            }
         }
-    };
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
-        write_chunk(socket, "{\"type\":\"error\",\"message\":\"Benchmark harness has no output stream\"}\n")
-            .await?;
-        socket.write_all(b"0\r\n\r\n").await?;
-        return Ok(());
-    };
-    let mut reader = tokio::io::BufReader::new(stdout);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        let read = tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line).await?;
-        if read == 0 {
-            break;
+        let status = child.wait().await?;
+        if !status.success() {
+            write_chunk(socket, "{\"type\":\"error\",\"message\":\"Benchmark process exited unsuccessfully; check that Python 3 and the target server are available\"}\n").await?;
         }
-        let row = String::from_utf8_lossy(&line);
-        if write_chunk(socket, &row).await.is_err() {
-            let _ = child.kill().await;
-            return Ok(());
-        }
-    }
-    let status = child.wait().await?;
-    if !status.success() {
-        write_chunk(socket, "{\"type\":\"error\",\"message\":\"Benchmark process exited unsuccessfully; check that Python 3 and the target server are available\"}\n").await?;
     }
     socket.write_all(b"0\r\n\r\n").await?;
     Ok(())
@@ -3631,22 +3652,26 @@ const SHOOTOUT_ENGINES: &[Engine] = &[
     },
 ];
 
-/// Inserts `"engine":"<id>",` right after a JSON object line's opening
+/// Inserts `"<key>":"<value>",` right after a JSON object line's opening
 /// `{` — cheaper than a real JSON parse/re-serialize round trip for
 /// tagging lines that are already known to be `{...}` objects (both
 /// `benchmarks/run.py`'s `json.dumps` rows and this file's own hand-built
 /// `{"type":...}` progress/error rows always are).
-fn tag_engine_line(line: &str, engine_id: &str) -> String {
+fn tag_json_line(line: &str, key: &str, value: &str) -> String {
     match line.find('{') {
         Some(pos) => {
-            let mut out = String::with_capacity(line.len() + engine_id.len() + 14);
+            let mut out = String::with_capacity(line.len() + key.len() + value.len() + 7);
             out.push_str(&line[..=pos]);
-            out.push_str(&format!("\"engine\":\"{engine_id}\","));
+            out.push_str(&format!("\"{key}\":\"{value}\","));
             out.push_str(&line[pos + 1..]);
             out
         }
         None => line.to_string(),
     }
+}
+
+fn tag_engine_line(line: &str, engine_id: &str) -> String {
+    tag_json_line(line, "engine", engine_id)
 }
 
 /// Runs the same fixed-workload harness (`benchmarks/run.py`, standard

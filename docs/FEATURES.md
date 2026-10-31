@@ -1,6 +1,8 @@
 # Features — what reflexdb has today
 
-Implements a subset of the Redis command protocol over RESP2/RESP3. Client compatibility depends
+Implements a subset of the Redis command protocol over RESP2/RESP3, plus an optional binary
+wire format, **RFX** ([docs/RFX.md](RFX.md)), auto-detected per connection. Client compatibility
+depends
 on the commands used. Two features of its own: **`LIVE` query subscriptions** and **tiered storage**.
 See [ROADMAP.md](ROADMAP.md) for what's designed but not built yet, and
 [COMMANDS.md](COMMANDS.md) for the full command list.
@@ -46,21 +48,24 @@ underlying key changes.
 - Fingerprint = CRC64 of `<command> <args>`, used to dedupe subscriptions and for `UNLIVE`.
 - RESP2 connections in `LIVE` mode are restricted to `LIVE`/`UNLIVE`/`PING`/`QUIT`/`RESET`;
   RESP3 allows mixing live subscriptions with normal commands.
-- A single server-wide broadcast bus carries changed subscription fingerprints. Matching
-  read-only commands are re-run synchronously on the write path; connection tasks then read the
-  latest result and send it to their clients. The event bus is bounded at 1,024 items, so a
-  connection that falls behind can skip intermediate states. Pub/sub and tracking use a separate
-  1,024-item outbound queue; overflow marks that client for disconnect after 25 ms. There is no
-  configurable LIVE debounce period.
+- Writes enqueue deduplicated wake-ups; a dedicated `live-fanout` thread re-runs the matching
+  read-only commands, caches the latest result, pre-encodes the push per wire format, and writes
+  it straight to each subscriber's socket via `try_lock` (falling back to the client's bounded
+  push queue when contended). A connection that falls behind can skip intermediate states.
+  Pub/sub and tracking use a separate 1,024-item outbound queue; overflow marks that client for
+  disconnect after 25 ms. Fan-out pacing is tunable: `live-sweep-ms` (default 10 — an idle gap
+  where writes dedup into one re-evaluation; `0` pushes every batch immediately) and
+  `live-pace-chunk`/`live-pace-ms` (defaults 64/1 — socket-write burst size and yield, `0`
+  disables pacing) trade subscriber freshness against fan-out CPU under write storms.
 
 ## Persistence
 
 | Mode | Config | Use case |
 |------|--------|----------|
-| Cache only | `save ""`, `appendonly no` | pure in-memory |
-| Snapshot only | `save 900 1 ...`, `appendonly no` | restartable, tolerates small loss |
-| AOF only | `save ""`, `appendonly yes` | max durability |
-| Hybrid (default) | both | fast restart + low loss |
+| Cache only (default) | `appendonly no` | pure in-memory; snapshots still load at startup if a `dbfilename` file exists |
+| Snapshot only | `appendonly no` + explicit `SAVE`/`BGSAVE` (no periodic `save` directive — verified 2026-11-01) | restartable, tolerates total loss since last snapshot |
+| AOF only | `appendonly yes` | max durability |
+| Hybrid | `appendonly yes` + periodic `SAVE`/`BGSAVE` | fast restart + low loss |
 
 - **RDB**: `SAVE` is synchronous to the client but runs on Tokio's blocking pool; `BGSAVE`
   serializes on that pool and writes/renames on a background OS thread — no `fork()`. New
@@ -140,9 +145,12 @@ HISTORY <key> [LIMIT n]  # versions: (timestamp, command, summary), newest-first
 
 Versions are written to a disk-backed side-car store (`fjall`, same engine as the tier), not
 reconstructed from the AOF, and not replicated. Recording a version costs one channel push on
-the write path (fire-and-forget to a batching writer thread). Retention: `history-retention-ms`
-(default 24h), reclaimed by a periodic sweep. `OBJECTAT`, `RESTOREAT`, `LIVE ... SINCE`, and
-`EXPIREACTION` are designed but not built — see [ROADMAP.md](ROADMAP.md).
+the write path (fire-and-forget to a batching writer thread). `history-retention-ms` defaults to
+24h; `0` disables age-based expiry. `history-max-versions-per-key` defaults to 200 (range
+1–1,000,000); the writer trims older versions and `GETAT`/`HISTORY` observe only the capped
+window. A per-key cap does not limit the number of distinct keys, so total disk use can still grow
+when age retention is disabled. `OBJECTAT`, `RESTOREAT`, `LIVE ... SINCE`, and `EXPIREACTION` are
+designed but not built — see [ROADMAP.md](ROADMAP.md).
 
 ## Cache correctness — single-flight
 
