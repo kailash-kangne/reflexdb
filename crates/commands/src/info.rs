@@ -3,6 +3,8 @@
 //! and `key:value` lines (not an array), so clients that parse it
 //! line-by-line work unmodified.
 
+use std::sync::atomic::Ordering;
+
 use bytes::Bytes;
 use keyspace::Value as KVal;
 use resp::Value;
@@ -68,6 +70,27 @@ pub fn cmd_info(ctx: &ServerContext, _args: &[Bytes]) -> Outcome {
         None => out.push_str("tiered_disk_used_bytes:0\r\n"),
     }
     out.push_str(&format!("tiered_disk_limit:{}\r\n", ctx.tiered_disk_limit.unwrap_or(0)));
+    let policy = match ctx.tiered_overflow_policy {
+        crate::dispatch::TieredOverflowPolicy::RejectWrites => "reject-writes",
+        crate::dispatch::TieredOverflowPolicy::EvictOldest => "evict-oldest",
+        crate::dispatch::TieredOverflowPolicy::NoLimit => "no-limit",
+    };
+    out.push_str(&format!("tiered_overflow_policy:{policy}\r\n"));
+    out.push_str(&format!("tiered_evictions:{}\r\n", ctx.tiered_evictions.load(Ordering::Relaxed)));
+    out.push_str(&format!("tiered_disk_drops:{}\r\n", ctx.tiered_disk_drops.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "tiered_rejected_writes:{}\r\n",
+        ctx.tiered_full_rejections.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!("tiered_spill_failures:{}\r\n", ctx.tiered_spill_failures.load(Ordering::Relaxed)));
+    out.push_str(&format!(
+        "tiered_expired_dropped:{}\r\n",
+        ctx.tiered_expired_dropped.load(Ordering::Relaxed)
+    ));
+    let stats = ctx.store.tiered_stats();
+    out.push_str(&format!("tiered_entries_removed:{}\r\n", stats.entries_removed));
+    out.push_str(&format!("tiered_compactions:{}\r\n", stats.compactions_completed));
+    out.push_str(&format!("tiered_compacting:{}\r\n", stats.compacting as i32));
     out.push_str("\r\n");
 
     out.push_str("# Persistence\r\n");

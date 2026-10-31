@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -92,6 +93,45 @@ impl MaxMemoryPolicy {
     /// TTL set; the `allkeys-*` ones (and `-random`) don't care.
     fn volatile_only(self) -> bool {
         matches!(self, Self::VolatileRandom | Self::VolatileLru | Self::VolatileLfu | Self::VolatileTtl)
+    }
+}
+
+/// `tiered-overflow-policy`: what happens when the disk tier itself reaches
+/// `tiered-disk-limit`. `RejectWrites` is the default — the disk tier is
+/// durable overflow, not a cache, so "full" must refuse new work rather
+/// than silently discard data the server already acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TieredOverflowPolicy {
+    /// Once RAM is over `tiered-memory-limit` *and* the disk tier is at
+    /// `tiered-disk-limit`, refuse writes that would grow the keyspace
+    /// (`ERR TIERED_STORAGE_FULL`). Deletes and overwrites of existing
+    /// keys stay allowed. Preserves every acknowledged byte.
+    #[default]
+    RejectWrites,
+    /// Drop the oldest tiered entries to make room — cache semantics with
+    /// real data loss (the pre-policy behavior).
+    EvictOldest,
+    /// No enforcement — disk capacity is the operator's responsibility;
+    /// `tiered-disk-limit` is ignored entirely.
+    NoLimit,
+}
+
+impl TieredOverflowPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "reject-writes" => Some(Self::RejectWrites),
+            "evict-oldest" => Some(Self::EvictOldest),
+            "no-limit" => Some(Self::NoLimit),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RejectWrites => "reject-writes",
+            Self::EvictOldest => "evict-oldest",
+            Self::NoLimit => "no-limit",
+        }
     }
 }
 
@@ -326,9 +366,27 @@ pub struct ServerContext {
     /// otherwise there's nowhere to move them and this is ignored.
     pub tiered_limit: Option<u64>,
     /// `tiered-disk-limit`: once the disk tier's own usage exceeds this,
-    /// cold tiered entries get dropped outright (real loss, not a RAM
-    /// move — there's nowhere left to move them). `None` means unbounded.
+    /// the configured `tiered_overflow_policy` applies (reject new writes,
+    /// drop oldest entries, or — `no-limit` — no enforcement). `None`
+    /// means unbounded.
     pub tiered_disk_limit: Option<u64>,
+    /// `tiered-overflow-policy` — see `TieredOverflowPolicy`. Consulted
+    /// only when `tiered_disk_limit` is set.
+    pub tiered_overflow_policy: TieredOverflowPolicy,
+    /// `tiered_evictions`/`tiered_disk_drops`/`tiered_full_rejections`/
+    /// `tiered_spill_failures`/`tiered_expired_dropped`: `INFO` counters —
+    /// keys spilled to disk, keys lost to `evict-oldest` capacity drops,
+    /// client writes refused under `reject-writes`, spill attempts that
+    /// hit the tier's own capacity guard, and entries the GC sweep
+    /// dropped.
+    pub tiered_evictions: AtomicU64,
+    pub tiered_disk_drops: AtomicU64,
+    pub tiered_full_rejections: AtomicU64,
+    pub tiered_spill_failures: AtomicU64,
+    pub tiered_expired_dropped: AtomicU64,
+    /// GC/compaction bookkeeping for `run_tiered_maintenance`.
+    pub(crate) tiered_removed_seen: AtomicU64,
+    pub(crate) tiered_last_compact_secs: AtomicU64,
     /// `eviction-low-watermark`: once a `maxmemory`/`tiered-limit`/
     /// `tiered-disk-limit` eviction pass starts, it drains down to this
     /// fraction of the configured limit rather than just back under it —
@@ -389,6 +447,10 @@ pub struct ServerContext {
     /// that's reconnected but still behind keeps counting as "connected"
     /// for `WAIT`/`CLIENT LIST` purposes for longer.
     pub replica_slow_disconnect_delay: Duration,
+    /// `min-replicas-to-write`: write commands fail with `NOREPLICAS` when
+    /// fewer than this many connected replicas are healthy (not flagged
+    /// slow). 0 = off (default). Same semantics as Redis's directive.
+    pub min_replicas_to_write: usize,
     /// Connected replicas (clients that sent `PSYNC`), keyed by client id.
     pub(crate) replicas: DashMap<u64, ReplicaState>,
     /// Logical replication offset: incremented once per replicated write
@@ -498,6 +560,14 @@ impl ServerContext {
             approx_memory: AtomicUsize::new(0),
             tiered_limit: None,
             tiered_disk_limit: None,
+            tiered_overflow_policy: TieredOverflowPolicy::default(),
+            tiered_evictions: AtomicU64::new(0),
+            tiered_disk_drops: AtomicU64::new(0),
+            tiered_full_rejections: AtomicU64::new(0),
+            tiered_spill_failures: AtomicU64::new(0),
+            tiered_expired_dropped: AtomicU64::new(0),
+            tiered_removed_seen: AtomicU64::new(0),
+            tiered_last_compact_secs: AtomicU64::new(0),
             eviction_low_watermark: 0.5,
             max_evictions_per_tick: 10_000,
             scheduler: Scheduler::default(),
@@ -507,6 +577,7 @@ impl ServerContext {
             replica_queue_capacity: 32_768,
             replica_queue_max_bytes: 64 * 1024 * 1024,
             replica_slow_disconnect_delay: Duration::from_secs(5),
+            min_replicas_to_write: 0,
             replicas: DashMap::new(),
             master_repl_offset: AtomicU64::new(0),
             replid: generate_replid(),
@@ -575,6 +646,11 @@ impl ServerContext {
         self
     }
 
+    pub fn with_min_replicas_to_write(mut self, n: usize) -> Self {
+        self.min_replicas_to_write = n;
+        self
+    }
+
     pub fn with_notify_keyspace_events(mut self, flags: NotifyFlags) -> Self {
         self.notify_keyspace_events = flags;
         self
@@ -593,6 +669,33 @@ impl ServerContext {
     pub fn with_tiered_disk_limit(mut self, limit: Option<u64>) -> Self {
         self.tiered_disk_limit = limit;
         self
+    }
+
+    pub fn with_tiered_overflow_policy(mut self, policy: TieredOverflowPolicy) -> Self {
+        self.tiered_overflow_policy = policy;
+        self
+    }
+
+    /// The policy actually enforced — `NoLimit` whenever there's no
+    /// `tiered_disk_limit` to enforce against, regardless of configuration.
+    pub fn effective_tiered_policy(&self) -> TieredOverflowPolicy {
+        if self.tiered_disk_limit.is_none() {
+            TieredOverflowPolicy::NoLimit
+        } else {
+            self.tiered_overflow_policy
+        }
+    }
+
+    /// Whether `reject-writes` currently refuses a new-key write estimated
+    /// at `est` charged bytes: RAM is over `tiered_limit` (so it wants to
+    /// spill) *and* the disk tier reports it couldn't absorb this write.
+    /// Same approximate-limit freshness as `maxmemory_exceeded` —
+    /// `approx_memory` is refreshed on the maintenance tick, not per write.
+    fn tiered_full_for(&self, est: u64) -> bool {
+        let Some(mem_limit) = self.tiered_limit else { return false };
+        self.tiered_overflow_policy == TieredOverflowPolicy::RejectWrites
+            && self.approx_memory.load(Ordering::Relaxed) as u64 > mem_limit
+            && !self.store.tiered_can_accept(est)
     }
 
     pub fn with_slowlog(mut self, threshold_us: i64, max_len: usize) -> Self {
@@ -665,6 +768,25 @@ impl ServerContext {
 
     pub fn aof_enabled(&self) -> bool {
         self.aof.is_some()
+    }
+
+    /// `SHUTDOWN`/signal-handler ritual: block until every queued write is
+    /// fsync'd, then (only if asked) take a final RDB snapshot. With AOF
+    /// enabled the snapshot is skipped — the AOF already holds everything;
+    /// with only RDB persistence it's the difference between losing and
+    /// keeping unsaved writes.
+    pub fn persist_for_shutdown(&self, save_rdb: bool) {
+        if let Some(Err(e)) = self.flush_aof() {
+            tracing::warn!(error = %e, "shutdown: final AOF fsync failed");
+        }
+        if save_rdb {
+            if let Some(path) = &self.rdb_path {
+                match persistence::rdb::save(path, &self.store) {
+                    Ok(()) => self.mark_saved(),
+                    Err(e) => tracing::warn!(error = %e, "shutdown: final RDB save failed"),
+                }
+            }
+        }
     }
 
     pub fn history_enabled(&self) -> bool {
@@ -784,9 +906,15 @@ impl ServerContext {
 
         let mut evicted = 0;
 
+        // Only `evict-oldest` sacrifices existing tiered data — under
+        // `reject-writes` the disk tier is never drained to make room (the
+        // write gate refuses new keys instead), and `no-limit` doesn't
+        // enforce capacity at all.
         if let Some(limit) = self.tiered_disk_limit {
-            let target = low_watermark(limit, self.eviction_low_watermark);
-            evicted += self.drain_tiered_disk(target);
+            if self.tiered_overflow_policy == TieredOverflowPolicy::EvictOldest {
+                let target = low_watermark(limit, self.eviction_low_watermark);
+                evicted += self.drain_tiered_disk(target);
+            }
         }
 
         if let Some(limit) = self.tiered_limit {
@@ -811,6 +939,36 @@ impl ServerContext {
         }
 
         evicted
+    }
+
+    /// Tier housekeeping (~1/min, off the latency path): GC expired tiered
+    /// entries, then `major_compact` once ≥10K tombstones accumulated or an
+    /// hour passed — LSM deletes don't reclaim file space until compacted.
+    pub fn run_tiered_maintenance(&self) {
+        let dropped = self.store.tiered_sweep_expired();
+        if dropped > 0 {
+            self.tiered_expired_dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+            tracing::debug!(dropped, "tiered GC dropped expired entries");
+        }
+
+        let stats = self.store.tiered_stats();
+        let new_tombstones =
+            stats.entries_removed.saturating_sub(self.tiered_removed_seen.load(Ordering::Relaxed));
+        let since_compact = self
+            .start_time
+            .elapsed()
+            .as_secs()
+            .saturating_sub(self.tiered_last_compact_secs.load(Ordering::Relaxed));
+        if new_tombstones >= 10_000 || since_compact >= 3600 {
+            match self.store.tiered_compact() {
+                Ok(()) => {
+                    self.tiered_removed_seen.store(stats.entries_removed, Ordering::Relaxed);
+                    self.tiered_last_compact_secs
+                        .store(self.start_time.elapsed().as_secs(), Ordering::Relaxed);
+                }
+                Err(e) => tracing::warn!(error = %e, "tiered compaction failed"),
+            }
+        }
     }
 
     fn refresh_memory_usage(&self) -> usize {
@@ -844,13 +1002,26 @@ impl ServerContext {
                 if used <= target || moved >= max_per_tick {
                     break;
                 }
-                if let Some(freed) = db.evict_to_tier_sized(&key) {
-                    used = used.saturating_sub(freed as u64);
-                    moved += 1;
+                match db.evict_to_tier_result(&key) {
+                    Ok(Some(freed)) => {
+                        used = used.saturating_sub(freed as u64);
+                        moved += 1;
+                    }
+                    // A full disk tier keeps the key in RAM — stop asking
+                    // it to accept more this tick; the `reject-writes`
+                    // gate (if configured) handles new writes.
+                    Err(e) if e == keyspace::TIERED_FULL => {
+                        self.tiered_spill_failures.fetch_add(1, Ordering::Relaxed);
+                        self.approx_memory.store(used as usize, Ordering::Relaxed);
+                        self.tiered_evictions.fetch_add(moved as u64, Ordering::Relaxed);
+                        return moved;
+                    }
+                    _ => {}
                 }
             }
         }
         self.approx_memory.store(used as usize, Ordering::Relaxed);
+        self.tiered_evictions.fetch_add(moved as u64, Ordering::Relaxed);
         moved
     }
 
@@ -881,7 +1052,12 @@ impl ServerContext {
                 if removed > 0 {
                     estimated_used = estimated_used.saturating_sub(freed as u64);
                     evicted += 1;
-                    on_key_changed(self, db_index, victim);
+                    // No ClientState here — evictions aren't logged
+                    // commands, so there's no AOF entry to order history
+                    // behind; record it inline.
+                    let mut pending = Vec::new();
+                    on_key_changed_impl(self, &mut pending, db_index, victim, None);
+                    drain_pending_history(self, &mut pending);
                 }
             }
         }
@@ -910,6 +1086,7 @@ impl ServerContext {
                 dropped += 1;
             }
         }
+        self.tiered_disk_drops.fetch_add(dropped as u64, Ordering::Relaxed);
         dropped
     }
 
@@ -928,7 +1105,9 @@ impl ServerContext {
             if let Some(victim) = candidates.into_iter().next() {
                 let (removed, freed) = db.del_sized(std::slice::from_ref(&victim));
                 if removed > 0 {
-                    on_key_changed(self, db_index, victim);
+                    let mut pending = Vec::new();
+                    on_key_changed_impl(self, &mut pending, db_index, victim, None);
+                    drain_pending_history(self, &mut pending);
                     return Some(freed);
                 }
             }
@@ -1153,6 +1332,11 @@ pub struct ClientState {
     /// mirrors `RequestDecoder::wire()` (RESP or RFX binary, latched by
     /// the first frame the client sends).
     pub wire: resp::Wire,
+    /// `(db, key, snapshot)` history records buffered by `on_key_changed`
+    /// during a dispatch and drained after the AOF/replication enqueues —
+    /// see `drain_pending_history`. `RefCell` because many handlers only
+    /// have `&ClientState`; push/drain borrows never overlap.
+    pub(crate) pending_history: RefCell<PendingHistory>,
 }
 
 impl ClientState {
@@ -1179,12 +1363,14 @@ impl ClientState {
             tracking: false,
             live_fingerprints: HashSet::new(),
             wire: resp::Wire::Resp,
+            pending_history: RefCell::new(Vec::new()),
         }
     }
 
-    /// State used by the background task applying a primary's replicated
-    /// command stream: authenticated (it's not a network client subject to
-    /// `requirepass`) and exempt from the replica-read-only check.
+    /// State used by internal command application — a replica's inbound
+    /// replication stream and startup AOF replay: authenticated (it's not a
+    /// network client subject to `requirepass`) and exempt from the
+    /// replica-read-only and `min-replicas-to-write` gates.
     pub fn for_replication_link() -> Self {
         let mut state = Self::with_id(0, false);
         state.is_replication_link = true;
@@ -1238,6 +1424,12 @@ pub enum Outcome {
         deadline: Option<Instant>,
         on_timeout: Value,
     },
+    /// `SHUTDOWN` — the connection loop is the only place that can end the
+    /// process cleanly, so dispatch just reports the intent. `save`
+    /// decides whether the final RDB snapshot is written before exit.
+    Shutdown {
+        save: bool,
+    },
 }
 
 /// `Instant::now() + dur` panics if the sum overflows the clock's internal
@@ -1284,9 +1476,115 @@ pub(crate) fn wrong_type() -> Outcome {
 /// (Phase 3), the `WATCH` dirty-CAS path (Phase 4), and any `SINGLEFLIGHT`
 /// waiters parked on this key (Phase 6) — every command that mutates
 /// exactly one key calls this once it knows the write stuck.
-pub(crate) fn on_key_changed(ctx: &ServerContext, db_index: usize, key: Bytes) {
+/// Commands allowed while `reject-writes` has the disk tier full: removals
+/// and TTL-only ops (can only shrink usage), plus single-key writes on an
+/// existing key (overwrites don't grow the keyspace). Everything else is
+/// refused while full.
+/// `SHUTDOWN [NOSAVE|SAVE]` — no reply on success (the process exits,
+/// matching Redis where clients see a closed connection). With no
+/// modifier the final RDB save happens only when it would actually
+/// protect unsaved data: when AOF is off and a dump path exists.
+fn cmd_shutdown(ctx: &ServerContext, args: &[Bytes]) -> Outcome {
+    let save = match args {
+        [] => ctx.aof.is_none() && ctx.rdb_path.is_some(),
+        [flag] if flag.eq_ignore_ascii_case(b"SAVE") => true,
+        [flag] if flag.eq_ignore_ascii_case(b"NOSAVE") => false,
+        _ => return err("ERR syntax error"),
+    };
+    Outcome::Shutdown { save }
+}
+
+fn tier_full_safe(ctx: &ServerContext, db_index: usize, name: &str, args: &[Bytes]) -> bool {
+    if matches!(
+        name,
+        "DEL"
+            | "UNLINK"
+            | "GETDEL"
+            | "GETEX"
+            | "EXPIRE"
+            | "PEXPIRE"
+            | "EXPIREAT"
+            | "PEXPIREAT"
+            | "PERSIST"
+            | "TOUCH"
+    ) {
+        return true;
+    }
+    let exists = args
+        .first()
+        .is_some_and(|key| ctx.store.db(db_index).is_some_and(|db| db.exists(std::slice::from_ref(key)) > 0));
+    exists
+        && matches!(
+            name,
+            "SET"
+                | "SETNX"
+                | "SETEX"
+                | "PSETEX"
+                | "GETSET"
+                | "SETRANGE"
+                | "APPEND"
+                | "SETBIT"
+                | "BITFIELD"
+                | "INCR"
+                | "DECR"
+                | "INCRBY"
+                | "DECRBY"
+                | "INCRBYFLOAT"
+                | "HSET"
+                | "HSETNX"
+                | "HINCRBY"
+                | "HINCRBYFLOAT"
+                | "HDEL"
+                | "LPUSH"
+                | "RPUSH"
+                | "LPUSHX"
+                | "RPUSHX"
+                | "LSET"
+                | "LINSERT"
+                | "LPOP"
+                | "RPOP"
+                | "LREM"
+                | "SADD"
+                | "SREM"
+                | "SPOP"
+                | "ZADD"
+                | "ZINCRBY"
+                | "ZREM"
+                | "ZPOPMIN"
+                | "ZPOPMAX"
+                | "RENAME"
+                | "RENAMENX"
+                | "RESTORE"
+                | "XADD"
+        )
+}
+
+/// `Some(bytes)` = the post-write string snapshot captured while the
+/// caller still held the entry lock (no re-read race); `None` = re-read
+/// the key at drain time, which can interleave with a concurrent write.
+pub(crate) type PendingHistory = Vec<(usize, Bytes, Option<Bytes>)>;
+
+pub(crate) fn on_key_changed(
+    ctx: &ServerContext,
+    state: &ClientState,
+    db_index: usize,
+    key: Bytes,
+    snap: Option<Bytes>,
+) {
+    on_key_changed_impl(ctx, &mut state.pending_history.borrow_mut(), db_index, key, snap);
+}
+
+/// The `&mut PendingHistory` variant — for callers with no `ClientState`
+/// (the eviction path), which drain their local buffer immediately.
+fn on_key_changed_impl(
+    ctx: &ServerContext,
+    pending: &mut PendingHistory,
+    db_index: usize,
+    key: Bytes,
+    snap: Option<Bytes>,
+) {
     if ctx.history.is_some() {
-        record_history(ctx, db_index, &key);
+        pending.push((db_index, key.clone(), snap));
     }
     // LIVE wakes go through the deduplicating fan-out queue when the ctx is
     // `Arc`-bound (production): the re-eval + per-subscriber wakeup then run
@@ -1323,25 +1621,35 @@ pub(crate) fn on_key_changed(ctx: &ServerContext, db_index: usize, key: Bytes) {
     }
 }
 
-/// Queues a `(now, current-string-value-or-None)` version of `key` for the
-/// disk-backed history log (`persistence::history::HistoryWriter`), called
-/// from `on_key_changed` whenever `ctx.history` is `Some`. See
-/// `ServerContext::history`'s docs for what this simplifies away vs. the
-/// real design. Re-reads the key instead of being handed the new value
-/// directly, since `on_key_changed` is shared by every write command and
-/// doesn't carry one — an acceptable extra lookup given this only runs at
-/// all when `history-enabled yes`. `HistoryWriter::record` itself is
-/// fire-and-forget (see its module docs), so this doesn't block the write
-/// path on any disk I/O.
-fn record_history(ctx: &ServerContext, db_index: usize, key: &Bytes) {
+/// Drains the `(db, key, snapshot)` entries `on_key_changed` buffered for
+/// this dispatch — called after the AOF/replication enqueues so the
+/// commit order is value -> LIVE -> AOF -> replication -> history. A crash
+/// can then only leave history *missing* a version the AOF has (a gap),
+/// never a phantom version the AOF lacks.
+fn drain_pending_history(ctx: &ServerContext, pending: &mut PendingHistory) {
+    for (db_index, key, snap) in pending.drain(..) {
+        record_history(ctx, db_index, &key, snap);
+    }
+}
+
+/// Queues a `(now, string-value-or-None)` version of `key` for the
+/// disk-backed history log (`persistence::history::HistoryWriter`). A
+/// `Some` snapshot is recorded as-is; `None` re-reads the key — `with_value`
+/// returns `None` for a missing key and `Some(None)` for a non-string
+/// value, and `.flatten()` collapses both into `None`, which is exactly
+/// the distinction `GETAT`/`HISTORY` need: "string with this value"
+/// (`Some`) vs. "deleted, or never a string" (`None`).
+/// `HistoryWriter::record` itself is fire-and-forget (see its module
+/// docs), so this doesn't block the write path on any disk I/O.
+fn record_history(ctx: &ServerContext, db_index: usize, key: &Bytes, snap: Option<Bytes>) {
     let Some(writer) = &ctx.history else { return };
-    let Some(db) = ctx.store.db(db_index) else { return };
-    // `with_value` returns `None` for a missing key and `Some(None)` for a
-    // non-string value; `.flatten()` collapses both into `None` here,
-    // which is exactly the distinction `GETAT`/`HISTORY` need: "string
-    // with this value" (`Some`) vs. "deleted, or never a string" (`None`).
-    let snapshot = db.with_value(key, |v| v.string_bytes());
-    let snapshot = snapshot.flatten();
+    let snapshot = match snap {
+        snap @ Some(_) => snap,
+        None => {
+            let Some(db) = ctx.store.db(db_index) else { return };
+            db.with_value(key, |v| v.string_bytes()).flatten()
+        }
+    };
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
     writer.record(db_index, key.clone(), now_ms, snapshot);
 }
@@ -1519,9 +1827,44 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     if is_write && ctx.is_replica() && !state.is_replication_link {
         return err("READONLY You can't write against a read only replica.");
     }
+    // `min-replicas-to-write`: refuse writes unless enough connected replicas
+    // are healthy. The replication-apply path is exempt — a replica must keep
+    // applying its primary's stream regardless of its own downstream links.
+    if is_write
+        && ctx.min_replicas_to_write > 0
+        && !state.is_replication_link
+        && ctx.replicas.iter().filter(|r| !ctx.slow_replicas.contains_key(r.key())).count()
+            < ctx.min_replicas_to_write
+    {
+        return err("NOREPLICAS Not enough good replicas to write.");
+    }
+    // AOF persistence failure: the fire-and-forget writer has already
+    // acknowledged writes it then dropped, so once it reports an error
+    // refuse further writes (same `MISCONF` contract Redis uses) rather
+    // than ack more data that can't persist. Auto-clears on the next
+    // successful batch; the replication-apply path stays exempt.
+    if is_write && !state.is_replication_link && ctx.aof.as_ref().is_some_and(|w| w.io_failed()) {
+        return err("MISCONF Errors writing to the AOF file");
+    }
     if is_write && ctx.maxmemory_exceeded() && ctx.effective_maxmemory_policy() == MaxMemoryPolicy::NoEviction
     {
         return err("OOM command not allowed when used memory > 'maxmemory'.");
+    }
+    // `tiered-overflow-policy reject-writes`: the disk tier is durable
+    // overflow, so a full tier refuses *new* keys rather than silently
+    // discarding acknowledged data. The estimate covers key + args + the
+    // tier's per-entry overhead — the actual atomic reservation happens in
+    // `evict_sync` when the key eventually spills. Removals and overwrites
+    // of existing keys stay allowed — they can't grow (and can shrink) the
+    // tier.
+    if is_write
+        && ctx.tiered_full_for(args.iter().map(|a| a.len() as u64 + 64).sum())
+        && !tier_full_safe(ctx, state.db_index, name.as_str(), args)
+    {
+        ctx.tiered_full_rejections.fetch_add(1, Ordering::Relaxed);
+        return err(
+            "ERR TIERED_STORAGE_FULL the disk tier is at its configured capacity; only deletes and overwrites of existing keys are allowed.",
+        );
     }
     // Snapshot the request for the AOF before it's consumed by the match
     // below — cheap, since `Bytes`/`Vec` cloning here is just refcount
@@ -1539,6 +1882,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
             _ => wrong_args("echo"),
         },
         "QUIT" => Outcome::CloseConnection(Value::ok()),
+        "SHUTDOWN" => cmd_shutdown(ctx, args),
         "AUTH" => cmd_auth(ctx, state, args),
         "HELLO" => cmd_hello(ctx, state, args),
         "RESET" => {
@@ -1801,6 +2145,13 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         }
     }
 
+    // History enqueues after the AOF/replication enqueues — a crash can
+    // only leave history missing a version the AOF has (a gap), never a
+    // phantom version the AOF lacks. Drained unconditionally: handlers
+    // may mutate before returning an error, and those mutations still
+    // pushed entries.
+    drain_pending_history(ctx, &mut state.pending_history.borrow_mut());
+
     ctx.record_command_timing(&req, dispatch_start.elapsed());
     outcome
 }
@@ -1915,8 +2266,8 @@ fn cmd_set(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome 
 
     let expires_at = if opts.keep_ttl { db.current_expiry(&key).flatten() } else { opts.expires_at };
 
-    db.set(key.clone(), KVal::String(value), expires_at);
-    on_key_changed(ctx, state.db_index, key.clone());
+    db.set(key.clone(), KVal::String(value.clone()), expires_at);
+    on_key_changed(ctx, state, state.db_index, key.clone(), Some(value));
     notify_keyspace_event(ctx, state.db_index, '$', "set", &key);
     reply(Value::ok())
 }
@@ -1956,7 +2307,7 @@ fn cmd_del(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome 
     // actually removed, so (like `on_key_changed` already does here) this
     // fires for every requested key, not just the ones that existed.
     for key in args {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'g', "del", key);
     }
     reply(Value::Integer(removed as i64))
@@ -2027,7 +2378,7 @@ fn cmd_expire(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: 
     if n <= 0 {
         // Non-positive TTL deletes the key immediately, matching Redis.
         let deleted = db.del(std::slice::from_ref(key));
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         if deleted > 0 {
             notify_keyspace_event(ctx, state.db_index, 'g', "del", key);
         }
@@ -2036,7 +2387,7 @@ fn cmd_expire(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: 
     let changed =
         if sliding { db.expire_sliding(key, dur) } else { db.expire(key, Some(saturating_deadline(dur))) };
     if changed {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'g', "expire", key);
     }
     reply(Value::Integer(if changed { 1 } else { 0 }))
@@ -2062,7 +2413,7 @@ fn cmd_expireat(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis
     let in_past = ts <= 0 || target.is_none() || target.is_some_and(|t| t <= now);
     if in_past {
         let deleted = db.del(std::slice::from_ref(key));
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         if deleted > 0 {
             notify_keyspace_event(ctx, state.db_index, 'g', "del", key);
         }
@@ -2071,7 +2422,7 @@ fn cmd_expireat(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis
     let dur = target.expect("checked above").duration_since(now).unwrap_or_default();
     let changed = db.expire(key, Some(saturating_deadline(dur)));
     if changed {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'g', "expire", key);
     }
     reply(Value::Integer(if changed { 1 } else { 0 }))
@@ -2102,8 +2453,8 @@ fn rename(ctx: &ServerContext, state: &ClientState, args: &[Bytes], nx: bool) ->
         return err("ERR no such key");
     };
     db.set(newkey.clone(), value, expires_at);
-    on_key_changed(ctx, state.db_index, key.clone());
-    on_key_changed(ctx, state.db_index, newkey.clone());
+    on_key_changed(ctx, state, state.db_index, key.clone(), None);
+    on_key_changed(ctx, state, state.db_index, newkey.clone(), None);
     notify_keyspace_event(ctx, state.db_index, 'g', "rename_from", key);
     notify_keyspace_event(ctx, state.db_index, 'g', "rename_to", newkey);
     reply(if nx { Value::Integer(1) } else { Value::ok() })
@@ -2115,7 +2466,7 @@ fn cmd_persist(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outc
     let changed = matches!(db.ttl(key), Ttl::Expires(_)) && db.expire(key, None);
     if changed {
         notify_keyspace_event(ctx, state.db_index, 'g', "persist", key);
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
     }
     reply(Value::Integer(if changed { 1 } else { 0 }))
 }
@@ -2229,6 +2580,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "PING",
     "ECHO",
     "QUIT",
+    "SHUTDOWN",
     "AUTH",
     "HELLO",
     "RESET",
@@ -2570,6 +2922,7 @@ mod tests {
             Outcome::NoReply => panic!("test helper doesn't support NoReply (REPLCONF ACK)"),
             Outcome::WaitForReplicas { .. } => panic!("test helper can't await WAIT"),
             Outcome::BlockWait { on_timeout, .. } => on_timeout,
+            Outcome::Shutdown { .. } => panic!("test helper can't exit the process"),
         }
     }
 
@@ -4058,8 +4411,6 @@ mod tests {
     #[test]
     fn acl_setuser_accepts_rw_scoped_key_patterns_and_wipe_all_passwords() {
         let (ctx, mut st) = fresh();
-        // `%R~`/`%W~` aren't enforced as read/write-separated, but must not
-        // error out `SETUSER` — they're folded into normal key access.
         assert_eq!(
             run(&ctx, &mut st, &["ACL", "SETUSER", "dana", "on", ">pw", "%R~read:*", "%W~write:*", "+GET"]),
             Value::ok()
@@ -4076,6 +4427,135 @@ mod tests {
         let (id2, _rx2) = ctx.register_client();
         let mut dana2 = ClientState::with_id(id2, true);
         assert!(matches!(run(&ctx, &mut dana2, &["AUTH", "dana", "anotherpw"]), Value::Error(_)));
+    }
+
+    #[test]
+    fn acl_categories_grant_and_deny() {
+        let (ctx, mut st) = fresh();
+        run(&ctx, &mut st, &["ACL", "SETUSER", "reader", "on", "nopass", "allkeys", "nocommands", "+@read"]);
+        let (id, _rx) = ctx.register_client();
+        let mut reader = ClientState::with_id(id, true);
+        run(&ctx, &mut reader, &["AUTH", "reader", "x"]);
+        assert_eq!(run(&ctx, &mut reader, &["GET", "k"]), Value::NullBulk);
+        assert!(matches!(run(&ctx, &mut reader, &["SET", "k", "v"]), Value::Error(_)));
+
+        // allcommands + -@write: category deny still blocks writes.
+        run(&ctx, &mut st, &["ACL", "SETUSER", "nowr", "on", "nopass", "allkeys", "allcommands", "-@write"]);
+        let (id2, _rx2) = ctx.register_client();
+        let mut nowr = ClientState::with_id(id2, true);
+        run(&ctx, &mut nowr, &["AUTH", "nowr", "x"]);
+        assert_eq!(run(&ctx, &mut nowr, &["GET", "k"]), Value::NullBulk);
+        assert!(matches!(run(&ctx, &mut nowr, &["SET", "k", "v"]), Value::Error(_)));
+
+        // Explicit +cmd beats a denied category: `+SET -@write` can still SET.
+        run(
+            &ctx,
+            &mut st,
+            &["ACL", "SETUSER", "nowr2", "on", "nopass", "allkeys", "nocommands", "+SET", "-@write"],
+        );
+        let (id3, _rx3) = ctx.register_client();
+        let mut nowr2 = ClientState::with_id(id3, true);
+        run(&ctx, &mut nowr2, &["AUTH", "nowr2", "x"]);
+        assert_eq!(run(&ctx, &mut nowr2, &["SET", "k", "v"]), Value::ok());
+        assert!(matches!(run(&ctx, &mut nowr2, &["INCR", "n"]), Value::Error(_)));
+    }
+
+    #[test]
+    fn acl_rw_key_patterns_enforced() {
+        let (ctx, mut st) = fresh();
+        run(&ctx, &mut st, &["ACL", "SETUSER", "scoped", "on", "nopass", "%R~ro:*", "%W~rw:*", "+@all"]);
+        let (id, _rx) = ctx.register_client();
+        let mut u = ClientState::with_id(id, true);
+        run(&ctx, &mut u, &["AUTH", "scoped", "x"]);
+        // %R~ permits reads only — this is the over-grant regression test.
+        assert_eq!(run(&ctx, &mut u, &["GET", "ro:1"]), Value::NullBulk);
+        assert!(matches!(run(&ctx, &mut u, &["SET", "ro:1", "v"]), Value::Error(_)));
+        // %W~ permits writes only.
+        assert_eq!(run(&ctx, &mut u, &["SET", "rw:1", "v"]), Value::ok());
+        assert!(matches!(run(&ctx, &mut u, &["GET", "rw:1"]), Value::Error(_)));
+        // No matching pattern at all.
+        assert!(matches!(run(&ctx, &mut u, &["GET", "other:1"]), Value::Error(_)));
+    }
+
+    #[test]
+    fn acl_rejects_unsupported_modifiers() {
+        let (ctx, mut st) = fresh();
+        for bad in ["&events", "(+get ~cache:*)", "+@bogus"] {
+            assert!(
+                matches!(run(&ctx, &mut st, &["ACL", "SETUSER", "u", "on", bad]), Value::Error(_)),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn min_replicas_to_write_blocks_writes_without_healthy_replicas() {
+        let (mut ctx, mut st) = fresh();
+        ctx.min_replicas_to_write = 1;
+        // No replicas: writes refused, reads fine.
+        assert!(matches!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::Error(_)));
+        assert_eq!(run(&ctx, &mut st, &["GET", "k"]), Value::NullBulk);
+
+        // One healthy replica: writes flow again.
+        let (replica_id, _rx) = ctx.register_client();
+        ctx.register_replica(replica_id);
+        assert_eq!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::ok());
+
+        // Replica flagged slow → back to refusing.
+        ctx.slow_replicas.insert(replica_id, Instant::now());
+        assert!(matches!(run(&ctx, &mut st, &["SET", "k", "v2"]), Value::Error(_)));
+    }
+
+    #[test]
+    fn min_replicas_to_write_reblocks_after_replica_disconnect() {
+        let (mut ctx, mut st) = fresh();
+        ctx.min_replicas_to_write = 1;
+        let (replica_id, _rx) = ctx.register_client();
+        ctx.register_replica(replica_id);
+        assert_eq!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::ok());
+        // The replica's socket dropping removes it entirely → NOREPLICAS again.
+        ctx.disconnect_client(replica_id);
+        assert!(
+            matches!(run(&ctx, &mut st, &["SET", "k", "v2"]), Value::Error(e) if e.starts_with("NOREPLICAS"))
+        );
+    }
+
+    #[test]
+    fn aof_io_failure_refuses_writes_with_misconf() {
+        let path = std::env::temp_dir().join(format!("reflexdb-misconf-{}.aof", std::process::id()));
+        let writer = persistence::aof::AofWriter::open(&path, persistence::aof::Fsync::No).unwrap();
+        let ctx = ServerContext::new(16, None).with_aof(writer, path.clone());
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, false);
+
+        assert_eq!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::ok());
+        ctx.aof.as_ref().unwrap().force_io_failure();
+        // Once the log can't persist, writes are refused — reads still work.
+        assert!(
+            matches!(run(&ctx, &mut st, &["SET", "k", "v2"]), Value::Error(e) if e.starts_with("MISCONF"))
+        );
+        assert_eq!(run(&ctx, &mut st, &["GET", "k"]), Value::bulk(&b"v"[..]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shutdown_modifier_parsing() {
+        let (mut ctx, mut st) = fresh();
+        let save_flag = |outcome| match outcome {
+            Outcome::Shutdown { save } => save,
+            _ => panic!("expected Shutdown"),
+        };
+        // No persistence configured: bare SHUTDOWN saves nothing.
+        assert!(!save_flag(dispatch(&ctx, &mut st, req(&["SHUTDOWN"]))));
+        // RDB configured, no AOF → bare SHUTDOWN takes a final snapshot.
+        ctx.rdb_path = Some(std::path::PathBuf::from("/tmp/dump.rdb"));
+        assert!(save_flag(dispatch(&ctx, &mut st, req(&["SHUTDOWN"]))));
+        assert!(!save_flag(dispatch(&ctx, &mut st, req(&["SHUTDOWN", "NOSAVE"]))));
+        assert!(save_flag(dispatch(&ctx, &mut st, req(&["SHUTDOWN", "SAVE"]))));
+        assert!(matches!(
+            dispatch(&ctx, &mut st, req(&["SHUTDOWN", "bogus"])),
+            Outcome::Reply(Value::Error(_))
+        ));
     }
 
     #[test]
@@ -4309,10 +4789,16 @@ mod tests {
     struct MockTier {
         disk: DashMap<Bytes, (keyspace::Value, Option<Duration>, u64)>,
         next_seq: AtomicU64,
+        /// Bytes the mock refuses to hold past — 0 (default) = no limit.
+        disk_limit: AtomicU64,
     }
 
     impl keyspace::TieringHandler for MockTier {
         fn evict(&self, key: &Bytes, value: &keyspace::Value, ttl: Option<Duration>) -> Result<(), String> {
+            let limit = self.disk_limit.load(Ordering::Relaxed);
+            if limit > 0 && self.disk_usage_bytes().unwrap_or(0) + 100 > limit {
+                return Err(keyspace::TIERED_FULL.to_string());
+            }
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             self.disk.insert(key.clone(), (value.clone(), ttl, seq));
             Ok(())
@@ -4340,6 +4826,10 @@ mod tests {
             // Fixed per-entry size is enough to deterministically exercise
             // `tiered_disk_limit` without needing real byte accounting.
             Some(self.disk.len() as u64 * 100)
+        }
+        fn can_accept(&self, additional: u64) -> bool {
+            let limit = self.disk_limit.load(Ordering::Relaxed);
+            limit == 0 || self.disk_usage_bytes().unwrap_or(0) + additional <= limit
         }
     }
 
@@ -4403,7 +4893,8 @@ mod tests {
         // under the raw limit — see `EVICTION_LOW_WATERMARK`).
         let ctx = ServerContext::with_store(store, None)
             .with_tiered_limit(Some(1))
-            .with_tiered_disk_limit(Some(300));
+            .with_tiered_disk_limit(Some(300))
+            .with_tiered_overflow_policy(TieredOverflowPolicy::EvictOldest);
         let (id, _rx) = ctx.register_client();
         let mut st = ClientState::with_id(id, false);
 
@@ -4431,7 +4922,8 @@ mod tests {
         let store = Store::new_with_tiering(16, tier.clone());
         let ctx = ServerContext::with_store(store, None)
             .with_tiered_limit(Some(1))
-            .with_tiered_disk_limit(Some(300));
+            .with_tiered_disk_limit(Some(300))
+            .with_tiered_overflow_policy(TieredOverflowPolicy::EvictOldest);
         let (id, _rx) = ctx.register_client();
         let mut st = ClientState::with_id(id, false);
 
@@ -4457,6 +4949,67 @@ mod tests {
             (newest_n..10).collect::<Vec<_>>(),
             "expected the surviving keys to be exactly the newest ones, got {survivors:?}"
         );
+    }
+
+    #[test]
+    fn tiered_reject_writes_refuses_new_keys_but_allows_deletes_and_overwrites() {
+        let tier = std::sync::Arc::new(MockTier::default());
+        tier.disk_limit.store(300, Ordering::Relaxed); // 3 entries at 100B each
+        let store = Store::new_with_tiering(16, tier.clone());
+        // reject-writes is the default once a disk limit is configured.
+        let ctx = ServerContext::with_store(store, None)
+            .with_tiered_limit(Some(1))
+            .with_tiered_disk_limit(Some(300));
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, false);
+
+        // Fill the tier to its cap; further spill attempts hit the tier's
+        // own guard and count as spill failures, not evictions. Once the
+        // gate activates mid-loop some of these SETs may themselves be
+        // rejected — that's the feature, so count rejections from here.
+        for i in 0..6 {
+            run(&ctx, &mut st, &["SET", &format!("k{i}"), "some reasonably sized value here"]);
+            ctx.run_eviction_tick();
+        }
+        assert_eq!(tier.disk.len(), 3);
+        assert!(ctx.tiered_spill_failures.load(Ordering::Relaxed) > 0);
+
+        let rejections_before = ctx.tiered_full_rejections.load(Ordering::Relaxed);
+        let Value::Error(e) = run(&ctx, &mut st, &["SET", "brand-new", "v"]) else {
+            panic!("expected TIERED_STORAGE_FULL")
+        };
+        assert!(e.starts_with("ERR TIERED_STORAGE_FULL"), "got {e}");
+        assert_eq!(ctx.tiered_full_rejections.load(Ordering::Relaxed), rejections_before + 1);
+        assert!(!tier.disk.contains_key(b"brand-new".as_slice()));
+
+        // Overwrites and deletes of existing keys stay allowed — and
+        // overwriting a *tiered* key pulls it into RAM, shrinking disk.
+        let tiered_key = String::from_utf8(tier.disk.iter().next().unwrap().key().to_vec()).unwrap();
+        assert_eq!(run(&ctx, &mut st, &["SET", &tiered_key, "v2"]), Value::ok());
+        assert_eq!(tier.disk.len(), 2);
+        assert_eq!(run(&ctx, &mut st, &["GET", &tiered_key]), Value::bulk(&b"v2"[..]));
+        assert_eq!(run(&ctx, &mut st, &["DEL", &tiered_key]), Value::Integer(1));
+    }
+
+    #[test]
+    fn tiered_no_limit_disables_disk_capacity_enforcement() {
+        let tier = std::sync::Arc::new(MockTier::default());
+        let store = Store::new_with_tiering(16, tier.clone());
+        let ctx = ServerContext::with_store(store, None)
+            .with_tiered_limit(Some(1))
+            .with_tiered_disk_limit(Some(300))
+            .with_tiered_overflow_policy(TieredOverflowPolicy::NoLimit);
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, false);
+
+        for i in 0..10 {
+            run(&ctx, &mut st, &["SET", &format!("k{i}"), "v"]);
+            ctx.run_eviction_tick();
+        }
+        // Grows straight past the configured limit — no draining, no rejections.
+        assert!(tier.disk.len() > 3);
+        assert_eq!(ctx.tiered_full_rejections.load(Ordering::Relaxed), 0);
+        assert_eq!(ctx.tiered_disk_drops.load(Ordering::Relaxed), 0);
     }
 
     #[test]

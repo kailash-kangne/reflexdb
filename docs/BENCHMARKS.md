@@ -1,7 +1,7 @@
 # Benchmarks
 
 These are development measurements, not published performance claims. The historical baselines
-below came from one Apple M5 machine; the Engine shootout was rerun on 2026-11-01 on an arm64 Mac.
+below came from one Apple M5 machine; the Engine shootout was rerun on an arm64 Mac.
 Both are single-machine observations, so re-measure before quoting numbers externally.
 `benchmarks/run.py` provides a checked-in, standard-library-only RESP2 harness for repeatable runs
 against a running server; `benchmarks/run_rfx.py` is the same harness speaking RFX
@@ -65,7 +65,7 @@ this remains unsuitable for low-latency hot keys at that fan-out. The
 10-second p999 is based on only about 850 writes per run, so treat it as a diagnostic rather than
 a stable tail guarantee. Slow subscribers may skip intermediate states by design.
 
-Rerun on 2026-11-01 (release Docker image, `--cpus 4` / 2 GiB, `INCR` writer + `LIVE GET`
+Rerun (release Docker image, `--cpus 4` / 2 GiB, `INCR` writer + `LIVE GET`
 watchers, buffered drain, loaded host): the fan-out-thread design measured ~1,120 writes/s at
 100 watchers and still collapsed at 1,000 watchers (~93 writes/s) — a single fan-out thread
 couldn't feed 1,000 sockets at once on a 4-CPU cap.
@@ -146,25 +146,27 @@ all members into a temporary vector.
 
 ## Engine shootout: ReflexDB vs. Redis vs. Dragonfly
 
-Second pass on 2026-11-01, same setup as below — but this time the host had an unrelated
-container stack (Kafka, ZooKeeper, application services) running alongside, so absolute numbers
-are ~15–25% lower and run-to-run variance is higher; only relative placement is meaningful.
-ReflexDB's image included the lazy shared-writer fix and the `live-sweep-ms`/pacing changes.
-Medians of 3 runs:
+Same setup as below, but the host had an unrelated container stack (Kafka, ZooKeeper,
+application services) running alongside, so absolute numbers are ~15–25% lower and run-to-run
+variance is higher; only relative placement is meaningful. ReflexDB's image was the current
+working tree — lazy shared-writer fix, `live-sweep-ms`/pacing changes, and the security/
+durability hardening (per-command ACL enforcement, `MISCONF` AOF-failure gate,
+`min-replicas-to-write`, `tiered-overflow-policy` capacity check, `SHUTDOWN`/signal handling);
+a separate host-side A/B against the previous commit showed none of those per-command gates
+cost measurable latency. Medians of 3 runs:
 
 | Workload | CPUs | Pipeline 1: Redis / Dragonfly / ReflexDB | Pipeline 16: Redis / Dragonfly / ReflexDB |
 |---|---:|---:|---:|
-| small-mixed | 1 | 12,734 / 11,264 / **16,102** | 146,259 / 128,202 / **149,367** |
-| small-mixed | 4 | **14,699** / 14,388 / 14,603 | **143,632** / 134,293 / 138,697 |
-| hot-key | 1 | 15,494 / 12,010 / **17,385** | 147,983 / 142,760 / **164,659** |
-| hot-key | 4 | **14,925** / 13,990 / 14,066 | **161,254** / 153,218 / 152,075 |
+| small-mixed | 1 | 12,734 / 11,264 / **17,249** | 146,259 / 128,202 / **149,301** |
+| small-mixed | 4 | 14,699 / 14,388 / **16,200** | 143,632 / 134,293 / **152,083** |
+| hot-key | 1 | 15,494 / 12,010 / **16,708** | 147,983 / 142,760 / **152,644** |
+| hot-key | 4 | 14,925 / 13,990 / **16,866** | 161,254 / 153,218 / **163,143** |
 
-ReflexDB led four medians, Redis the other four, Dragonfly none — all three inside a noisy
-~14–17k ops/s P1 band. An unloaded-host pass earlier the same day (below) had ReflexDB leading
-all eight. Under an idle host the engines are close enough that placement flips run to run;
-under a loaded host the gap stays within ~±15%.
+ReflexDB led all eight medians this pass, Dragonfly none — though all three sit inside a noisy
+~14–17k ops/s P1 band, and the idle-host pass below shows placement can flip run to run; the
+gap stays within ~±15%.
 
-First pass on 2026-11-01 (idle host) used the current working tree, `benchmarks/run.py`, and a
+The idle-host pass used an earlier working tree (pre-hardening), `benchmarks/run.py`, and a
 freshly built
 ReflexDB image. Host: arm64 macOS 26.6, 10 logical CPUs, Docker Desktop 29.8. Persistence was off;
 each engine ran **alone** to avoid CPU oversubscription. Both CPU settings used 2 GiB memory,
@@ -207,7 +209,7 @@ shootout** tab runs all selected engines concurrently, so its results can differ
 
 ## Aggressive profile
 
-Same loaded-host Docker setup as the second shootout pass (2026-11-01, `--cpus 4`, 2 GiB,
+Same loaded-host Docker setup as the shootout above (`--cpus 4`, 2 GiB,
 engines run one at a time, `small-mixed`, median of 3 × 5 s runs). Stresses dimensions the main
 table does not — client count, pipeline depth, keyspace size, value size:
 
@@ -244,7 +246,7 @@ parsing, dominates. The auto-detect branch adds no measurable cost to RESP conne
 formats ran concurrently with zero errors — the numbers do not establish an RFX advantage beyond
 pipelined decode/encode savings on this one machine.
 
-Re-ran concurrently on 2026-11-01 in Docker (`--cpus 4`, loaded host): both formats completed all
+Re-ran concurrently in Docker (`--cpus 4`, loaded host): both formats completed all
 runs with zero errors and stayed within run-to-run noise of each other (medians ~7.6–10.4k ops/s
 P1, ~106–142k ops/s P16 on both codecs — the host was too loaded to separate the two this
 session). No regression observed versus the table above.

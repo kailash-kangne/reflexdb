@@ -39,7 +39,7 @@ pub fn cmd_append(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
 
     match result {
         Ok(len) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, '$', "append", &key);
             reply(Value::Integer(len as i64))
         }
@@ -87,7 +87,7 @@ fn incr_by(ctx: &ServerContext, state: &ClientState, key: &Bytes, delta: i64, ev
     );
     match result {
         Ok(n) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, '$', event, key);
             reply(Value::Integer(n))
         }
@@ -139,7 +139,7 @@ pub fn cmd_getdel(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     match db.with_value(key, |v| v.string_bytes().ok_or(())) {
         Some(Ok(s)) => {
             db.del(std::slice::from_ref(key));
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'g', "del", key);
             reply(Value::bulk(s))
         }
@@ -165,7 +165,7 @@ pub fn cmd_getset(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     );
     match result {
         Ok(previous) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), Some(replacement.clone()));
             notify_keyspace_event(ctx, state.db_index, '$', "set", &key);
             reply(previous.map_or(Value::NullBulk, Value::bulk))
         }
@@ -244,7 +244,7 @@ pub fn cmd_getex(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Ou
     match result {
         Some(Ok(value)) => {
             if !matches!(expiry, GetExExpiry::Unchanged) {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 let event = if matches!(expiry, GetExExpiry::Persist) { "persist" } else { "expire" };
                 notify_keyspace_event(ctx, state.db_index, '$', event, &key);
             }
@@ -289,7 +289,7 @@ pub fn cmd_incrbyfloat(ctx: &ServerContext, state: &ClientState, args: &[Bytes])
     );
     match result {
         Ok(formatted) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, '$', "incrbyfloat", key);
             reply(Value::bulk(formatted))
         }
@@ -322,7 +322,7 @@ pub fn cmd_setex(ctx: &ServerContext, state: &ClientState, args: &[Bytes], milli
     };
     let db = ctx.store.db(state.db_index).expect("valid db index");
     db.set(key.clone(), KVal::String(value.clone()), Some(expires_at));
-    on_key_changed(ctx, state.db_index, key.clone());
+    on_key_changed(ctx, state, state.db_index, key.clone(), Some(value.clone()));
     notify_keyspace_event(ctx, state.db_index, '$', "set", key);
     reply(Value::ok())
 }
@@ -336,7 +336,7 @@ pub fn cmd_setnx(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Ou
         return reply(Value::Integer(0));
     }
     db.set(key.clone(), KVal::String(value.clone()), None);
-    on_key_changed(ctx, state.db_index, key.clone());
+    on_key_changed(ctx, state, state.db_index, key.clone(), Some(value.clone()));
     notify_keyspace_event(ctx, state.db_index, '$', "set", key);
     reply(Value::Integer(1))
 }
@@ -349,7 +349,7 @@ pub fn cmd_mset(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     for chunk in args.chunks(2) {
         let key = chunk[0].clone();
         db.set(key.clone(), KVal::String(chunk[1].clone()), None);
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), Some(chunk[1].clone()));
         notify_keyspace_event(ctx, state.db_index, '$', "set", &key);
     }
     reply(Value::ok())
@@ -443,7 +443,7 @@ pub fn cmd_setbit(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     );
     match previous {
         Ok(old) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, '$', "setbit", &key);
             reply(Value::Integer(old as i64))
         }
@@ -523,7 +523,7 @@ pub fn cmd_setrange(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) ->
     );
     match result {
         Ok(len) => {
-            on_key_changed(ctx, state.db_index, key_owned.clone());
+            on_key_changed(ctx, state, state.db_index, key_owned.clone(), None);
             notify_keyspace_event(ctx, state.db_index, '$', "setrange", &key_owned);
             reply(Value::Integer(len as i64))
         }

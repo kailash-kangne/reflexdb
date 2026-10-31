@@ -1,6 +1,6 @@
 //! TLS listener support via `rustls` (the `ring` crypto provider — no
 //! cmake/C++ toolchain needed, unlike the `aws-lc-rs` default). See
-//! `docs/07-security.md` §4.
+//! `docs/SECURITY.md`.
 //!
 //! Scope, deliberately: server-side TLS only. No mutual TLS (client
 //! certificate verification, `tls-auth-clients`), no `tls-ca-cert-file`,

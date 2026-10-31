@@ -83,16 +83,49 @@ victim; LRU/LFU/TTL policies preserve their ordering.
   disables it); the writer maintains a configurable per-key cap (default 200). Changing the cap
   compacts existing history on the writer thread in bounded batches.
 
+### Commit order and crash windows
+
+There is no atomic commit across the places a write lands — the defined order per write is:
+
+`mutate value` → `enqueue LIVE wake` → `enqueue AOF` → `enqueue replication` → `enqueue history` → `reply`
+
+Consequences of a crash between any two steps (all enqueues are in-memory queues — "enqueued" is
+not "durable"; only `appendfsync`'s writer-thread cadence and `WAIT`/`WAITAOF` bound the loss):
+
+- After the value mutation but before the LIVE/AOF enqueues: the write is lost entirely on
+  restart (only the in-memory dataset ever had it). LIVE subscribers can only ever observe
+  values that reached their own enqueue step.
+- Between AOF and replication enqueues: the primary has the write queued for durability but no
+  replica was offered it — consistent with an ordinary replica lag window.
+- Between replication and history enqueues: the AOF may contain a version history never
+  recorded — a gap. History is deliberately last so the reverse (a history version the AOF
+  lacks — a phantom) can't happen: replaying the AOF then can't resurrect state that history
+  claims it saw.
+- Before the reply: a client may time out on a write that did enqueue; the client can't know.
+  Same ambiguity every network store has — mitigate with `WAIT`/`WAITAOF` when it matters.
+
+History's per-key snapshot is captured while the writer still holds the entry lock on the
+sites that pass one (`SET`-family); sites passing `None` re-read at drain time and can
+interleave with a concurrent write to the same key — a remaining edge in the prototype, not
+a corruption vector, since a re-read can only yield a newer committed value, never an
+uncommitted one.
+
 ## Tiered storage
 
 `crates/tiered` implements a `keyspace::TieringHandler` trait on `fjall`:
 
 ```rust
 trait TieringHandler: Send + Sync {
-    fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>);
+    fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String>;
     fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)>;
     fn contains(&self, key: &[u8]) -> bool;
     fn remove(&self, key: &[u8]);
+    // capacity/maintenance hooks, all with safe defaults:
+    fn disk_usage_bytes(&self) -> Option<u64>;
+    fn oldest_keys(&self, max: usize) -> Vec<Bytes>;
+    fn sweep_expired(&self) -> usize;   // GC of stale tiered entries
+    fn compact(&self) -> Result<(), String>; // reclaim tombstone space
+    fn stats(&self) -> TieredStats;     // engine counters for INFO
 }
 ```
 
@@ -101,6 +134,14 @@ RAM hits avoid any blocking-pool handoff. On Tokio's multi-thread runtime, actua
 Fjall operations use `block_in_place` so Tokio can replace the occupied worker; outside that
 runtime they execute synchronously. Tier spill selection follows the configured maxmemory
 eviction policy, preserving LRU/LFU ordering where selected.
+
+When the disk tier has its own `tiered-disk-limit`, `tiered-overflow-policy` decides what a
+full tier means: `reject-writes` (default) refuses new-key writes with
+`ERR TIERED_STORAGE_FULL` — a spill failure keeps the key in RAM and no acknowledged data is
+lost — while `evict-oldest` drops the oldest tiered entries (cache semantics, real loss) and
+`no-limit` doesn't enforce at all. A ~60s background task GCs expired tiered entries and
+major-compacts the LSM once ≥10K tombstones accumulate or an hour passes, since fjall deletes
+don't reclaim file space until compacted.
 
 Replication uses a separate bounded queue per connected replica (32,768 messages and 64 MiB).
 The normal pub/sub slow-client timeout does not apply to replicas. If the replica queue overflows,

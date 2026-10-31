@@ -53,6 +53,11 @@ pub fn cmd_exec(ctx: &ServerContext, state: &mut ClientState) -> Outcome {
             // command inside `MULTI`/`EXEC` can't actually block, so it
             // resolves exactly as if its timeout had already elapsed.
             Outcome::BlockWait { on_timeout, .. } => on_timeout,
+            // Like Redis's `no-multi-scripting` flag: never let EXEC
+            // silently queue a process exit.
+            Outcome::Shutdown { .. } => {
+                Value::error("ERR SHUTDOWN is not allowed in transactions or scripts")
+            }
         })
         .collect();
     reply(Value::Array(results))

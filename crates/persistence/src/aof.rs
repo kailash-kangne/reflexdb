@@ -49,8 +49,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use bytes::{Bytes, BytesMut};
@@ -132,6 +133,12 @@ pub struct AofWriter {
     tx: Mutex<SyncSender<Job>>,
     // Keeps the writer thread alive for the program's lifetime.
     _worker: thread::JoinHandle<()>,
+    /// Set when the writer thread's last `write`/`fsync` failed, cleared
+    /// once a batch lands cleanly. `append()` is fire-and-forget, so a
+    /// client whose write was dropped by a failed batch has already been
+    /// acked — like Redis's `MISCONF`, all we can do is refuse *subsequent*
+    /// writes instead of acknowledging more data that can't persist.
+    io_failed: Arc<AtomicBool>,
 }
 
 impl AofWriter {
@@ -149,11 +156,13 @@ impl AofWriter {
             n == magic.len() && &magic == AOF_MAGIC
         };
         let (tx, rx) = mpsc::sync_channel(4096);
+        let io_failed = Arc::new(AtomicBool::new(false));
+        let thread_flag = io_failed.clone();
         let worker = thread::Builder::new()
             .name("reflexdb-aof-writer".into())
-            .spawn(move || writer_loop(file, rx, fsync, compressed))
+            .spawn(move || writer_loop(file, rx, fsync, compressed, thread_flag))
             .map_err(|e| io::Error::other(format!("failed to spawn AOF writer thread: {e}")))?;
-        Ok(Self { tx: Mutex::new(tx), _worker: worker })
+        Ok(Self { tx: Mutex::new(tx), _worker: worker, io_failed })
     }
 
     /// Queue one command for the log, to be preceded by a `SELECT` if the
@@ -172,7 +181,24 @@ impl AofWriter {
     }
 
     fn send(&self, job: Job) -> io::Result<()> {
-        self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(job).map_err(|_| writer_gone())
+        let result = self.tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(job);
+        if result.is_err() {
+            self.io_failed.store(true, Ordering::Relaxed);
+        }
+        result.map_err(|_| writer_gone())
+    }
+
+    /// `true` once the writer thread (or a failed `send`) has reported a
+    /// persistence failure — the dispatch layer turns this into a `MISCONF`
+    /// refusal so acknowledged writes can't silently outpace the log.
+    pub fn io_failed(&self) -> bool {
+        self.io_failed.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: simulates the writer thread reporting a disk failure.
+    #[doc(hidden)]
+    pub fn force_io_failure(&self) {
+        self.io_failed.store(true, Ordering::Relaxed);
     }
 
     /// Blocks until everything already queued before this call has been
@@ -353,7 +379,13 @@ fn writer_gone() -> io::Error {
 /// queued without blocking, coalescing all of it into one `write` (and at
 /// most one `fsync`) — this is what turns N concurrent callers into O(1)
 /// syscalls instead of N.
-fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync, mut compressed: bool) {
+fn writer_loop(
+    mut file: File,
+    rx: Receiver<Job>,
+    fsync_policy: Fsync,
+    mut compressed: bool,
+    io_failed: Arc<AtomicBool>,
+) {
     const MAX_REWRITE_MIRROR_BYTES: usize = 256 * 1024 * 1024;
     const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
     let mut last_db: Option<usize> = None;
@@ -451,6 +483,9 @@ fn writer_loop(mut file: File, rx: Receiver<Job>, fsync_policy: Fsync, mut compr
         if let Err(e) = &fsync_result {
             tracing::warn!(error = %e, "AOF writer thread failed to fsync");
         }
+        // A clean batch clears the flag — a transient failure (full disk
+        // that got freed, e.g.) self-heals once writes land again.
+        io_failed.store(write_result.is_err() || fsync_result.is_err(), Ordering::Relaxed);
 
         // Swap the whole file over to `base` + whatever the side buffer
         // captured, only after this batch's normal write/fsync above has

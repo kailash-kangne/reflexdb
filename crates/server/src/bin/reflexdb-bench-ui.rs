@@ -435,10 +435,20 @@ const HTML: &str = r###"<!DOCTYPE html>
     file: <code>10kb</code>, <code>1mb</code>, etc.
   </span></span></label><input id="tieredMemoryLimit" value="10kb">
   <label>Tiered disk limit (blank = unbounded)<span class="info-icon" tabindex="0">i<span class="info-tooltip">
-    Once the disk tier itself exceeds this, cold tiered entries are dropped outright (real loss,
-    same spirit as <code>allkeys-random</code> — nowhere left to move them). Leave blank to test
-    the old unbounded behavior.
+    Disk-tier capacity. What a full tier does is the overflow policy's choice below —
+    <code>reject-writes</code> refuses new keys, <code>evict-oldest</code> drops cold tiered
+    entries outright (real loss). Leave blank for unbounded.
   </span></span></label><input id="tieredDiskLimit" value="50kb">
+  <label>Overflow policy<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    <code>reject-writes</code> (recommended) — once RAM and disk are both full, new-key writes
+    fail with <code>ERR TIERED_STORAGE_FULL</code>; deletes and overwrites still work, nothing
+    is lost. <code>evict-oldest</code> — drops oldest tiered entries (cache semantics, real
+    data loss). <code>no-limit</code> — disk limit ignored.
+  </span></span></label><select id="tieredOverflowPolicy">
+    <option value="reject-writes" selected>reject-writes (no data loss)</option>
+    <option value="evict-oldest">evict-oldest (cache semantics)</option>
+    <option value="no-limit">no-limit (unbounded)</option>
+  </select>
   <label>Keys to write</label><input id="tieredCount" value="2000" type="number">
   <label>Value size (bytes)</label><input id="tieredSize" value="2000" type="number">
   <div class="actions">
@@ -1156,6 +1166,7 @@ tieredRunBtn.onclick = async () => {
     port: document.getElementById('tieredPort').value,
     tiered_memory_limit: document.getElementById('tieredMemoryLimit').value.trim(),
     tiered_disk_limit: document.getElementById('tieredDiskLimit').value.trim(),
+    overflow_policy: document.getElementById('tieredOverflowPolicy').value,
     count: document.getElementById('tieredCount').value,
     size: document.getElementById('tieredSize').value,
   }).toString();
@@ -1202,9 +1213,15 @@ tieredRunBtn.onclick = async () => {
             (evt.tiered_disk_tracked_bytes > 0
               ? `tiered-memory-limit is working: some keys moved to disk.\n`
               : `Nothing moved to disk yet — tiered-memory-limit may be larger than what was written.\n`) +
-            (evt.dbsize < evt.written
-              ? `tiered-disk-limit is working: ${evt.written - evt.dbsize} key(s) were dropped outright ` +
+            (evt.rejected > 0
+              ? `reject-writes is working: ${evt.rejected} write(s) refused with TIERED_STORAGE_FULL ` +
+                `once the disk tier filled up — nothing was discarded.\n`
+              : evt.dbsize < evt.written
+              ? `evict-oldest is working: ${evt.written - evt.dbsize} key(s) were dropped outright ` +
                 `once the disk tier filled up.\n`
+              : '') +
+            (evt.spill_failures > 0
+              ? `${evt.spill_failures} spill attempt(s) hit the full tier — those keys stayed in RAM.\n`
               : '');
         } else if (evt.type === 'promote_check') {
           document.getElementById('tsPromote').textContent = evt.ms + ' ms';
@@ -2406,6 +2423,11 @@ async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std:
     let port = text("port", "17391").parse::<u16>().unwrap_or(17391);
     let mem_limit = text("tiered_memory_limit", "10kb");
     let disk_limit = text("tiered_disk_limit", "");
+    let overflow_policy = match text("overflow_policy", "reject-writes").as_str() {
+        "evict-oldest" => "evict-oldest",
+        "no-limit" => "no-limit",
+        _ => "reject-writes",
+    };
     let count = text("count", "2000").parse::<usize>().unwrap_or(2000).clamp(1, 1_000_000);
     let size = text("size", "2000").parse::<usize>().unwrap_or(2000).clamp(1, 10_000_000);
     let prefix = "tiered:demo:";
@@ -2459,6 +2481,8 @@ async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std:
     if !disk_limit.is_empty() {
         args.push("--tiered-disk-limit".to_string());
         args.push(disk_limit);
+        args.push("--tiered-overflow-policy".to_string());
+        args.push(overflow_policy.to_string());
     }
     let spawned = Command::new(&server_bin)
         .args(&args)
@@ -2507,14 +2531,29 @@ async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std:
     };
 
     let value = "x".repeat(size);
+    let mut rejected = 0usize;
     for i in 0..count {
         let key = format!("{prefix}{i}");
-        if client.call(&["SET", &key, &value]).await.is_err() {
-            let _ = write_chunk(socket, "{\"type\":\"error\",\"message\":\"SET failed mid-run\"}\n").await;
-            socket.write_all(b"0\r\n\r\n").await?;
-            let _ = child.kill().await;
-            let _ = std::fs::remove_dir_all(&data_dir);
-            return Ok(());
+        match client.call(&["SET", &key, &value]).await {
+            // Under `reject-writes` a full tier answers `-ERR
+            // TIERED_STORAGE_FULL` — that's the point of the demo, not a
+            // transport failure, so count it and keep going.
+            Ok(Reply::Error(_)) => rejected += 1,
+            Ok(_) => {}
+            Err(_) => {
+                let _ =
+                    write_chunk(socket, "{\"type\":\"error\",\"message\":\"SET failed mid-run\"}\n").await;
+                socket.write_all(b"0\r\n\r\n").await?;
+                let _ = child.kill().await;
+                let _ = std::fs::remove_dir_all(&data_dir);
+                return Ok(());
+            }
+        }
+        // Pace the loop a little — `reject-writes` only engages once the
+        // ~100ms maintenance tick has refreshed `approx_memory`, and a
+        // flat-out burst would finish before the first tick.
+        if i % 10 == 9 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         if i % 50 == 0 || i + 1 == count {
             let line = format!("{{\"type\":\"progress\",\"written\":{},\"total\":{}}}\n", i + 1, count);
@@ -2546,8 +2585,9 @@ async fn handle_tiered_demo(query: Option<&str>, socket: &mut TcpStream) -> std:
     // whichever doesn't match the configured limit.
     let disk_kb = get_dir_disk_kb(&data_dir.join("tiered").to_string_lossy()).await;
     let tracked_bytes = fetch_info_u64(&host, port, "tiered_disk_used_bytes").await.unwrap_or(0);
+    let spill_failures = fetch_info_u64(&host, port, "tiered_spill_failures").await.unwrap_or(0);
     let line = format!(
-        "{{\"type\":\"summary\",\"written\":{count},\"dbsize\":{dbsize},\"tiered_disk_kb\":{disk_kb},\"tiered_disk_tracked_bytes\":{tracked_bytes}}}\n"
+        "{{\"type\":\"summary\",\"written\":{count},\"dbsize\":{dbsize},\"tiered_disk_kb\":{disk_kb},\"tiered_disk_tracked_bytes\":{tracked_bytes},\"rejected\":{rejected},\"spill_failures\":{spill_failures}}}\n"
     );
     if write_chunk(socket, &line).await.is_err() {
         return Ok(());

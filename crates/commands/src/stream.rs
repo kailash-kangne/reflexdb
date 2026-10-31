@@ -140,7 +140,7 @@ pub fn cmd_xadd(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
 
     match result {
         Ok(id) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 't', "xadd", key);
             reply(Value::bulk(id.to_display_string()))
         }
@@ -222,7 +222,7 @@ pub fn cmd_xdel(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
         None => reply(Value::Integer(0)),
         Some(Ok(removed)) => {
             if removed > 0 {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, 't', "xdel", key);
             }
             reply(Value::Integer(removed as i64))
@@ -249,7 +249,7 @@ pub fn cmd_xtrim(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Ou
         None => reply(Value::Integer(0)),
         Some(Ok(removed)) => {
             if removed > 0 {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, 't', "xtrim", key);
             }
             reply(Value::Integer(removed as i64))
@@ -285,7 +285,7 @@ pub fn cmd_xgroup(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         );
         return match result {
             Ok(true) => {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 reply(Value::ok())
             }
             Ok(false) => err("BUSYGROUP Consumer Group name already exists"),
@@ -308,7 +308,7 @@ pub fn cmd_xgroup(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         });
         match result {
             Some(Ok(true)) => {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 reply(Value::ok())
             }
             Some(Ok(false)) | None => nogroup(key, &group),
@@ -325,7 +325,7 @@ pub fn cmd_xgroup(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         });
         match result {
             Some(Ok(true)) => {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 reply(Value::Integer(1))
             }
             Some(Ok(false)) | None => reply(Value::Integer(0)),
@@ -339,7 +339,7 @@ pub fn cmd_xgroup(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         });
         match result {
             Some(Ok(Some(true))) => {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 reply(Value::Integer(1))
             }
             Some(Ok(Some(false))) => reply(Value::Integer(0)),
@@ -354,7 +354,7 @@ pub fn cmd_xgroup(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         });
         match result {
             Some(Ok(Some(n))) => {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 reply(Value::Integer(n as i64))
             }
             Some(Ok(None)) | None => nogroup(key, &group),
@@ -387,7 +387,7 @@ pub fn cmd_xack(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
         None => reply(Value::Integer(0)),
         Some(Ok(n)) => {
             if n > 0 {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
             }
             reply(Value::Integer(n as i64))
         }
@@ -531,7 +531,7 @@ pub fn cmd_xreadgroup(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) 
         });
         match result {
             Some(Ok(entries)) => {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 out.push((key.clone(), entries));
             }
             Some(Err(false)) => return wrong_type(),
@@ -734,7 +734,7 @@ pub fn cmd_xclaim(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     match result {
         Some(Ok(Some(claimed))) => {
             if !claimed.is_empty() {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, 't', "xclaim", key);
             }
             reply(Value::Array(if justid {
@@ -792,7 +792,7 @@ pub fn cmd_xautoclaim(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) 
     match result {
         Some(Ok(Some((cursor, claimed, deleted)))) => {
             if !claimed.is_empty() || !deleted.is_empty() {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, 't', "xautoclaim", key);
             }
             let claimed_v = if justid {

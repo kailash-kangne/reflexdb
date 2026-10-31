@@ -60,12 +60,27 @@ underlying key changes.
 
 ## Persistence
 
+Three operating profiles via `profile <name>` — a preset bundle so a deployment's durability
+posture is one word, not a handful of knobs. Directives listed *after* `profile` in the config
+file override its individual values:
+
+| Profile | Sets | Guarantee |
+|---------|------|-----------|
+| `cache` | `appendonly no` | pure in-memory — **total data loss on restart** (an existing `dbfilename` snapshot still loads) |
+| `durable` | `appendonly yes` + `appendfsync always` | every acknowledged write is fsync'd before the client sees it — survives `kill -9` with zero loss; OS/hardware crash can still lose it |
+| `replicated` | `appendonly yes` + `appendfsync everysec` + `min-replicas-to-write 1` | writes are refused (`NOREPLICAS`) unless at least one healthy replica is attached; `WAIT`/`WAITAOF` give per-write acks; failover keeps data the replica already applied |
+
+Raw knobs for non-profile setups:
+
 | Mode | Config | Use case |
 |------|--------|----------|
-| Cache only (default) | `appendonly no` | pure in-memory; snapshots still load at startup if a `dbfilename` file exists |
 | Snapshot only | `appendonly no` + explicit `SAVE`/`BGSAVE` (no periodic `save` directive — verified 2026-11-01) | restartable, tolerates total loss since last snapshot |
 | AOF only | `appendonly yes` | max durability |
 | Hybrid | `appendonly yes` + periodic `SAVE`/`BGSAVE` | fast restart + low loss |
+
+- `min-replicas-to-write <n>` works standalone too: write commands fail while fewer than `n`
+  connected replicas are healthy (not flagged slow). The replication-apply path and AOF replay
+  are exempt — a replica must keep applying its primary's stream regardless.
 
 - **RDB**: `SAVE` is synchronous to the client but runs on Tokio's blocking pool; `BGSAVE`
   serializes on that pool and writes/renames on a background OS thread — no `fork()`. New
@@ -78,6 +93,15 @@ underlying key changes.
   commands under `everysec`; `WAITAOF` is the call that explicitly blocks for a real fsync.
   `BGREWRITEAOF` compacts to one command per live key (manual trigger only — no automatic
   rewrite-on-growth yet).
+- **AOF failure handling**: because `append` is fire-and-forget, a batch the writer thread
+  fails to write (disk full, I/O error) has already been acked to its client. Once that
+  happens all subsequent writes are refused with `MISCONF Errors writing to the AOF file`
+  (same contract Redis uses) until a batch lands cleanly — acknowledged-but-unpersisted
+  writes never silently pile up.
+- **Graceful shutdown**: `SIGTERM`/`SIGINT` and `SHUTDOWN` run the same ritual — block
+  until every queued AOF write is fsync'd, then take a final RDB snapshot only when AOF
+  is off and a dump path is configured (`SHUTDOWN SAVE`/`NOSAVE` overrides either way).
+  `kill -9` gets no ritual; that's what `appendfsync`/`profile` is for.
 
 ## Tiered storage
 
@@ -89,15 +113,23 @@ and promoted back to RAM on the next read — so the working set can exceed the 
 | `tiered-storage` | `no` | enable the disk tier |
 | `tiered-memory-limit` | 250MB | RAM budget before tiering kicks in |
 | `tiered-dir` | `./tiered` | where LSM files land |
-| `tiered-promotion` | `on-access` | when to pull a key back to RAM |
-| `tiered-disk-limit` | unset (unbounded) | once the disk tier itself exceeds this, the oldest-evicted entries are dropped outright, oldest-first, down to 50% of the limit (real data loss — there's nowhere left to move them) |
+| `tiered-disk-limit` | unset (unbounded) | disk-tier capacity; what "full" does is `tiered-overflow-policy`'s choice |
+| `tiered-overflow-policy` | `reject-writes` | `reject-writes` — once RAM is over `tiered-memory-limit` *and* the disk tier is at `tiered-disk-limit`, new-key writes fail with `ERR TIERED_STORAGE_FULL` (deletes/updates of existing keys still work — every acknowledged byte is preserved). `evict-oldest` — drops oldest tiered entries down to ~50% of the limit (real data loss, cache semantics). `no-limit` — no enforcement even with a limit set. Only consulted when `tiered-disk-limit` is set |
 | `eviction-tick-ms` | 100 | how often the background task re-checks `maxmemory`/`tiered-memory-limit`/`tiered-disk-limit` and runs TTL active-expire — a background task, not the request path, so lowering it reacts to write bursts faster for free (small extra idle-tick CPU, not request latency) |
 
 A tiered key and its RAM copy never coexist (promotion is a move, not a copy). `EXISTS` answers
 truthfully for tiered keys without a disk read. RAM hits avoid a blocking-pool handoff; actual
 Fjall I/O uses Tokio's `block_in_place` on its multi-thread runtime. Tier spill ordering follows
 the configured maxmemory policy, including LRU/LFU ranking. TTLs on sliding-mode keys don't
-survive a tier round-trip.
+survive a tier round-trip. If the disk tier is full when a key would spill, the key stays in RAM
+(spill failure is counted, not silently dropped).
+
+A ~60-second background task does tier housekeeping off the latency path: GCs entries that
+expired while untouched, then `major_compact`s the LSM once ≥10K tombstones accumulated or an
+hour passed — deletes don't reclaim file space until compaction. `INFO` reports
+`tiered_evictions`, `tiered_disk_drops`, `tiered_rejected_writes`, `tiered_spill_failures`,
+`tiered_expired_dropped`, `tiered_entries_removed`, `tiered_compactions`, `tiered_compacting`,
+`tiered_disk_used_bytes`, and the active `tiered_overflow_policy`.
 
 ## Replication & HA
 
@@ -119,12 +151,16 @@ survive a tier round-trip.
 ## Security
 
 - `AUTH` (`requirepass`) and ACL: users, on/off, passwords (plaintext/hashed), command
-  allow/deny (`+cmd`/`-cmd`/`allcommands`/`nocommands`), key-glob patterns (`~pattern`).
-- Accepted but not enforced yet: ACL command categories (`+@read`/`+@write`), read/write-scoped
-  key patterns (`%R~`/`%W~`).
-- Not implemented: `ACL LOG`/`LOAD`/`SAVE`/`DRYRUN`, `&pattern` pub/sub ACLs, `aclfile`.
-- TLS (`rustls`) on client and replication links, mutual TLS optional.
-- `protected-mode`, `rename-command`, `sanitize-dump-payload`.
+  allow/deny (`+cmd`/`-cmd`/`allcommands`/`nocommands`), command categories
+  (`+@read`/`-@write`/...), key-glob patterns (`~pattern`) and read/write-scoped key
+  patterns (`%R~`/`%W~`). Rule precedence: explicit `+cmd`/`-cmd` over category rules over
+  `allcommands`/`nocommands` (Redis applies tokens left-to-right instead).
+- Rejected rather than silently accepted: `&pattern` pub/sub channel ACLs, `(...)` selectors,
+  and unknown `+@category` names — rules that can't be enforced fail `SETUSER` loudly.
+- Not implemented: `ACL LOG`/`LOAD`/`SAVE`/`DRYRUN`, `aclfile` (users are in-memory only).
+- TLS (`rustls`) on the client listener. Set `port 0` for TLS-only operation — plaintext is
+  then never bound. Not implemented: mutual TLS (`tls-auth-clients`), CA config, TLS on the
+  replication link.
 
 ## Scripting
 
