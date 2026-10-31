@@ -89,10 +89,11 @@ Not being built.
 `DOCS`, `GETKEYS`, `GETKEYSANDFLAGS`, `INFO`, `LIST`), `CONFIG` (`GET`, `REWRITE`, `RESETSTAT`,
 `SET`), `DBSIZE`, `FLUSHALL`, `FLUSHDB`, `INFO`, `LASTSAVE`, `LATENCY` (`DOCTOR`,
 `GRAPH`, `HISTOGRAM`, `HISTORY`, `LATEST`, `RESET`), `MEMORY` (`DOCTOR`,
-`MALLOC-STATS`, `PURGE`, `STATS`, `USAGE`), `SAVE`, `SLOWLOG`
-(`GET`, `HELP`, `LEN`, `RESET`), `TIME`
+`MALLOC-STATS`, `PURGE`, `STATS`, `USAGE`), `SAVE`, `SHUTDOWN` (`[NOSAVE|SAVE]` —
+flushes the AOF, writes a final RDB when AOF is off unless `NOSAVE`, then exits),
+`SLOWLOG` (`GET`, `HELP`, `LEN`, `RESET`), `TIME`
 
-`FAILOVER`, `LOLWUT`, `MONITOR`, `ROLE`, `SHUTDOWN`, `SWAPDB` — **[planned]** (listed in Redis'
+`FAILOVER`, `LOLWUT`, `MONITOR`, `ROLE`, `SWAPDB` — **[planned]** (listed in Redis'
 server group; not implemented yet — verified 2026-11-01, they return `ERR unknown command`).
 
 `MODULE` — parsed but no-op (extensions are compiled-in Rust crates, not `.so` modules).

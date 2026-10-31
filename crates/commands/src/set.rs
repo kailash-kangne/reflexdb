@@ -29,7 +29,7 @@ pub fn cmd_sadd(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
 
     match result {
         Ok(added) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 's', "sadd", &key);
             reply(Value::Integer(added as i64))
         }
@@ -58,7 +58,7 @@ pub fn cmd_srem(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     };
     db.remove_if_empty(key);
     if removed > 0 {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 's', "srem", key);
     }
     reply(Value::Integer(removed as i64))
@@ -221,7 +221,7 @@ pub fn cmd_spop(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     };
     db.remove_if_empty(key);
     if !chosen.is_empty() {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 's', "spop", key);
     }
     match count {
@@ -329,7 +329,7 @@ pub fn cmd_store(ctx: &ServerContext, state: &ClientState, args: &[Bytes], op: S
     } else {
         db.set(destination.clone(), KVal::Set(result.into_iter().collect()), None);
     }
-    on_key_changed(ctx, state.db_index, destination.clone());
+    on_key_changed(ctx, state, state.db_index, destination.clone(), None);
     notify_keyspace_event(ctx, state.db_index, 's', "store", &destination);
     reply(Value::Integer(
         db.with_value(&destination, |v| match v {

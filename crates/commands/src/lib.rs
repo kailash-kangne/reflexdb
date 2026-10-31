@@ -32,7 +32,7 @@ mod zset;
 
 pub use dispatch::{
     dispatch, request_may_write, ClientPush, ClientState, ClientWriter, MaxMemoryPolicy, NotifyFlags,
-    Outcome, ServerContext,
+    Outcome, ServerContext, TieredOverflowPolicy,
 };
 pub use replication::ReplicaMessage;
 pub use singleflight::SingleFlightLease;

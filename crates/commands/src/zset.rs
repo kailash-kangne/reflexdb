@@ -47,7 +47,7 @@ pub fn cmd_zadd(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
 
     match result {
         Ok(added) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'z', "zadd", &key);
             reply(Value::Integer(added as i64))
         }
@@ -80,7 +80,7 @@ pub fn cmd_zincrby(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> 
     );
     match result {
         Ok(score) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'z', "zincr", &key);
             reply(Value::bulk(format_score(score)))
         }
@@ -271,7 +271,7 @@ pub fn cmd_algebra(
             }
             db.set(destination.clone(), KVal::ZSet(z), None);
         }
-        on_key_changed(ctx, state.db_index, destination.clone());
+        on_key_changed(ctx, state, state.db_index, destination.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'z', "zstore", &destination);
         reply(Value::Integer(result.len() as i64))
     } else {
@@ -356,7 +356,7 @@ pub fn cmd_lex(
             .unwrap_or(0);
         db.remove_if_empty(key);
         if removed > 0 {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'z', name, key);
         }
         reply(Value::Integer(removed as i64))
@@ -513,7 +513,7 @@ pub fn cmd_zrangestore(ctx: &ServerContext, state: &ClientState, args: &[Bytes])
         }
         db.set(dest.clone(), KVal::ZSet(z), None);
     }
-    on_key_changed(ctx, state.db_index, dest.clone());
+    on_key_changed(ctx, state, state.db_index, dest.clone(), None);
     notify_keyspace_event(ctx, state.db_index, 'z', "rangestore", dest);
     reply(Value::Integer(selected.len() as i64))
 }
@@ -627,7 +627,7 @@ pub fn cmd_zrem(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     };
     db.remove_if_empty(key);
     if removed > 0 {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'z', "zrem", key);
     }
     reply(Value::Integer(removed as i64))
@@ -834,7 +834,7 @@ pub fn cmd_zremrangebyscore(ctx: &ServerContext, state: &ClientState, args: &[By
     };
     db.remove_if_empty(key);
     if removed > 0 {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'z', "zremrangebyscore", key);
     }
     reply(Value::Integer(removed as i64))
@@ -874,7 +874,7 @@ pub fn cmd_zremrangebyrank(ctx: &ServerContext, state: &ClientState, args: &[Byt
     };
     db.remove_if_empty(key);
     if removed > 0 {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'z', "zremrangebyrank", key);
     }
     reply(Value::Integer(removed as i64))
@@ -915,7 +915,7 @@ fn zpop(ctx: &ServerContext, state: &ClientState, args: &[Bytes], name: &str, mi
         Some(Ok(items)) => {
             db.remove_if_empty(key);
             if !items.is_empty() {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, 'z', name, key);
             }
             reply(Value::Array(render(&items, true)))
@@ -946,7 +946,7 @@ pub(crate) fn pop_one(
         Some(Ok(None)) => None,
         Some(Ok(Some(item))) => {
             db.remove_if_empty(key);
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'z', if min { "zpopmin" } else { "zpopmax" }, key);
             Some(Ok(item))
         }
@@ -1026,7 +1026,7 @@ pub fn cmd_zmpop(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes], b
             }
             Some(Ok(values)) => {
                 db.remove_if_empty(key);
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 let command = if min { "zpopmin" } else { "zpopmax" };
                 notify_keyspace_event(ctx, state.db_index, 'z', command, key);
                 let mut effect =

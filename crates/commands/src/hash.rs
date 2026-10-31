@@ -35,7 +35,7 @@ pub fn cmd_hset(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
 
     match result {
         Ok(added) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'h', "hset", &key);
             reply(Value::Integer(added as i64))
         }
@@ -63,7 +63,7 @@ pub fn cmd_hsetnx(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
     );
     match result {
         Ok(true) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'h', "hset", key);
             reply(Value::Integer(1))
         }
@@ -111,7 +111,7 @@ pub fn cmd_hincrbyfloat(ctx: &ServerContext, state: &ClientState, args: &[Bytes]
     );
     match result {
         Ok(formatted) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'h', "hincrbyfloat", key);
             reply(Value::bulk(formatted))
         }
@@ -225,7 +225,7 @@ pub fn cmd_hdel(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     };
     db.remove_if_empty(key);
     if removed > 0 {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'h', "hdel", key);
     }
     reply(Value::Integer(removed as i64))
@@ -289,7 +289,7 @@ pub fn cmd_hincrby(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> 
     );
     match result {
         Ok(n) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'h', "hincrby", key);
             reply(Value::Integer(n))
         }

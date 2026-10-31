@@ -92,11 +92,11 @@ Then open `http://127.0.0.1:8080` and pick a workload tab.
 
 ### One real comparison so far
 
-On 2026-11-01, Redis, Dragonfly, and ReflexDB were tested in Docker with the same 2 GiB memory
+Redis, Dragonfly, and ReflexDB were tested in Docker with the same 2 GiB memory
 cap, 16 clients, and workloads, running one engine at a time (median of 3 runs per case).
-Pipeline depth 16 delivered roughly 9–10× the throughput of depth 1. On an idle host ReflexDB
-led all eight cases; a second pass with an unrelated container stack running on the host split
-the lead 4–4 with Redis, all inside ~±15% of each other. Repeat the test before drawing firm
+Pipeline depth 16 delivered roughly 9–10× the throughput of depth 1. ReflexDB led all eight
+cases on an idle host, and again on a loaded-host rerun with an unrelated container stack
+running alongside — all three engines within ~±15% of each other. Repeat the test before drawing firm
 performance conclusions. See
 [the benchmark setup and results](docs/BENCHMARKS.md#engine-shootout-reflexdb-vs-redis-vs-dragonfly).
 

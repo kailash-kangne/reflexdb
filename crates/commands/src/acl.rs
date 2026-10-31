@@ -1,22 +1,22 @@
 //! `ACL SETUSER`/`GETUSER`/`DELUSER`/`LIST`/`USERS`/`WHOAMI`/`CAT`/`GENPASS`
 //! and the permission checks `dispatch()` runs against the authenticated
-//! user on every command. See `docs/07-security.md` §2-3.
+//! user on every command. See `docs/SECURITY.md`.
 //!
-//! Scope, deliberately: command-level allow/deny (`+cmd`/`-cmd`/
-//! `allcommands`/`nocommands`) and key-glob patterns (`~pattern`/`allkeys`)
-//! are enforced. Command **categories** (`+@read`, `+@write`, ...) and
-//! read/write-scoped key patterns (`%R~pattern`/`%W~pattern`) are parsed
-//! (so `ACL SETUSER` doesn't error on them) but don't do real category or
-//! read-vs-write matching — nothing in reflexdb's command table is tagged
-//! with categories, and `%R~`/`%W~` patterns are just folded into the same
-//! full-access `key_patterns` list as plain `~pattern`. Pub/Sub channel
-//! patterns (`&pattern`) and `ACL LOG`/`LOAD`/`SAVE`/`DRYRUN`/`HELP` aren't
-//! implemented. Key-pattern enforcement only runs for a known list of
-//! single-key commands (`KEY_COMMANDS` below), not every command that
-//! happens to take a key as an argument.
+//! Enforced: command-level allow/deny (`+cmd`/`-cmd`/`allcommands`/
+//! `nocommands`), command categories (`+@read`, `-@write`, ... — see
+//! `command_categories`), key globs (`~pattern`/`allkeys`), and
+//! read/write-scoped key patterns (`%R~pattern`/`%W~pattern`).
+//! Rule precedence: explicit `+cmd`/`-cmd` beats categories, categories beat
+//! `allcommands`/`nocommands`; this differs from Redis's last-token-wins
+//! order but keeps `+get -@read` (grant one read) unsurprising.
+//!
+//! Rejected rather than silently accepted: pub/sub channel patterns
+//! (`&pattern`), `(...)` selectors, and unknown `+@category` names — a
+//! configuration that can't be enforced must fail loudly.
+//! `ACL LOG`/`LOAD`/`SAVE`/`DRYRUN`/`HELP` aren't implemented.
 //!
 //! This is a subset of the ACL command surface, not "full ACL" — see
-//! `docs/07-security.md` for the honest scope.
+//! `docs/SECURITY.md` for the honest scope.
 
 use std::collections::HashSet;
 
@@ -35,10 +35,17 @@ pub struct AclUser {
     pub nopass: bool,
     pub password_hashes: HashSet<String>,
     pub allkeys: bool,
+    /// `~pattern` — read and write access.
     pub key_patterns: Vec<String>,
+    /// `%R~pattern` — read-only access.
+    pub read_patterns: Vec<String>,
+    /// `%W~pattern` — write-only access.
+    pub write_patterns: Vec<String>,
     pub allcommands: bool,
     pub allowed_commands: HashSet<String>,
     pub denied_commands: HashSet<String>,
+    pub allowed_categories: u32,
+    pub denied_categories: u32,
 }
 
 impl AclUser {
@@ -54,27 +61,355 @@ impl AclUser {
                 .unwrap_or_default(),
             allkeys: true,
             key_patterns: Vec::new(),
+            read_patterns: Vec::new(),
+            write_patterns: Vec::new(),
             allcommands: true,
             allowed_commands: HashSet::new(),
             denied_commands: HashSet::new(),
+            allowed_categories: 0,
+            denied_categories: 0,
         }
     }
 
+    /// Explicit `+cmd`/`-cmd` rules win over categories; a denied category
+    /// still blocks `allcommands`. See module docs.
     pub fn can_run(&self, command: &str) -> bool {
         if self.denied_commands.contains(command) {
             return false;
         }
-        self.allcommands || self.allowed_commands.contains(command)
+        if self.allowed_commands.contains(command) {
+            return true;
+        }
+        let cats = command_categories(command);
+        if cats & self.denied_categories != 0 {
+            return false;
+        }
+        self.allcommands || cats & self.allowed_categories != 0
     }
 
-    pub fn can_access_key(&self, key: &[u8]) -> bool {
-        self.allkeys || self.key_patterns.iter().any(|p| pattern::matches(p.as_bytes(), key))
+    pub fn can_access_key(&self, key: &[u8], write: bool) -> bool {
+        let scoped = if write { &self.write_patterns } else { &self.read_patterns };
+        self.allkeys
+            || self.key_patterns.iter().chain(scoped.iter()).any(|p| pattern::matches(p.as_bytes(), key))
     }
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Command categories understood by `+@name`/`-@name`. `@all` is special.
+pub mod cat {
+    pub const READ: u32 = 1 << 0;
+    pub const WRITE: u32 = 1 << 1;
+    pub const KEYSPACE: u32 = 1 << 2;
+    pub const GENERIC: u32 = 1 << 3;
+    pub const ADMIN: u32 = 1 << 4;
+    pub const DANGEROUS: u32 = 1 << 5;
+    pub const CONNECTION: u32 = 1 << 6;
+    pub const PUBSUB: u32 = 1 << 7;
+    pub const SCRIPTING: u32 = 1 << 8;
+    pub const TRANSACTION: u32 = 1 << 9;
+    pub const BLOCKING: u32 = 1 << 10;
+    pub const SLOW: u32 = 1 << 11;
+    pub const FAST: u32 = 1 << 12;
+    pub const STRING: u32 = 1 << 13;
+    pub const HASH: u32 = 1 << 14;
+    pub const LIST: u32 = 1 << 15;
+    pub const SET: u32 = 1 << 16;
+    pub const SORTEDSET: u32 = 1 << 17;
+    pub const STREAM: u32 = 1 << 18;
+    pub const ALL: u32 = (1 << 19) - 1;
+}
+
+/// `+@name` → category bits; `None` for names we don't enforce so
+/// `SETUSER` rejects them instead of silently granting nothing.
+pub fn category_mask(name: &str) -> Option<u32> {
+    use cat::*;
+    Some(match name {
+        "all" => ALL,
+        "read" => READ,
+        "write" => WRITE,
+        "keyspace" => KEYSPACE,
+        "generic" => GENERIC,
+        "admin" => ADMIN,
+        "dangerous" => DANGEROUS,
+        "connection" => CONNECTION,
+        "pubsub" => PUBSUB,
+        "scripting" => SCRIPTING,
+        "transaction" => TRANSACTION,
+        "blocking" => BLOCKING,
+        "slow" => SLOW,
+        "fast" => FAST,
+        "string" => STRING,
+        "hash" => HASH,
+        "list" => LIST,
+        "set" => SET,
+        "sortedset" => SORTEDSET,
+        "stream" => STREAM,
+        _ => return None,
+    })
+}
+
+/// Inverse of `category_mask` for `ACL CAT`/`GETUSER` output.
+pub fn category_names(mask: u32) -> Vec<&'static str> {
+    [
+        ("read", cat::READ),
+        ("write", cat::WRITE),
+        ("keyspace", cat::KEYSPACE),
+        ("generic", cat::GENERIC),
+        ("admin", cat::ADMIN),
+        ("dangerous", cat::DANGEROUS),
+        ("connection", cat::CONNECTION),
+        ("pubsub", cat::PUBSUB),
+        ("scripting", cat::SCRIPTING),
+        ("transaction", cat::TRANSACTION),
+        ("blocking", cat::BLOCKING),
+        ("slow", cat::SLOW),
+        ("fast", cat::FAST),
+        ("string", cat::STRING),
+        ("hash", cat::HASH),
+        ("list", cat::LIST),
+        ("set", cat::SET),
+        ("sortedset", cat::SORTEDSET),
+        ("stream", cat::STREAM),
+    ]
+    .into_iter()
+    .filter_map(|(name, bit)| (mask & bit != 0).then_some(name))
+    .collect()
+}
+
+/// Every dispatched command's category bits — the single source used by
+/// both `command_categories` and `ACL CAT <category>`.
+const COMMAND_CATEGORY_TABLE: &[(&str, u32)] = &[
+    // connection
+    ("PING", cat::CONNECTION | cat::FAST),
+    ("ECHO", cat::CONNECTION | cat::FAST),
+    ("QUIT", cat::CONNECTION | cat::FAST),
+    ("AUTH", cat::CONNECTION | cat::FAST),
+    ("HELLO", cat::CONNECTION | cat::FAST),
+    ("RESET", cat::CONNECTION | cat::FAST),
+    ("SELECT", cat::CONNECTION | cat::FAST),
+    ("TIME", cat::FAST),
+    // pub/sub
+    ("PUBLISH", cat::PUBSUB | cat::FAST),
+    ("SUBSCRIBE", cat::PUBSUB),
+    ("PSUBSCRIBE", cat::PUBSUB),
+    ("UNSUBSCRIBE", cat::PUBSUB),
+    ("PUNSUBSCRIBE", cat::PUBSUB),
+    ("PUBSUB", cat::PUBSUB | cat::SLOW),
+    ("LIVE", cat::PUBSUB | cat::SLOW),
+    ("UNLIVE", cat::PUBSUB | cat::SLOW),
+    // transactions
+    ("MULTI", cat::TRANSACTION | cat::FAST),
+    ("DISCARD", cat::TRANSACTION | cat::FAST),
+    ("WATCH", cat::TRANSACTION | cat::FAST),
+    ("UNWATCH", cat::TRANSACTION | cat::FAST),
+    ("EXEC", cat::TRANSACTION | cat::SLOW),
+    // scripting
+    ("EVAL", cat::SCRIPTING | cat::WRITE | cat::SLOW),
+    ("EVALSHA", cat::SCRIPTING | cat::WRITE | cat::SLOW),
+    ("EVAL_RO", cat::SCRIPTING | cat::READ | cat::SLOW),
+    ("EVALSHA_RO", cat::SCRIPTING | cat::READ | cat::SLOW),
+    ("SCRIPT", cat::SCRIPTING | cat::SLOW),
+    // server admin / dangerous
+    ("CONFIG", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("ACL", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("CLIENT", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("INFO", cat::ADMIN | cat::SLOW),
+    ("COMMAND", cat::ADMIN | cat::SLOW),
+    ("LATENCY", cat::ADMIN | cat::SLOW),
+    ("SLOWLOG", cat::ADMIN | cat::SLOW),
+    ("MEMORY", cat::ADMIN | cat::SLOW),
+    ("OBJECT", cat::KEYSPACE | cat::READ | cat::SLOW),
+    ("DBSIZE", cat::KEYSPACE | cat::READ | cat::FAST),
+    ("SHUTDOWN", cat::ADMIN | cat::DANGEROUS),
+    ("SAVE", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("BGSAVE", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("BGREWRITEAOF", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("LASTSAVE", cat::ADMIN | cat::FAST),
+    ("FLUSHDB", cat::KEYSPACE | cat::WRITE | cat::SLOW | cat::DANGEROUS),
+    ("FLUSHALL", cat::KEYSPACE | cat::WRITE | cat::SLOW | cat::DANGEROUS),
+    ("REPLICAOF", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("SLAVEOF", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("REPLCONF", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("PSYNC", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("WAIT", cat::ADMIN | cat::BLOCKING | cat::SLOW),
+    ("WAITAOF", cat::ADMIN | cat::BLOCKING | cat::SLOW),
+    ("SCHEDULE", cat::ADMIN | cat::WRITE | cat::DANGEROUS),
+    // generic keyspace
+    ("DEL", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::FAST),
+    ("UNLINK", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::FAST),
+    ("EXISTS", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::FAST),
+    ("TTL", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::FAST),
+    ("PTTL", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::FAST),
+    ("EXPIRETIME", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::FAST),
+    ("PEXPIRETIME", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::FAST),
+    ("TYPE", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::FAST),
+    ("TOUCH", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::FAST),
+    ("EXPIRE", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::FAST),
+    ("PEXPIRE", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::FAST),
+    ("EXPIREAT", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::FAST),
+    ("PEXPIREAT", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::FAST),
+    ("PERSIST", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::FAST),
+    ("KEYS", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::SLOW | cat::DANGEROUS),
+    ("SCAN", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::SLOW),
+    ("RANDOMKEY", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::SLOW),
+    ("RENAME", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::SLOW),
+    ("RENAMENX", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::SLOW),
+    ("COPY", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::SLOW),
+    ("MOVE", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::FAST),
+    ("DUMP", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::SLOW),
+    ("RESTORE", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::SLOW | cat::DANGEROUS),
+    ("SORT", cat::GENERIC | cat::WRITE | cat::SLOW | cat::DANGEROUS),
+    ("SORT_RO", cat::GENERIC | cat::READ | cat::SLOW),
+    ("GETAT", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::SLOW),
+    ("HISTORY", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::SLOW),
+    // strings
+    ("GET", cat::STRING | cat::READ | cat::FAST),
+    ("STRLEN", cat::STRING | cat::READ | cat::FAST),
+    ("GETBIT", cat::STRING | cat::READ | cat::FAST),
+    ("GETEX", cat::STRING | cat::READ | cat::FAST),
+    ("BITFIELD_RO", cat::STRING | cat::READ | cat::FAST),
+    ("GETRANGE", cat::STRING | cat::READ | cat::SLOW),
+    ("MGET", cat::STRING | cat::READ | cat::SLOW),
+    ("BITCOUNT", cat::STRING | cat::READ | cat::SLOW),
+    ("BITPOS", cat::STRING | cat::READ | cat::SLOW),
+    ("SUBSTR", cat::STRING | cat::READ | cat::SLOW),
+    ("SET", cat::STRING | cat::WRITE | cat::FAST),
+    ("SETEX", cat::STRING | cat::WRITE | cat::FAST),
+    ("PSETEX", cat::STRING | cat::WRITE | cat::FAST),
+    ("SETNX", cat::STRING | cat::WRITE | cat::FAST),
+    ("APPEND", cat::STRING | cat::WRITE | cat::FAST),
+    ("INCR", cat::STRING | cat::WRITE | cat::FAST),
+    ("INCRBY", cat::STRING | cat::WRITE | cat::FAST),
+    ("DECR", cat::STRING | cat::WRITE | cat::FAST),
+    ("DECRBY", cat::STRING | cat::WRITE | cat::FAST),
+    ("INCRBYFLOAT", cat::STRING | cat::WRITE | cat::FAST),
+    ("GETDEL", cat::STRING | cat::WRITE | cat::FAST),
+    ("GETSET", cat::STRING | cat::WRITE | cat::FAST),
+    ("SETBIT", cat::STRING | cat::WRITE | cat::FAST),
+    ("MSET", cat::STRING | cat::WRITE | cat::SLOW),
+    ("MSETNX", cat::STRING | cat::WRITE | cat::SLOW),
+    ("SETRANGE", cat::STRING | cat::WRITE | cat::SLOW),
+    ("BITFIELD", cat::STRING | cat::WRITE | cat::SLOW),
+    ("BITOP", cat::STRING | cat::WRITE | cat::SLOW | cat::DANGEROUS),
+    // hashes
+    ("HGET", cat::HASH | cat::READ | cat::FAST),
+    ("HEXISTS", cat::HASH | cat::READ | cat::FAST),
+    ("HLEN", cat::HASH | cat::READ | cat::FAST),
+    ("HMGET", cat::HASH | cat::READ | cat::FAST),
+    ("HSTRLEN", cat::HASH | cat::READ | cat::FAST),
+    ("HRANDFIELD", cat::HASH | cat::READ | cat::FAST),
+    ("HGETALL", cat::HASH | cat::READ | cat::SLOW),
+    ("HKEYS", cat::HASH | cat::READ | cat::SLOW),
+    ("HVALS", cat::HASH | cat::READ | cat::SLOW),
+    ("HSCAN", cat::HASH | cat::READ | cat::SLOW),
+    ("HSET", cat::HASH | cat::WRITE | cat::FAST),
+    ("HMSET", cat::HASH | cat::WRITE | cat::FAST),
+    ("HSETNX", cat::HASH | cat::WRITE | cat::FAST),
+    ("HDEL", cat::HASH | cat::WRITE | cat::FAST),
+    ("HINCRBY", cat::HASH | cat::WRITE | cat::FAST),
+    ("HINCRBYFLOAT", cat::HASH | cat::WRITE | cat::FAST),
+    // lists
+    ("LLEN", cat::LIST | cat::READ | cat::FAST),
+    ("LINDEX", cat::LIST | cat::READ | cat::FAST),
+    ("LRANGE", cat::LIST | cat::READ | cat::SLOW),
+    ("LPOS", cat::LIST | cat::READ | cat::SLOW),
+    ("LPUSH", cat::LIST | cat::WRITE | cat::FAST),
+    ("RPUSH", cat::LIST | cat::WRITE | cat::FAST),
+    ("LPUSHX", cat::LIST | cat::WRITE | cat::FAST),
+    ("RPUSHX", cat::LIST | cat::WRITE | cat::FAST),
+    ("LPOP", cat::LIST | cat::WRITE | cat::FAST),
+    ("RPOP", cat::LIST | cat::WRITE | cat::FAST),
+    ("LSET", cat::LIST | cat::WRITE | cat::FAST),
+    ("LINSERT", cat::LIST | cat::WRITE | cat::FAST),
+    ("LMOVE", cat::LIST | cat::WRITE | cat::FAST),
+    ("LMPOP", cat::LIST | cat::WRITE | cat::FAST),
+    ("LTRIM", cat::LIST | cat::WRITE | cat::SLOW),
+    ("LREM", cat::LIST | cat::WRITE | cat::SLOW),
+    ("RPOPLPUSH", cat::LIST | cat::WRITE | cat::SLOW),
+    ("BLPOP", cat::LIST | cat::WRITE | cat::BLOCKING | cat::SLOW),
+    ("BRPOP", cat::LIST | cat::WRITE | cat::BLOCKING | cat::SLOW),
+    ("BLMPOP", cat::LIST | cat::WRITE | cat::BLOCKING | cat::SLOW),
+    ("BLMOVE", cat::LIST | cat::WRITE | cat::BLOCKING | cat::SLOW),
+    // sets
+    ("SISMEMBER", cat::SET | cat::READ | cat::FAST),
+    ("SMISMEMBER", cat::SET | cat::READ | cat::FAST),
+    ("SCARD", cat::SET | cat::READ | cat::FAST),
+    ("SRANDMEMBER", cat::SET | cat::READ | cat::FAST),
+    ("SINTERCARD", cat::SET | cat::READ | cat::FAST),
+    ("SMEMBERS", cat::SET | cat::READ | cat::SLOW),
+    ("SUNION", cat::SET | cat::READ | cat::SLOW),
+    ("SINTER", cat::SET | cat::READ | cat::SLOW),
+    ("SDIFF", cat::SET | cat::READ | cat::SLOW),
+    ("SSCAN", cat::SET | cat::READ | cat::SLOW),
+    ("SADD", cat::SET | cat::WRITE | cat::FAST),
+    ("SREM", cat::SET | cat::WRITE | cat::FAST),
+    ("SPOP", cat::SET | cat::WRITE | cat::FAST),
+    ("SMOVE", cat::SET | cat::WRITE | cat::FAST),
+    ("SUNIONSTORE", cat::SET | cat::WRITE | cat::SLOW),
+    ("SINTERSTORE", cat::SET | cat::WRITE | cat::SLOW),
+    ("SDIFFSTORE", cat::SET | cat::WRITE | cat::SLOW),
+    // sorted sets
+    ("ZSCORE", cat::SORTEDSET | cat::READ | cat::FAST),
+    ("ZMSCORE", cat::SORTEDSET | cat::READ | cat::FAST),
+    ("ZCARD", cat::SORTEDSET | cat::READ | cat::FAST),
+    ("ZRANK", cat::SORTEDSET | cat::READ | cat::FAST),
+    ("ZREVRANK", cat::SORTEDSET | cat::READ | cat::FAST),
+    ("ZCOUNT", cat::SORTEDSET | cat::READ | cat::FAST),
+    ("ZLEXCOUNT", cat::SORTEDSET | cat::READ | cat::FAST),
+    ("ZRANDMEMBER", cat::SORTEDSET | cat::READ | cat::FAST),
+    ("ZRANGE", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZRANGEBYSCORE", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZREVRANGE", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZREVRANGEBYSCORE", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZRANGEBYLEX", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZREVRANGEBYLEX", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZSCAN", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZDIFF", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZINTER", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZINTERCARD", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZUNION", cat::SORTEDSET | cat::READ | cat::SLOW),
+    ("ZADD", cat::SORTEDSET | cat::WRITE | cat::FAST),
+    ("ZINCRBY", cat::SORTEDSET | cat::WRITE | cat::FAST),
+    ("ZREM", cat::SORTEDSET | cat::WRITE | cat::FAST),
+    ("ZPOPMIN", cat::SORTEDSET | cat::WRITE | cat::FAST),
+    ("ZPOPMAX", cat::SORTEDSET | cat::WRITE | cat::FAST),
+    ("ZMPOP", cat::SORTEDSET | cat::WRITE | cat::FAST),
+    ("ZREMRANGEBYSCORE", cat::SORTEDSET | cat::WRITE | cat::SLOW),
+    ("ZREMRANGEBYRANK", cat::SORTEDSET | cat::WRITE | cat::SLOW),
+    ("ZREMRANGEBYLEX", cat::SORTEDSET | cat::WRITE | cat::SLOW),
+    ("ZRANGESTORE", cat::SORTEDSET | cat::WRITE | cat::SLOW),
+    ("ZDIFFSTORE", cat::SORTEDSET | cat::WRITE | cat::SLOW),
+    ("ZINTERSTORE", cat::SORTEDSET | cat::WRITE | cat::SLOW),
+    ("ZUNIONSTORE", cat::SORTEDSET | cat::WRITE | cat::SLOW),
+    ("BZPOPMIN", cat::SORTEDSET | cat::WRITE | cat::BLOCKING | cat::SLOW),
+    ("BZPOPMAX", cat::SORTEDSET | cat::WRITE | cat::BLOCKING | cat::SLOW),
+    ("BZMPOP", cat::SORTEDSET | cat::WRITE | cat::BLOCKING | cat::SLOW),
+    // streams
+    ("XLEN", cat::STREAM | cat::READ | cat::FAST),
+    ("XPENDING", cat::STREAM | cat::READ | cat::FAST),
+    ("XINFO", cat::STREAM | cat::READ | cat::FAST),
+    ("XRANGE", cat::STREAM | cat::READ | cat::SLOW),
+    ("XREVRANGE", cat::STREAM | cat::READ | cat::SLOW),
+    ("XREAD", cat::STREAM | cat::READ | cat::BLOCKING | cat::SLOW),
+    ("XADD", cat::STREAM | cat::WRITE | cat::SLOW),
+    ("XACK", cat::STREAM | cat::WRITE | cat::SLOW),
+    ("XAUTOCLAIM", cat::STREAM | cat::WRITE | cat::SLOW),
+    ("XCLAIM", cat::STREAM | cat::WRITE | cat::SLOW),
+    ("XDEL", cat::STREAM | cat::WRITE | cat::SLOW),
+    ("XGROUP", cat::STREAM | cat::WRITE | cat::SLOW),
+    ("XTRIM", cat::STREAM | cat::WRITE | cat::SLOW),
+    ("XREADGROUP", cat::STREAM | cat::WRITE | cat::BLOCKING | cat::SLOW),
+];
+
+/// Category bits for `name`. Commands not in the table get `0`: categories
+/// neither grant nor deny them (unknown commands anyway, or reachable only
+/// via explicit `+cmd`/`allcommands`).
+pub fn command_categories(name: &str) -> u32 {
+    COMMAND_CATEGORY_TABLE.iter().find_map(|(n, bits)| (*n == name).then_some(*bits)).unwrap_or(0)
 }
 
 /// Commands whose key operand is in the first argument position. Multi-key
@@ -306,7 +641,8 @@ pub fn authorize(user: &AclUser, name: &str, args: &[Bytes]) -> Result<(), Strin
             name.to_ascii_lowercase()
         ));
     }
-    if command_keys(name, args).into_iter().any(|key| !user.can_access_key(key)) {
+    let write = command_categories(name) & cat::WRITE != 0;
+    if command_keys(name, args).into_iter().any(|key| !user.can_access_key(key, write)) {
         return Err("NOPERM No permissions to access a key for this user".into());
     }
     Ok(())
@@ -332,23 +668,26 @@ pub fn cmd_acl(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outc
         "LIST" => reply(Value::Array(
             ctx.acl_users.iter().map(|e| Value::bulk(describe_user(e.key(), e.value()))).collect(),
         )),
-        "CAT" => reply(Value::Array(
-            [
-                "keyspace",
-                "read",
-                "write",
-                "string",
-                "list",
-                "hash",
-                "set",
-                "sortedset",
-                "connection",
-                "admin",
-            ]
-            .iter()
-            .map(|c| Value::bulk(*c))
-            .collect(),
-        )),
+        "CAT" => {
+            if let [name] = rest {
+                let name = String::from_utf8_lossy(name).to_ascii_lowercase();
+                return match category_mask(&name) {
+                    Some(mask) => reply(Value::Array(
+                        COMMAND_CATEGORY_TABLE
+                            .iter()
+                            .filter(|(_, bits)| bits & mask != 0)
+                            .map(|(c, _)| Value::bulk(c.to_ascii_lowercase()))
+                            .collect(),
+                    )),
+                    None => err(format!("ERR Unknown category '{name}'")),
+                };
+            }
+            reply(Value::Array(
+                std::iter::once(Value::bulk("all"))
+                    .chain(category_names(cat::ALL).into_iter().map(Value::bulk))
+                    .collect(),
+            ))
+        }
         "GENPASS" => {
             let mut rng = rand::thread_rng();
             let bytes: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
@@ -412,20 +751,28 @@ fn apply_setuser_tokens(user: &mut AclUser, tokens: &[Bytes]) -> Result<(), Stri
             "allkeys" => {
                 user.allkeys = true;
                 user.key_patterns.clear();
+                user.read_patterns.clear();
+                user.write_patterns.clear();
             }
             "resetkeys" => {
                 user.allkeys = false;
                 user.key_patterns.clear();
+                user.read_patterns.clear();
+                user.write_patterns.clear();
             }
-            "allcommands" => {
+            "allcommands" | "+@all" => {
                 user.allcommands = true;
                 user.allowed_commands.clear();
                 user.denied_commands.clear();
+                user.allowed_categories = 0;
+                user.denied_categories = 0;
             }
-            "nocommands" => {
+            "nocommands" | "-@all" => {
                 user.allcommands = false;
                 user.allowed_commands.clear();
                 user.denied_commands.clear();
+                user.allowed_categories = 0;
+                user.denied_categories = 0;
             }
             "reset" => *user = AclUser::default(),
             _ if text.starts_with('>') => {
@@ -451,16 +798,29 @@ fn apply_setuser_tokens(user: &mut AclUser, tokens: &[Bytes]) -> Result<(), Stri
                 user.allkeys = false;
                 user.key_patterns.push(text[4..].to_string());
             }
-            _ if text.starts_with("%R~") || text.starts_with("%W~") => {
-                // Read-only/write-only key patterns: accepted (so `SETUSER`
-                // doesn't error on otherwise-valid syntax) but, like command
-                // categories, not enforced separately — treated as full
-                // (read+write) key access on this pattern. See module docs.
+            _ if text.starts_with("%R~") => {
                 user.allkeys = false;
-                user.key_patterns.push(text[3..].to_string());
+                user.read_patterns.push(text[3..].to_string());
             }
-            _ if text.starts_with("+@") || text.starts_with("-@") => {
-                // Command categories: parsed but not enforced — see module docs.
+            _ if text.starts_with("%W~") => {
+                user.allkeys = false;
+                user.write_patterns.push(text[3..].to_string());
+            }
+            _ if text.starts_with("+@") => {
+                let name = &text[2..];
+                let Some(mask) = category_mask(name) else {
+                    return Err(format!("ERR Unrecognized ACL category '{name}'"));
+                };
+                user.allowed_categories |= mask;
+                user.denied_categories &= !mask;
+            }
+            _ if text.starts_with("-@") => {
+                let name = &text[2..];
+                let Some(mask) = category_mask(name) else {
+                    return Err(format!("ERR Unrecognized ACL category '{name}'"));
+                };
+                user.denied_categories |= mask;
+                user.allowed_categories &= !mask;
             }
             _ if text.starts_with('+') => {
                 let cmd = text[1..].to_ascii_uppercase();
@@ -473,7 +833,14 @@ fn apply_setuser_tokens(user: &mut AclUser, tokens: &[Bytes]) -> Result<(), Stri
                 user.denied_commands.insert(cmd);
             }
             _ if text.starts_with('&') => {
-                // Pub/Sub channel patterns: not enforced yet — see module docs.
+                return Err(format!(
+                    "ERR Error in ACL SETUSER modifier '{text}': channel patterns are not supported"
+                ));
+            }
+            _ if text.starts_with('(') => {
+                return Err(format!(
+                    "ERR Error in ACL SETUSER modifier '{text}': selectors are not supported"
+                ));
             }
             other => return Err(format!("ERR Error in ACL SETUSER modifier '{other}'")),
         }
@@ -488,24 +855,38 @@ fn describe_user(name: &str, user: &AclUser) -> String {
     } else {
         user.password_hashes.iter().map(|h| format!("#{h}")).collect::<Vec<_>>().join(" ")
     };
-    let keys = if user.allkeys {
-        "~*".to_string()
-    } else {
-        user.key_patterns.iter().map(|p| format!("~{p}")).collect::<Vec<_>>().join(" ")
-    };
-    let commands = if user.allcommands {
-        "+@all".to_string()
-    } else {
-        let mut parts: Vec<String> =
-            user.allowed_commands.iter().map(|c| format!("+{}", c.to_ascii_lowercase())).collect();
-        parts.extend(user.denied_commands.iter().map(|c| format!("-{}", c.to_ascii_lowercase())));
-        if parts.is_empty() {
-            "-@all".to_string()
-        } else {
-            parts.join(" ")
-        }
-    };
+    let keys = describe_keys(user);
+    let commands = describe_commands(user);
     format!("user {name} {status} {pass} {keys} {commands}")
+}
+
+fn describe_keys(user: &AclUser) -> String {
+    if user.allkeys {
+        return "~*".to_string();
+    }
+    user.key_patterns
+        .iter()
+        .map(|p| format!("~{p}"))
+        .chain(user.read_patterns.iter().map(|p| format!("%R~{p}")))
+        .chain(user.write_patterns.iter().map(|p| format!("%W~{p}")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn describe_commands(user: &AclUser) -> String {
+    if user.allcommands {
+        return "+@all".to_string();
+    }
+    let mut parts: Vec<String> =
+        user.allowed_commands.iter().map(|c| format!("+{}", c.to_ascii_lowercase())).collect();
+    parts.extend(user.denied_commands.iter().map(|c| format!("-{}", c.to_ascii_lowercase())));
+    parts.extend(category_names(user.allowed_categories).into_iter().map(|c| format!("+@{c}")));
+    parts.extend(category_names(user.denied_categories).into_iter().map(|c| format!("-@{c}")));
+    if parts.is_empty() {
+        "-@all".to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
 fn describe_user_map(user: &AclUser) -> Value {
@@ -522,18 +903,8 @@ fn describe_user_map(user: &AclUser) -> Value {
             Value::bulk("passwords"),
             Value::Array(user.password_hashes.iter().map(|h| Value::bulk(h.clone())).collect()),
         ),
-        (
-            Value::bulk("commands"),
-            Value::bulk(if user.allcommands { "+@all".to_string() } else { "-@all".to_string() }),
-        ),
-        (
-            Value::bulk("keys"),
-            Value::bulk(if user.allkeys {
-                "~*".to_string()
-            } else {
-                user.key_patterns.iter().map(|p| format!("~{p}")).collect::<Vec<_>>().join(" ")
-            }),
-        ),
+        (Value::bulk("commands"), Value::bulk(describe_commands(user))),
+        (Value::bulk("keys"), Value::bulk(describe_keys(user))),
         (Value::bulk("channels"), Value::bulk("")),
     ])
 }

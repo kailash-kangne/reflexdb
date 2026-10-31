@@ -32,6 +32,7 @@ async fn main() -> std::io::Result<()> {
     let store = if cfg.tiered_storage {
         match tiered::FjallTier::open(&cfg.tiered_dir_path()) {
             Ok(tier) => {
+                tier.set_disk_limit(cfg.tiered_disk_limit.unwrap_or(0));
                 tracing::info!(dir = %cfg.tiered_dir_path().display(), "tiered storage enabled");
                 keyspace::Store::new_with_tiering(cfg.databases, std::sync::Arc::new(tier))
             }
@@ -49,6 +50,7 @@ async fn main() -> std::io::Result<()> {
         .with_maxmemory(cfg.maxmemory, cfg.maxmemory_policy)
         .with_tiered_limit(cfg.tiered_storage.then_some(cfg.tiered_memory_limit))
         .with_tiered_disk_limit(cfg.tiered_storage.then_some(cfg.tiered_disk_limit).flatten())
+        .with_tiered_overflow_policy(cfg.tiered_overflow_policy)
         .with_slowlog(cfg.slowlog_log_slower_than_us, cfg.slowlog_max_len)
         .with_singleflight_max_wait(Duration::from_millis(cfg.singleflight_max_wait_ms))
         .with_notify_keyspace_events(commands::NotifyFlags::parse(&cfg.notify_keyspace_events))
@@ -59,6 +61,7 @@ async fn main() -> std::io::Result<()> {
             cfg.replica_backlog_max_bytes,
             Duration::from_millis(cfg.replica_slow_disconnect_ms),
         )
+        .with_min_replicas_to_write(cfg.min_replicas_to_write)
         .with_live_pacing(cfg.live_sweep_ms, cfg.live_pace_chunk, cfg.live_pace_ms);
 
     if cfg.history_enabled {
@@ -77,7 +80,10 @@ async fn main() -> std::io::Result<()> {
     if cfg.appendonly {
         match persistence::aof::replay(&cfg.aof_path()) {
             Ok(requests) => {
-                let mut scratch = ClientState::with_id(0, false);
+                // Internal apply: exempt from client-facing write gates
+                // (READONLY on replicas, min-replicas-to-write) so replayed
+                // data always lands.
+                let mut scratch = ClientState::for_replication_link();
                 let count = requests.len();
                 for req in requests {
                     dispatch(&ctx, &mut scratch, req);
@@ -99,6 +105,11 @@ async fn main() -> std::io::Result<()> {
             Ok(writer) => ctx = ctx.with_aof(writer, cfg.aof_path()),
             Err(e) => tracing::warn!(error = %e, "failed to open AOF for writing; continuing without it"),
         }
+    }
+
+    if let Some(profile) = &cfg.profile {
+        tracing::info!(%profile, appendonly = cfg.appendonly, appendfsync = ?cfg.appendfsync,
+            min_replicas_to_write = cfg.min_replicas_to_write, "durability profile applied");
     }
 
     let ctx = Arc::new(ctx);
@@ -126,6 +137,47 @@ async fn main() -> std::io::Result<()> {
                     tracing::warn!(%error, "maintenance task failed");
                 }
             }
+        });
+    }
+
+    // Periodic tiered-storage maintenance: GCs entries that expired while
+    // down or never got touched, and major-compacts the LSM once enough
+    // tombstones pile up — deletes don't reclaim file space until then.
+    // Off the latency path; coarse 60s interval is fine. No-op (and ~free)
+    // while `tiered-storage no`.
+    if cfg.tiered_storage {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let maintenance_ctx = ctx.clone();
+                if let Err(error) =
+                    tokio::task::spawn_blocking(move || maintenance_ctx.run_tiered_maintenance()).await
+                {
+                    tracing::warn!(%error, "tiered maintenance task failed");
+                }
+            }
+        });
+    }
+
+    // Graceful shutdown on SIGTERM/SIGINT: same ritual `SHUTDOWN` runs —
+    // final AOF fsync, plus an RDB snapshot when no AOF covers the writes.
+    // persist_for_shutdown blocks the caller for the duration; it's a
+    // dedicated task, so nothing else is harmed.
+    {
+        let shutdown_ctx = ctx.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            tracing::info!("shutdown signal received; flushing persistence");
+            shutdown_ctx.persist_for_shutdown(!shutdown_ctx.aof_enabled());
+            std::process::exit(0);
         });
     }
 
@@ -202,10 +254,12 @@ async fn main() -> std::io::Result<()> {
     }
 
     let connection_slots = Arc::new(Semaphore::new(cfg.maxclients));
+    let mut tls_listening = false;
     if cfg.tls_port != 0 {
         match (&cfg.tls_cert_file, &cfg.tls_key_file) {
             (Some(cert), Some(key)) => match tls::build_acceptor(cert, key) {
                 Ok(acceptor) => {
+                    tls_listening = true;
                     let ctx = ctx.clone();
                     let bind = cfg.bind.clone();
                     let tls_port = cfg.tls_port;
@@ -222,6 +276,16 @@ async fn main() -> std::io::Result<()> {
             },
             _ => tracing::warn!("tls-port set but tls-cert-file/tls-key-file missing; TLS disabled"),
         }
+    }
+
+    // `port 0` disables the plaintext listener (TLS-only mode).
+    if cfg.port == 0 {
+        if tls_listening {
+            tracing::info!("plaintext listener disabled (port 0); serving TLS only");
+            return std::future::pending().await;
+        }
+        eprintln!("reflexdb-server: both `port` and `tls-port` are disabled or TLS failed to start; nothing to listen on");
+        std::process::exit(1);
     }
 
     let addr = format!("{}:{}", cfg.bind, cfg.port);
@@ -438,6 +502,12 @@ where
                                 encode_out(&value, &state, &mut out);
                                 flush(&mut writer, &mut write_half, &out).await?;
                                 return Ok(());
+                            }
+                            // No reply first — like Redis, a client that
+                            // SHUTDOWNs just sees the connection die.
+                            Outcome::Shutdown { save } => {
+                                ctx.persist_for_shutdown(save);
+                                std::process::exit(0);
                             }
                             Outcome::SingleFlightWait(lease) => {
                                 flush(&mut writer, &mut write_half, &out).await?;
@@ -662,6 +732,9 @@ async fn resolve_singleflight(
             Outcome::BlockWait { .. } => {
                 return resp::Value::error("ERR unexpected blocking command during SINGLEFLIGHT retry")
             }
+            Outcome::Shutdown { .. } => {
+                return resp::Value::error("ERR unexpected SHUTDOWN during SINGLEFLIGHT retry")
+            }
         }
     }
 }
@@ -713,6 +786,9 @@ async fn resolve_block_wait(
             Outcome::NoReply => return resp::Value::NullBulk,
             Outcome::WaitForReplicas { .. } => {
                 return resp::Value::error("ERR unexpected WAIT during blocking retry")
+            }
+            Outcome::Shutdown { .. } => {
+                return resp::Value::error("ERR unexpected SHUTDOWN during blocking retry")
             }
         }
     }

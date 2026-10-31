@@ -44,7 +44,7 @@ fn push(ctx: &ServerContext, state: &ClientState, args: &[Bytes], name: &str, fr
 
     match result {
         Ok(len) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'l', name, &key);
             reply(Value::Integer(len as i64))
         }
@@ -88,7 +88,7 @@ fn pushx(ctx: &ServerContext, state: &ClientState, args: &[Bytes], name: &str, f
     match result {
         None => reply(Value::Integer(0)),
         Some(Ok(len)) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'l', name, key);
             reply(Value::Integer(len as i64))
         }
@@ -141,7 +141,7 @@ fn pop(ctx: &ServerContext, state: &ClientState, args: &[Bytes], name: &str, fro
     };
     db.remove_if_empty(key);
     if popped.as_ref().is_some_and(|v| !v.is_empty()) {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'l', name, key);
     }
 
@@ -305,7 +305,7 @@ pub fn cmd_ltrim(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Ou
         None => reply(Value::ok()),
         Some(Ok(())) => {
             db.remove_if_empty(key);
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'l', "ltrim", key);
             reply(Value::ok())
         }
@@ -334,7 +334,7 @@ pub fn cmd_lset(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     match result {
         None => err("ERR no such key"),
         Some(Ok(true)) => {
-            on_key_changed(ctx, state.db_index, key.clone());
+            on_key_changed(ctx, state, state.db_index, key.clone(), None);
             notify_keyspace_event(ctx, state.db_index, 'l', "lset", key);
             reply(Value::ok())
         }
@@ -366,7 +366,7 @@ pub fn cmd_linsert(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> 
         None => reply(Value::Integer(0)),
         Some(Ok(n)) => {
             if n > 0 {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, 'l', "linsert", key);
             }
             reply(Value::Integer(n))
@@ -415,7 +415,7 @@ pub fn cmd_lrem(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
         Some(Ok(removed)) => {
             db.remove_if_empty(key);
             if removed > 0 {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, 'l', "lrem", key);
             }
             reply(Value::Integer(removed as i64))
@@ -478,7 +478,7 @@ fn lmove(
             None => reply(Value::NullBulk),
             Some(Ok(None)) => reply(Value::NullBulk),
             Some(Ok(Some(item))) => {
-                on_key_changed(ctx, state.db_index, source.clone());
+                on_key_changed(ctx, state, state.db_index, source.clone(), None);
                 notify_keyspace_event(
                     ctx,
                     state.db_index,
@@ -545,8 +545,8 @@ fn lmove(
         return wrong_type();
     }
 
-    on_key_changed(ctx, state.db_index, source.clone());
-    on_key_changed(ctx, state.db_index, destination.clone());
+    on_key_changed(ctx, state, state.db_index, source.clone(), None);
+    on_key_changed(ctx, state, state.db_index, destination.clone(), None);
     notify_keyspace_event(ctx, state.db_index, 'l', if from_left { "lpop" } else { "rpop" }, source);
     notify_keyspace_event(ctx, state.db_index, 'l', if to_left { "lpush" } else { "rpush" }, destination);
     reply(Value::bulk(item))
@@ -637,7 +637,7 @@ pub fn cmd_lmpop(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes], b
             }
             Some(Ok(values)) => {
                 db.remove_if_empty(key);
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 let event = if from_left { "lpop" } else { "rpop" };
                 notify_keyspace_event(ctx, state.db_index, 'l', event, key);
                 let mut effect =
@@ -704,7 +704,7 @@ fn bpop(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes], name: &str
             }
             Some(Ok(Some(item))) => {
                 db.remove_if_empty(key);
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, 'l', if front { "lpop" } else { "rpop" }, key);
                 let effect_name: &[u8] = if front { b"LPOP" } else { b"RPOP" };
                 let effect = vec![Bytes::from_static(effect_name), key.clone()];

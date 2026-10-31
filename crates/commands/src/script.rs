@@ -365,6 +365,10 @@ fn call_inner(
         // `BLPOP`-family commands can't block inside a script either —
         // treat a would-be block as an immediate timeout, same idea.
         Outcome::BlockWait { on_timeout, .. } => on_timeout,
+        // `no-multi-scripting`: a script can't exit the process.
+        Outcome::Shutdown { .. } => {
+            resp::Value::error("ERR SHUTDOWN is not allowed in transactions or scripts")
+        }
     };
     match value {
         resp::Value::Error(msg) => Err(msg),

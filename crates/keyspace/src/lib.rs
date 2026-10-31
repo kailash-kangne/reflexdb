@@ -254,8 +254,16 @@ pub enum Ttl {
 /// contract; the concrete LSM-backed implementation lives in the `tiered`
 /// crate so this crate doesn't need to know about any particular storage
 /// engine.
+/// Error returned by `TieringHandler::evict` when the tier's configured
+/// capacity is exhausted — the dispatch layer maps it to the client-facing
+/// `ERR TIERED_STORAGE_FULL` reply and treats it differently from an
+/// ordinary I/O failure (which just keeps the key in RAM and retries).
+pub const TIERED_FULL: &str = "TIERED_STORAGE_FULL";
+
 pub trait TieringHandler: Send + Sync {
-    /// Persist a key being dropped from RAM.
+    /// Persist a key being dropped from RAM. May fail with
+    /// [`TIERED_FULL`] when a configured capacity is exhausted — the key
+    /// must stay in RAM in that case; no data is lost.
     fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String>;
     /// Fetch (and remove from the tier — promotion is a one-way move back
     /// into RAM, not a cache copy) a previously evicted key.
@@ -280,6 +288,14 @@ pub trait TieringHandler: Send + Sync {
     fn disk_usage_bytes(&self) -> Option<u64> {
         None
     }
+    /// Whether the tier would accept `additional` charged bytes — lets the
+    /// `reject-writes` gate refuse a new-key write *before* it lands in RAM
+    /// when the tier couldn't absorb its eventual spill. Default `true`
+    /// (unbounded/unknowable tiers never trigger the gate).
+    fn can_accept(&self, additional: u64) -> bool {
+        let _ = additional;
+        true
+    }
     /// Up to `max` of the tier's keys, oldest-evicted-first — used by
     /// `tiered-disk-limit` so capacity eviction drops genuinely stale
     /// entries first instead of a random pick. Default falls back to an
@@ -297,6 +313,38 @@ pub trait TieringHandler: Send + Sync {
             self.remove(&key);
         }
     }
+    /// Periodic GC: drop expired or undecodable entries still sitting in
+    /// the tier — the batch partner to the lazy checks in `contains`/
+    /// `promote`. Returns how many entries were dropped.
+    fn sweep_expired(&self) -> usize {
+        0
+    }
+    /// Reclaim disk space held by tombstoned entries (LSM compaction or
+    /// equivalent). Deletions don't free file space until this or the
+    /// engine's own merging runs. Default no-op for implementations that
+    /// don't need offline reclamation.
+    fn compact(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Operational counters surfaced via `INFO`.
+    fn stats(&self) -> TieredStats {
+        TieredStats::default()
+    }
+}
+
+/// `TieringHandler::stats` — engine-side counters the dispatch layer can't
+/// see (tombstones written, compaction progress). All fields optional-ish:
+/// implementations that can't measure leave them zeroed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TieredStats {
+    /// Entries removed since open (deletes, promotes, GC sweeps,
+    /// evict-oldest drops) — every removal writes a tombstone, so this is
+    /// the signal for "compaction is worth running".
+    pub entries_removed: u64,
+    pub compactions_completed: u64,
+    pub compacting: bool,
+    /// Total wall-clock time the engine has spent compacting.
+    pub compact_time: Duration,
 }
 
 /// A single logical database (what Redis calls `SELECT 0..N`).
@@ -850,25 +898,36 @@ impl Db {
     /// `Store::approx_bytes()` (an O(total keys) scan) after every single
     /// eviction.
     pub fn evict_to_tier_sized(&self, key: &[u8]) -> Option<usize> {
+        self.evict_to_tier_result(key).ok().flatten()
+    }
+
+    /// `evict_to_tier_sized` with the tier's error surfaced — callers that
+    /// enforce `tiered-disk-limit` need to tell `TIERED_FULL` (stop
+    /// asking, the capacity gate handles it) apart from an I/O failure.
+    /// `Ok(None)` = key gone already (expired/removed concurrently);
+    /// `Err` = key stays in RAM, nothing was written to the tier.
+    pub fn evict_to_tier_result(&self, key: &[u8]) -> Result<Option<usize>, String> {
         let _tier_guard = self.tier_guard();
-        let handler = self.tiering.as_ref()?;
+        let Some(handler) = self.tiering.as_ref() else { return Ok(None) };
         let guard = self.map.guard();
-        let lock = self.map.get(key, &guard)?;
+        let Some(lock) = self.map.get(key, &guard) else { return Ok(None) };
         let entry = lock.write();
         if entry.is_expired() {
             drop(entry);
             self.map.remove(key, &guard);
-            return None;
+            return Ok(None);
         }
         let ttl = entry.remaining_ttl();
         if let Err(error) = handler.evict(&Bytes::copy_from_slice(key), &entry.value, ttl) {
-            tracing::warn!(?key, %error, "failed to persist evicted key; keeping it in RAM");
-            return None;
+            if error != TIERED_FULL {
+                tracing::warn!(?key, %error, "failed to persist evicted key; keeping it in RAM");
+            }
+            return Err(error);
         }
         let freed = key.len() + 48 + entry.value.approx_bytes();
         drop(entry);
         self.map.remove(key, &guard);
-        Some(freed)
+        Ok(Some(freed))
     }
 
     /// Drop a key if its container value has become empty (see
@@ -922,6 +981,27 @@ impl Db {
     /// Bytes used by the disk tier, if the handler can report it.
     pub fn tiered_disk_usage_bytes(&self) -> Option<u64> {
         self.tiering.as_ref().and_then(|t| t.disk_usage_bytes())
+    }
+
+    /// `TieringHandler::can_accept` via the store — `true` when there's no
+    /// handler or the handler is unbounded.
+    pub fn tiered_can_accept(&self, additional: u64) -> bool {
+        self.tiering.as_ref().map(|t| t.can_accept(additional)).unwrap_or(true)
+    }
+
+    /// `TieringHandler::sweep_expired` via the store.
+    pub fn tiered_sweep_expired(&self) -> usize {
+        self.tiering.as_ref().map(|t| t.sweep_expired()).unwrap_or(0)
+    }
+
+    /// `TieringHandler::compact` via the store.
+    pub fn tiered_compact(&self) -> Result<(), String> {
+        self.tiering.as_ref().map(|t| t.compact()).unwrap_or(Ok(()))
+    }
+
+    /// `TieringHandler::stats` via the store.
+    pub fn tiered_stats(&self) -> TieredStats {
+        self.tiering.as_ref().map(|t| t.stats()).unwrap_or_default()
     }
 
     /// Drop a key from the disk tier outright — unlike `evict_to_tier`,
@@ -1070,6 +1150,11 @@ impl Store {
         self.dbs.first()?.tiered_disk_usage_bytes()
     }
 
+    /// `TieringHandler::can_accept` — `true` with no tier attached.
+    pub fn tiered_can_accept(&self, additional: u64) -> bool {
+        self.dbs.first().map(|db| db.tiered_can_accept(additional)).unwrap_or(true)
+    }
+
     pub fn tiered_keys_snapshot(&self) -> Vec<Bytes> {
         self.dbs.first().map(Db::tiered_keys_snapshot).unwrap_or_default()
     }
@@ -1080,6 +1165,18 @@ impl Store {
 
     pub fn remove_tiered_key_outright(&self, key: &[u8]) -> bool {
         self.dbs.first().is_some_and(|db| db.remove_tiered_key_outright(key))
+    }
+
+    pub fn tiered_sweep_expired(&self) -> usize {
+        self.dbs.first().map(|db| db.tiered_sweep_expired()).unwrap_or(0)
+    }
+
+    pub fn tiered_compact(&self) -> Result<(), String> {
+        self.dbs.first().map(|db| db.tiered_compact()).unwrap_or(Ok(()))
+    }
+
+    pub fn tiered_stats(&self) -> TieredStats {
+        self.dbs.first().map(|db| db.tiered_stats()).unwrap_or_default()
     }
 
     /// Run an active expire cycle across every database.

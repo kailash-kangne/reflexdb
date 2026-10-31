@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use commands::MaxMemoryPolicy;
+use commands::{MaxMemoryPolicy, TieredOverflowPolicy};
 use persistence::aof::Fsync;
 
 #[derive(Debug, Clone)]
@@ -45,6 +45,15 @@ pub struct Config {
     /// Defaults to `no` (fastest, OS decides when to flush); set it
     /// explicitly in the config file for a tighter durability bound.
     pub appendfsync: Fsync,
+    /// `profile cache|durable|replicated` — preset bundle that sets
+    /// `appendonly`/`appendfsync`/`min-replicas-to-write` to a coherent
+    /// durability posture. Directives listed *after* `profile` in the file
+    /// override its individual values. `None` = no preset applied.
+    pub profile: Option<String>,
+    /// `min-replicas-to-write`: refuse write commands when fewer than this
+    /// many connected replicas are healthy (not flagged slow). 0 = off.
+    /// Same semantics as Redis's directive of the same name.
+    pub min_replicas_to_write: usize,
     /// `tiered-storage yes/no` — evicted keys spill to an on-disk LSM tier
     /// (via the `tiered` crate / `fjall`) instead of being dropped.
     pub tiered_storage: bool,
@@ -53,11 +62,16 @@ pub struct Config {
     /// `tiered-dir`: where the tier's files land, relative to `dir` if not
     /// absolute.
     pub tiered_dir: PathBuf,
-    /// `tiered-disk-limit`: once the disk tier itself exceeds this, cold
-    /// tiered entries get dropped outright (real data loss, not a RAM/disk
-    /// move) to keep it bounded. `None` (default) means unbounded — the
-    /// previous behavior, kept for backward compatibility.
+    /// `tiered-disk-limit`: capacity the disk tier enforces once exceeded.
+    /// What "exceeded" does is `tiered-overflow-policy`'s choice.
+    /// `None` (default) means unbounded.
     pub tiered_disk_limit: Option<u64>,
+    /// `tiered-overflow-policy`: `reject-writes` (default — preserve all
+    /// acknowledged data, refuse new keys with `ERR TIERED_STORAGE_FULL`),
+    /// `evict-oldest` (drop oldest tiered entries — cache semantics, real
+    /// data loss), or `no-limit` (no enforcement). Only consulted when
+    /// `tiered-disk-limit` is set.
+    pub tiered_overflow_policy: TieredOverflowPolicy,
     /// `eviction-tick-ms`: how often the background task re-checks
     /// `maxmemory`/`tiered-memory-limit`/`tiered-disk-limit` and runs TTL
     /// active-expire. Lowering this reacts to a write burst faster (lower
@@ -92,9 +106,8 @@ pub struct Config {
     /// primary, equivalent to issuing `REPLICAOF` right after boot.
     pub replicaof: Option<(String, u16)>,
     /// `tls-port`: 0 disables TLS. When set, a second listener accepts TLS
-    /// connections on this port alongside the plain-text one on `port`
-    /// (TLS-only operation by also disabling `port` is not supported here; we
-    /// always keep the plain listener for simplicity).
+    /// connections on this port alongside the plain-text one on `port`;
+    /// set `port 0` for TLS-only operation.
     pub tls_port: u16,
     pub tls_cert_file: Option<PathBuf>,
     pub tls_key_file: Option<PathBuf>,
@@ -173,10 +186,13 @@ impl Default for Config {
             appendonly: false,
             appendfilename: "appendonly.aof".to_string(),
             appendfsync: Fsync::No,
+            profile: None,
+            min_replicas_to_write: 0,
             tiered_storage: false,
             tiered_memory_limit: 250 * 1024 * 1024,
             tiered_dir: PathBuf::from("tiered"),
             tiered_disk_limit: None,
+            tiered_overflow_policy: TieredOverflowPolicy::RejectWrites,
             eviction_tick_ms: 100,
             eviction_low_watermark: 0.5,
             max_evictions_per_tick: 10_000,
@@ -301,12 +317,38 @@ impl Config {
                     other => return Err(format!("invalid appendfsync: {other}")),
                 }
             }
+            "profile" => match value.to_ascii_lowercase().as_str() {
+                "cache" => {
+                    self.profile = Some("cache".into());
+                    self.appendonly = false;
+                }
+                "durable" => {
+                    self.profile = Some("durable".into());
+                    self.appendonly = true;
+                    self.appendfsync = Fsync::Always;
+                }
+                "replicated" => {
+                    self.profile = Some("replicated".into());
+                    self.appendonly = true;
+                    self.appendfsync = Fsync::EverySec;
+                    self.min_replicas_to_write = 1;
+                }
+                other => return Err(format!("invalid profile: {other} (expected cache|durable|replicated)")),
+            },
+            "min-replicas-to-write" => {
+                self.min_replicas_to_write =
+                    value.parse().map_err(|_| format!("invalid min-replicas-to-write: {value}"))?
+            }
             "tiered-storage" => self.tiered_storage = value.eq_ignore_ascii_case("yes"),
             "tiered-memory-limit" => self.tiered_memory_limit = parse_memory(value)?,
             "tiered-dir" => self.tiered_dir = PathBuf::from(value),
             "tiered-disk-limit" => {
                 self.tiered_disk_limit =
                     (!value.is_empty() && value != "0").then(|| parse_memory(value)).transpose()?
+            }
+            "tiered-overflow-policy" => {
+                self.tiered_overflow_policy = TieredOverflowPolicy::parse(value)
+                    .ok_or_else(|| format!("invalid tiered-overflow-policy: {value} (expected reject-writes|evict-oldest|no-limit)"))?
             }
             "eviction-tick-ms" => {
                 self.eviction_tick_ms =
@@ -433,6 +475,33 @@ mod tests {
         assert_eq!(cfg.replica_backlog_size, 1024);
         assert_eq!(cfg.replica_backlog_max_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.replica_slow_disconnect_ms, 1500);
+    }
+
+    #[test]
+    fn profile_presets_and_explicit_overrides() {
+        let cfg = Config::from_args(args(&[("profile", "cache")])).unwrap();
+        assert!(!cfg.appendonly);
+
+        let cfg = Config::from_args(args(&[("profile", "durable")])).unwrap();
+        assert!(cfg.appendonly);
+        assert_eq!(cfg.appendfsync, Fsync::Always);
+
+        let cfg = Config::from_args(args(&[("profile", "replicated")])).unwrap();
+        assert!(cfg.appendonly);
+        assert_eq!(cfg.appendfsync, Fsync::EverySec);
+        assert_eq!(cfg.min_replicas_to_write, 1);
+
+        // Directives after `profile` override its values.
+        let cfg = Config::from_args(args(&[
+            ("profile", "durable"),
+            ("appendfsync", "everysec"),
+            ("min-replicas-to-write", "2"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.appendfsync, Fsync::EverySec);
+        assert_eq!(cfg.min_replicas_to_write, 2);
+
+        assert!(Config::from_args(args(&[("profile", "bogus")])).is_err());
     }
 
     #[test]

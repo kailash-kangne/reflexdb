@@ -188,7 +188,7 @@ pub fn cmd_copy(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
         _ => None,
     };
     dest_db.set(destination.clone(), value, expires_at);
-    on_key_changed(ctx, target_db, destination.clone());
+    on_key_changed(ctx, state, target_db, destination.clone(), None);
     notify_keyspace_event(ctx, target_db, 'g', "copy_to", destination);
     reply(Value::Integer(1))
 }
@@ -220,8 +220,8 @@ pub fn cmd_move(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     }
     source_db.del(std::slice::from_ref(key));
     dest_db.set(key.clone(), value, expires_at);
-    on_key_changed(ctx, state.db_index, key.clone());
-    on_key_changed(ctx, target, key.clone());
+    on_key_changed(ctx, state, state.db_index, key.clone(), None);
+    on_key_changed(ctx, state, target, key.clone(), None);
     notify_keyspace_event(ctx, state.db_index, 'g', "move_from", key);
     notify_keyspace_event(ctx, target, 'g', "move_to", key);
     reply(Value::Integer(1))
@@ -268,7 +268,7 @@ pub fn cmd_bitop(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Ou
         };
     }
     db.set(dest.clone(), KVal::String(Bytes::from(out)), None);
-    on_key_changed(ctx, state.db_index, dest.clone());
+    on_key_changed(ctx, state, state.db_index, dest.clone(), None);
     notify_keyspace_event(ctx, state.db_index, '$', "set", &dest);
     reply(Value::Integer(len as i64))
 }
@@ -451,7 +451,7 @@ pub fn cmd_bitfield(ctx: &ServerContext, state: &ClientState, args: &[Bytes], re
         Err(()) => wrong_type(),
         Ok(replies) => {
             if changed {
-                on_key_changed(ctx, state.db_index, key.clone());
+                on_key_changed(ctx, state, state.db_index, key.clone(), None);
                 notify_keyspace_event(ctx, state.db_index, '$', "bitfield", &key);
             }
             reply(Value::Array(replies))
@@ -619,7 +619,7 @@ pub fn cmd_msetnx(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         db.set(pair[0].clone(), KVal::String(pair[1].clone()), None);
     }
     for key in keys {
-        on_key_changed(ctx, state.db_index, key.clone());
+        on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, '$', "mset", &key);
     }
     reply(Value::Integer(1))
@@ -745,7 +745,7 @@ pub fn cmd_sort(ctx: &ServerContext, state: &ClientState, args: &[Bytes], read_o
             let stored = output.iter().map(|v| v.clone().unwrap_or_default()).collect();
             db.set(destination.clone(), KVal::List(stored), None);
         }
-        on_key_changed(ctx, state.db_index, destination.clone());
+        on_key_changed(ctx, state, state.db_index, destination.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'l', "sortstore", &destination);
         reply(Value::Integer(output.len() as i64))
     } else {

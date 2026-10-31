@@ -154,7 +154,7 @@ pub fn cmd_restore(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> 
     let expires_at =
         if ttl_ms == 0 { None } else { Some(saturating_deadline(Duration::from_millis(ttl_ms))) };
     db.set(key.clone(), value, expires_at);
-    on_key_changed(ctx, state.db_index, key.clone());
+    on_key_changed(ctx, state, state.db_index, key.clone(), None);
     notify_keyspace_event(ctx, state.db_index, 'g', "restore", key);
     reply(Value::ok())
 }
