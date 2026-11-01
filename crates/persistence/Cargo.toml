@@ -12,6 +12,6 @@ bincode.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 fjall = "3.1.13"
-zstd = "0.13.3"
+zstd = "0.14"
 keyspace = { path = "../keyspace" }
 resp = { path = "../resp" }

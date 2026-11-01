@@ -267,12 +267,16 @@ async fn main() -> std::io::Result<()> {
         let shutdown_ctx = ctx.clone();
         tokio::spawn(async move {
             #[cfg(unix)]
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
+            {
+                let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
             }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
             tracing::info!("shutdown signal received; flushing persistence");
             shutdown_ctx.persist_for_shutdown(!shutdown_ctx.aof_enabled());
             std::process::exit(0);
