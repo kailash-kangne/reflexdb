@@ -142,6 +142,14 @@ async fn try_link_once(
         };
     let mut reader = BufReader::new(read_half);
 
+    // `masterauth`: a password-protected primary NOAUTHs PSYNC, so AUTH
+    // first. Wrong/missing credentials surface as a link error and the
+    // supervisor retries (logging the primary's reply).
+    if let Some(password) = ctx.masterauth.as_deref() {
+        write_half.write_all(&auth_request(password)).await?;
+        read_simple_reply(&mut reader).await?;
+    }
+
     // Resume when we have a cursor from a previous link (`PSYNC <replid>
     // <offset>`); a first-time link asks for everything (`PSYNC ? -1`).
     let psync = match cursor.as_ref() {
@@ -235,6 +243,30 @@ enum Handshake {
 enum PsyncReply {
     Full { replid: String, offset: u64 },
     Continue,
+}
+
+/// `*2\r\n$4\r\nAUTH\r\n$<n>\r\n<password>\r\n` — the `default`-user form
+/// (matches `requirepass`, which is what `masterauth` pairs with).
+fn auth_request(password: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24 + password.len());
+    out.extend_from_slice(b"*2\r\n$4\r\nAUTH\r\n$");
+    out.extend_from_slice(password.len().to_string().as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(password.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// Reads one `+`/`-` line reply — used for the `AUTH` handshake where
+/// only success vs. failure matters.
+async fn read_simple_reply(reader: &mut (impl AsyncBufReadExt + Unpin)) -> io::Result<()> {
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let line = line.trim_end();
+    match line.as_bytes().first() {
+        Some(b'+') => Ok(()),
+        _ => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("primary rejected AUTH: {line}"))),
+    }
 }
 
 /// `*3\r\n$5\r\nPSYNC\r\n$<n>\r\n<replid>\r\n$<n>\r\n<offset>\r\n`.

@@ -102,9 +102,20 @@ pub struct Config {
     /// `singleflight-max-wait-ms`: hard cap on how long a `GET ...
     /// SINGLEFLIGHT` caller blocks before getting a timeout error.
     pub singleflight_max_wait_ms: u64,
+    /// `protected-mode yes/no` (default `yes`, like Redis): while no
+    /// password is configured, a listener that accepts non-loopback
+    /// traffic (`bind 0.0.0.0`, a LAN address, …) refuses those
+    /// connections with a DENIED error until auth is set or the operator
+    /// turns it off. Loopback is always allowed.
+    pub protected_mode: bool,
     /// `replicaof <host> <port>` — start up already replicating from a
     /// primary, equivalent to issuing `REPLICAOF` right after boot.
     pub replicaof: Option<(String, u16)>,
+    /// `masterauth <password>` — the AUTH this replica sends its primary
+    /// on connect (the primary's `requirepass` / `default` user
+    /// password). Required for replication to a password-protected
+    /// primary; without it the link gets NOAUTH and retries forever.
+    pub masterauth: Option<String>,
     /// `tls-port`: 0 disables TLS. When set, a second listener accepts TLS
     /// connections on this port alongside the plain-text one on `port`;
     /// set `port 0` for TLS-only operation.
@@ -227,7 +238,9 @@ impl Default for Config {
             eviction_low_watermark: 0.5,
             max_evictions_per_tick: 10_000,
             singleflight_max_wait_ms: 10_000,
+            protected_mode: true,
             replicaof: None,
+            masterauth: None,
             tls_port: 0,
             tls_cert_file: None,
             tls_key_file: None,
@@ -405,6 +418,7 @@ impl Config {
                 self.singleflight_max_wait_ms =
                     value.parse().map_err(|_| format!("invalid singleflight-max-wait-ms: {value}"))?
             }
+            "protected-mode" => self.protected_mode = value.eq_ignore_ascii_case("yes"),
             "replicaof" | "slaveof" => {
                 let mut parts = value.split_whitespace();
                 let (Some(host), Some(port)) = (parts.next(), parts.next()) else {
@@ -415,6 +429,7 @@ impl Config {
                     port.parse().map_err(|_| format!("invalid {directive} port: {port}"))?,
                 ));
             }
+            "masterauth" => self.masterauth = if value.is_empty() { None } else { Some(value.to_string()) },
             "tls-port" => self.tls_port = value.parse().map_err(|_| format!("invalid tls-port: {value}"))?,
             "tls-cert-file" => self.tls_cert_file = Some(PathBuf::from(value)),
             "tls-key-file" => self.tls_key_file = Some(PathBuf::from(value)),
@@ -517,6 +532,23 @@ mod tests {
         assert_eq!(cfg.replica_backlog_max_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.replica_slow_disconnect_ms, 1500);
         assert_eq!(cfg.partial_resync_backlog, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn protected_mode_and_masterauth_parse() {
+        // Defaults: protected on, no master password.
+        let cfg = Config::from_args(args(&[])).unwrap();
+        assert!(cfg.protected_mode);
+        assert_eq!(cfg.masterauth, None);
+
+        let cfg = Config::from_args(args(&[
+            ("protected-mode", "no"),
+            ("masterauth", "s3cret"),
+            ("replicaof", "127.0.0.1 7000"),
+        ]))
+        .unwrap();
+        assert!(!cfg.protected_mode);
+        assert_eq!(cfg.masterauth.as_deref(), Some("s3cret"));
     }
 
     #[test]

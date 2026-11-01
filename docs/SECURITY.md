@@ -12,8 +12,8 @@ Read this before deploying it anywhere traffic you don't control can reach.
 - **Replication link** — outbound replica connection to a primary, plaintext by default;
   `tls-replication yes` wraps it in TLS verified against `tls-ca-cert-file` (the replica's
   `tls-cert-file`/`tls-key-file` double as its client certificate when the primary runs
-  `tls-auth-clients yes`). A replica trusts everything the primary sends: keep the link
-  protected.
+  `tls-auth-clients yes`). `masterauth` sends `AUTH` on connect when the primary sets
+  `requirepass`. A replica trusts everything the primary sends: keep the link protected.
 - **Persistence files** — AOF/RDB/history/tiered files under `dir`/`tiered-dir`. Anyone with
   filesystem access reads the dataset; nothing at rest is encrypted.
 - **Lua** — `EVAL`/`EVALSHA` run in an `mlua` Lua 5.1 sandbox with `os`/`io` removed and
@@ -40,8 +40,9 @@ Read this before deploying it anywhere traffic you don't control can reach.
 
 ## Known gaps (do not treat as closed)
 
-- **No `AUTH` rate limiting** — online brute-force against `requirepass`/user passwords is
-  possible. Use long passwords (`ACL GENPASS`) and network-level controls.
+- **Bounded `AUTH` attempts** — 16 failed authentications on one connection drop the socket,
+  capping online brute force per socket (an attacker can still reconnect; use long passwords
+  (`ACL GENPASS`) and network-level controls). Passwords are also masked in `CONFIG GET`.
 - **Passwords are unsalted SHA-256** — Redis-compatible but weak against offline attacks if
   an attacker reads process memory or `ACL LIST`/`GETUSER` output. Treat hash disclosure as
   password disclosure.
@@ -53,11 +54,16 @@ Read this before deploying it anywhere traffic you don't control can reach.
   enforced; any authenticated user can subscribe to any channel.
 - **`KEYS`/`CONFIG`/`ACL` are @dangerous but enabled for `allcommands` users** — grant them
   deliberately.
-- **One writer per data dir** — two servers sharing a `dir` will corrupt the AOF (verified in
-  testing). There is no lockfile protecting against this.
+- **One writer per data dir** — enforced: startup takes an exclusive `flock` on
+  `<dir>/reflexdb.lock` (released automatically on exit, including SIGKILL), so a second
+  server on the same `dir` refuses to boot.
 - **`LIVE`/`SCHEDULE` execute on behalf of the subscriber/issuer** — scheduled commands run
   later with server-side privileges; restrict `SCHEDULE` (`-SCHEDULE` or `-@admin`).
-- **No `rename-command` or `protected-mode`** — dangerous commands can't be hidden, only
-  ACL-denied, and there is no loopback-only safety net: bind addresses and auth are your job.
+- **`protected-mode` is on by default** — while no password is configured, a listener that
+  accepts non-loopback traffic (e.g. `bind 0.0.0.0`) refuses off-loopback clients with DENIED;
+  loopback stays open. `protected-mode no` disables it. Note `CONFIG SET requirepass` lifts
+  the fence live. Any client that can reach a `PSYNC`-capable listener and knows the password
+  can still pull the whole dataset — replication auth is the same credential.
+- **No `rename-command`** — dangerous commands can't be hidden, only ACL-denied.
 - **`GETAT`/`HISTORY` and tiered storage** keep copies of values outside the in-memory
   keyspace — key ACLs don't retroactively hide already-persisted bytes.

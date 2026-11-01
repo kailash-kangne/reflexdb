@@ -554,6 +554,10 @@ pub struct ServerContext {
     /// re-attaching must never partial-resync from a pre-promotion
     /// offset.
     pub(crate) replica_generation: AtomicU64,
+    /// `masterauth` — the AUTH a replication link sends its primary on
+    /// connect. Startup-only (set via config/`with_masterauth`); not
+    /// runtime-settable.
+    pub masterauth: Option<String>,
     /// Woken on every `REPLCONF ACK`, so `WAIT` doesn't have to poll on a
     /// tight timer.
     pub replica_ack_notify: tokio::sync::Notify,
@@ -685,6 +689,7 @@ impl ServerContext {
             replica_of: std::sync::Mutex::new(None),
             replication_epoch: AtomicU64::new(0),
             replica_generation: AtomicU64::new(0),
+            masterauth: None,
             replica_ack_notify: tokio::sync::Notify::new(),
             blocking_notify: tokio::sync::Notify::new(),
             notify_keyspace_events: std::sync::RwLock::new(NotifyFlags::default()),
@@ -772,6 +777,12 @@ impl ServerContext {
 
     pub fn with_min_replicas_to_write(mut self, n: usize) -> Self {
         self.min_replicas_to_write = AtomicUsize::new(n);
+        self
+    }
+
+    /// `masterauth` — see the field's doc.
+    pub fn with_masterauth(mut self, password: Option<String>) -> Self {
+        self.masterauth = password;
         self
     }
 
@@ -1523,6 +1534,10 @@ pub struct ClientState {
     /// see `drain_pending_history`. `RefCell` because many handlers only
     /// have `&ClientState`; push/drain borrows never overlap.
     pub(crate) pending_history: RefCell<PendingHistory>,
+    /// Failed `AUTH`/`HELLO ... AUTH` attempts on this connection — hits
+    /// `MAX_AUTH_FAILURES` and the connection is dropped, capping online
+    /// password brute-force to a handful of tries per socket.
+    pub auth_failures: u32,
 }
 
 impl ClientState {
@@ -1550,6 +1565,7 @@ impl ClientState {
             live_fingerprints: HashSet::new(),
             wire: resp::Wire::Resp,
             pending_history: RefCell::new(Vec::new()),
+            auth_failures: 0,
         }
     }
 
@@ -2387,6 +2403,11 @@ fn cmd_auth(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Out
 /// Shared by `AUTH` and `HELLO ... AUTH`: checks a username/password pair
 /// against the ACL user table (which always has at least `default`, mirroring
 /// plain `requirepass` when ACL hasn't been touched — see `acl::AclUser::default_user`).
+/// Failed-auth budget per connection before the socket is dropped —
+/// bounds online brute force without rate-limit machinery. Generous
+/// enough that a human typoing a few times never notices.
+const MAX_AUTH_FAILURES: u32 = 16;
+
 fn try_authenticate(
     ctx: &ServerContext,
     state: &mut ClientState,
@@ -2402,7 +2423,15 @@ fn try_authenticate(
             state.acl_user = username.to_string();
             reply(Value::ok())
         }
-        _ => err("WRONGPASS invalid username-password pair or user is disabled."),
+        _ => {
+            state.auth_failures += 1;
+            let e = err("WRONGPASS invalid username-password pair or user is disabled.");
+            if state.auth_failures >= MAX_AUTH_FAILURES {
+                let Outcome::Reply(v) = e else { return e };
+                return Outcome::CloseConnection(v);
+            }
+            e
+        }
     }
 }
 
@@ -2425,8 +2454,12 @@ fn cmd_hello(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Ou
                 }
                 let username = String::from_utf8_lossy(&args[i + 1]).into_owned();
                 let pass = &args[i + 2];
-                if let Outcome::Reply(Value::Error(e)) = try_authenticate(ctx, state, &username, pass) {
-                    return err(e);
+                match try_authenticate(ctx, state, &username, pass) {
+                    Outcome::Reply(Value::Error(e)) => return err(e),
+                    // Too many failures: propagate the close or the cap
+                    // is bypassed via HELLO AUTH.
+                    other @ Outcome::CloseConnection(_) => return other,
+                    _ => {}
                 }
                 i += 3;
             }
@@ -5656,6 +5689,37 @@ mod tests {
         assert_eq!(run(&ctx, &mut st2, &["AUTH", "pw"]), Value::ok());
         assert_eq!(run(&ctx, &mut st2, &["SET", "k2", "v"]), Value::ok());
         assert_eq!(run(&ctx, &mut st, &["GET", "k2"]), Value::bulk(&b"v"[..]));
+    }
+
+    /// `CONFIG GET requirepass` must never return the plaintext — masked
+    /// output proves set-vs-unset without disclosing the secret; and a
+    /// connection that keeps failing AUTH is dropped after
+    /// `MAX_AUTH_FAILURES`.
+    #[test]
+    fn config_get_masks_requirepass_and_repeated_auth_failures_close_the_socket() {
+        let ctx = ServerContext::new(16, Some("pw".into()));
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, true);
+
+        assert_eq!(run(&ctx, &mut st, &["AUTH", "pw"]), Value::ok());
+        let Value::Array(pairs) = run(&ctx, &mut st, &["CONFIG", "GET", "requirepass"]) else {
+            panic!("expected array");
+        };
+        let val = pairs.windows(2).find(|w| w[0] == Value::bulk(&b"requirepass"[..])).map(|w| &w[1]);
+        assert_eq!(val, Some(&Value::bulk(&b"********"[..])));
+
+        let (id2, _rx2) = ctx.register_client();
+        let mut st2 = ClientState::with_id(id2, true);
+        for i in 0..MAX_AUTH_FAILURES - 1 {
+            match run(&ctx, &mut st2, &["AUTH", "nope"]) {
+                Value::Error(_) => {}
+                other => panic!("attempt {i}: expected WRONGPASS, got {other:?}"),
+            }
+        }
+        match dispatch(&ctx, &mut st2, req(&["AUTH", "nope"])) {
+            Outcome::CloseConnection(_) => {}
+            _ => panic!("final failure should close the socket"),
+        }
     }
 
     #[test]

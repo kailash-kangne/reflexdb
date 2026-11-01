@@ -118,6 +118,14 @@ fn sigkill(child: &mut Child) {
     child.wait().unwrap();
 }
 
+/// These tests spawn real server processes and poll asynchronous
+/// replication state — parallel runs starve the waits and flake.
+/// Serialize the file; each test is only a couple of seconds.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn bulk(s: &str) -> Reply {
     Reply::Bulk(Some(s.as_bytes().to_vec()))
 }
@@ -163,6 +171,7 @@ fn info_field(client: &mut Client, field: &str) -> String {
 /// the resume cursor makes the next `PSYNC` a `+CONTINUE`.
 #[test]
 fn replica_resumes_with_partial_resync_after_link_bounce() {
+    let _serial = serial();
     let dir_a = temp_dir("psync-primary");
     let dir_b = temp_dir("psync-replica");
     let (port_a, port_b) = (free_port(), free_port());
@@ -193,6 +202,7 @@ fn replica_resumes_with_partial_resync_after_link_bounce() {
 /// replica still ends up correct.
 #[test]
 fn replica_falls_back_to_full_resync_when_backlog_disabled() {
+    let _serial = serial();
     let dir_a = temp_dir("psyncoff-primary");
     let dir_b = temp_dir("psyncoff-replica");
     let (port_a, port_b) = (free_port(), free_port());
@@ -224,6 +234,7 @@ fn replica_falls_back_to_full_resync_when_backlog_disabled() {
 /// from the pre-crash primary but that no longer exist.
 #[test]
 fn primary_sigkill_recovers_and_replica_converges() {
+    let _serial = serial();
     let dir_a = temp_dir("crash-primary");
     let dir_b = temp_dir("crash-replica");
     let (port_a, port_b) = (free_port(), free_port());
@@ -264,6 +275,7 @@ fn primary_sigkill_recovers_and_replica_converges() {
 /// data may have diverged, so re-attaching must be a full resync.
 #[test]
 fn replicaof_no_one_clears_resume_cursor() {
+    let _serial = serial();
     let dir_a = temp_dir("psyncpromote-primary");
     let dir_b = temp_dir("psyncpromote-replica");
     let (port_a, port_b) = (free_port(), free_port());
@@ -283,6 +295,31 @@ fn replicaof_no_one_clears_resume_cursor() {
 
     wait_info_field(&mut pc, "sync_full", "2");
     assert_eq!(info_field(&mut pc, "sync_partial_ok"), "0");
+
+    sigkill(&mut primary);
+    sigkill(&mut replica);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// A password-protected primary NOAUTHs a bare `PSYNC` — the link must
+/// AUTH with `masterauth` first. Without the flag replication can't
+/// connect at all; with it, the replica syncs normally.
+#[test]
+fn masterauth_authenticates_the_replication_link() {
+    let _serial = serial();
+    let dir_a = temp_dir("masterauth-primary");
+    let dir_b = temp_dir("masterauth-replica");
+    let (port_a, port_b) = (free_port(), free_port());
+    let mut primary = spawn(port_a, &dir_a, &["--requirepass", "pw"]);
+    let mut replica =
+        spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}"), "--masterauth", "pw"]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["AUTH", "pw"]), Reply::Simple("OK".into()));
+    assert_eq!(pc.cmd(&["SET", "k", "v"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "k", &bulk("v"));
 
     sigkill(&mut primary);
     sigkill(&mut replica);

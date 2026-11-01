@@ -110,11 +110,21 @@ fn free_port() -> u16 {
     // Atomic counter, not bind-and-release: bind(:0) releases the port
     // before the server claims it, so two parallel tests could probe the
     // same free port and race for it — the loser exits and the winner's
-    // client gets a connection reset from the wrong server.
-    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(23_000);
+    // client gets a connection reset from the wrong server. The base is
+    // pid-seeded so concurrently-running test binaries use disjoint ranges.
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    if NEXT.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        let base = 20_000 + (std::process::id() as u16 % 20_000);
+        let _ = NEXT.compare_exchange(
+            0,
+            base,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     loop {
         let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if port >= 1024 && TcpListener::bind(("127.0.0.1", port)).is_ok() {
             return port;
         }
     }
@@ -573,4 +583,84 @@ fn resp_command_compat() {
 
     sigkill(&mut server);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `protected-mode` (on by default): with no password configured, a
+/// listener bound to a non-loopback address refuses off-loopback clients
+/// while loopback keeps working. The probe connects through one of this
+/// machine's real interfaces — the server's `peer.ip()` check sees it as
+/// remote. Denial shows up as a `-DENIED` line or a dead socket (an
+/// endpoint filter can RST the conn before our reply lands); either way
+/// the contract is "commands are not served".
+#[cfg(unix)]
+#[test]
+fn protected_mode_denies_non_loopback_clients() {
+    let _serial = serial();
+    let dir = temp_dir("protected");
+    let port = free_port();
+    let mut server = spawn(port, &dir, &["--bind", "0.0.0.0"]);
+
+    // Every non-loopback IPv4 on this box (en0, bridges, …); point-to-
+    // point tunnel addrs connect but route away from the local listener,
+    // so candidates that don't answer are just skipped.
+    let mut refused_seen = false;
+    for ip in non_loopback_ipv4s() {
+        let Ok(mut sock) =
+            TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), Duration::from_secs(1))
+        else {
+            continue;
+        };
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        sock.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+        let _ = sock.write_all(b"PING\r\n");
+        let mut buf = [0u8; 512];
+        match sock.read(&mut buf) {
+            Ok(n) => {
+                let reply = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    reply.starts_with("-DENIED") || reply.is_empty(),
+                    "non-loopback client was served via {ip}: {reply:?}"
+                );
+                refused_seen = true;
+            }
+            Err(_) => refused_seen = true, // reset/timeout = refused
+        }
+    }
+    assert!(refused_seen, "no non-loopback interface answered; can't verify the refusal");
+
+    // Loopback is always allowed.
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
+
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Non-loopback IPv4s from `ifconfig` (or `ip` on minimal systems) —
+/// `std::net` can't enumerate interfaces. Both formats print `inet
+/// <addr[/len]>`, so the parse is the same.
+#[cfg(unix)]
+fn non_loopback_ipv4s() -> Vec<std::net::IpAddr> {
+    for cmd in [("ifconfig", vec![]), ("ip", vec!["-o", "-4", "addr", "show"])] {
+        let Ok(out) = Command::new(cmd.0).args(&cmd.1).output() else { continue };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut tokens = text.split_whitespace().peekable();
+        let mut ips = Vec::new();
+        while let Some(tok) = tokens.next() {
+            if tok != "inet" {
+                continue;
+            }
+            let Some(addr) = tokens.next() else { break };
+            let addr = addr.split('/').next().unwrap_or(addr);
+            if let Ok(ip) = addr.parse::<std::net::Ipv4Addr>() {
+                if !ip.is_loopback() && !ip.is_link_local() {
+                    ips.push(std::net::IpAddr::V4(ip));
+                }
+            }
+        }
+        if !ips.is_empty() {
+            return ips;
+        }
+    }
+    Vec::new()
 }

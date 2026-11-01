@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use commands::{dispatch, ClientState, Outcome, ServerContext, SingleFlightLease};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_util::codec::FramedRead;
@@ -98,6 +98,7 @@ async fn main() -> std::io::Result<()> {
         .with_live_pacing(cfg.live_sweep_ms, cfg.live_pace_chunk, cfg.live_pace_ms)
         .with_acl_file(cfg.acl_file.clone())
         .with_maxclients(cfg.maxclients)
+        .with_masterauth(cfg.masterauth.clone())
         // Always record where these would live so `CONFIG SET
         // appendonly|history-enabled yes` can open them lazily.
         .with_aof_config(cfg.aof_path(), cfg.appendfsync)
@@ -112,6 +113,11 @@ async fn main() -> std::io::Result<()> {
                 ("bind".into(), cfg.bind.clone()),
                 ("port".into(), cfg.port.to_string()),
                 ("proto-max-bulk-len".into(), cfg.proto_max_bulk_len.to_string()),
+                ("protected-mode".into(), yn(cfg.protected_mode)),
+                (
+                    "masterauth".into(),
+                    cfg.masterauth.as_ref().map(|_| "********".to_string()).unwrap_or_default(),
+                ),
                 ("profile".into(), cfg.profile.clone().unwrap_or_default()),
                 ("tiered-storage".into(), yn(cfg.tiered_storage)),
                 ("tiered-memory-limit".into(), cfg.tiered_memory_limit.to_string()),
@@ -366,6 +372,12 @@ async fn main() -> std::io::Result<()> {
         );
     }
 
+    // `protected-mode` (default on, like Redis): while no password is
+    // configured, a listener reachable off-host refuses non-loopback
+    // clients with DENIED. `auth_required()` is re-checked per connection,
+    // so a later `CONFIG SET requirepass` lifts the fence automatically.
+    let protected = cfg.protected_mode && bind_accepts_non_loopback(&cfg.bind);
+
     let connection_slots = Arc::new(Semaphore::new(cfg.maxclients));
     let mut tls_listening = false;
     if cfg.tls_port != 0 {
@@ -383,7 +395,8 @@ async fn main() -> std::io::Result<()> {
                     let connection_slots = connection_slots.clone();
                     tokio::spawn(async move {
                         if let Err(e) =
-                            run_tls_listener(ctx, &bind, tls_port, acceptor, connection_slots).await
+                            run_tls_listener(ctx, &bind, tls_port, acceptor, connection_slots, protected)
+                                .await
                         {
                             tracing::error!(error = %e, "TLS listener failed");
                         }
@@ -410,7 +423,11 @@ async fn main() -> std::io::Result<()> {
     tracing::info!(%addr, databases = cfg.databases, "reflexdb-server listening");
 
     loop {
-        let (socket, peer) = listener.accept().await?;
+        let (mut socket, peer) = listener.accept().await?;
+        if protected && !peer.ip().is_loopback() && !ctx.auth_required() {
+            deny_protected(&mut socket, &peer).await;
+            continue;
+        }
         let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
             drop(socket);
             tracing::debug!(%peer, "connection limit reached");
@@ -427,18 +444,55 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
+/// Whether `bind` admits off-host clients — `protected-mode` only needs
+/// to engage when the listener is actually reachable non-locally. A
+/// hostname we can't parse locally is treated as open (fail-safe).
+fn bind_accepts_non_loopback(bind: &str) -> bool {
+    match bind.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => true,
+    }
+}
+
+/// Sends the one-shot DENIED error, then drains until the client closes
+/// (bounded) — a bare drop right after `write_all` discards the queued
+/// reply into an RST on some stacks, so the client owns the close.
+async fn deny_protected(socket: &mut tokio::net::TcpStream, peer: &std::net::SocketAddr) {
+    let msg = "-DENIED ReflexDB is running in protected mode because protected-mode is enabled \
+               and no password is configured, while the listener accepts non-loopback traffic. \
+               Only loopback connections are served. Set `requirepass` (or `CONFIG SET requirepass` \
+               from loopback) to authenticate, or run with `--protected-mode no` to disable.\r\n";
+    let _ = socket.write_all(msg.as_bytes()).await;
+    let mut buf = [0u8; 512];
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    tracing::warn!(%peer, "protected-mode: refused non-loopback connection");
+}
+
 async fn run_tls_listener(
     ctx: Arc<ServerContext>,
     bind: &str,
     port: u16,
     acceptor: tokio_rustls::TlsAcceptor,
     connection_slots: Arc<Semaphore>,
+    protected: bool,
 ) -> std::io::Result<()> {
     let addr = format!("{bind}:{port}");
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "reflexdb-server listening (TLS)");
     loop {
-        let (socket, peer) = listener.accept().await?;
+        let (mut socket, peer) = listener.accept().await?;
+        if protected && !peer.ip().is_loopback() && !ctx.auth_required() {
+            deny_protected(&mut socket, &peer).await;
+            continue;
+        }
         let Ok(slot) = connection_slots.clone().try_acquire_owned() else {
             drop(socket);
             tracing::debug!(%peer, "TLS connection limit reached");
