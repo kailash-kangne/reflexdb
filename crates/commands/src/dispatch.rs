@@ -2069,6 +2069,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
             return err("NOAUTH Authentication required.");
         };
         if let Err(message) = crate::acl::authorize(user.value(), name, args) {
+            tracing::warn!(user = %state.acl_user, command = %name, reason = %message, "ACL denied command");
             return err(message);
         }
     }
@@ -2487,16 +2488,14 @@ fn try_authenticate(
     password: &[u8],
 ) -> Outcome {
     match ctx.acl_users.get(username) {
-        Some(user)
-            if user.enabled
-                && (user.nopass || user.password_hashes.contains(&crate::acl::sha256_hex(password))) =>
-        {
+        Some(user) if user.enabled && user.check_password(password) => {
             state.authenticated = true;
             state.acl_user = username.to_string();
             reply(Value::ok())
         }
         _ => {
             state.auth_failures += 1;
+            tracing::warn!(user = %username, attempts = state.auth_failures, "authentication failed");
             let e = err("WRONGPASS invalid username-password pair or user is disabled.");
             if state.auth_failures >= MAX_AUTH_FAILURES {
                 let Outcome::Reply(v) = e else { return e };
@@ -5099,7 +5098,7 @@ mod tests {
     #[test]
     fn acl_rejects_unsupported_modifiers() {
         let (ctx, mut st) = fresh();
-        for bad in ["&events", "(+get ~cache:*)", "+@bogus"] {
+        for bad in ["!garbage", "(+get ~cache:*)", "+@bogus"] {
             assert!(
                 matches!(run(&ctx, &mut st, &["ACL", "SETUSER", "u", "on", bad]), Value::Error(_)),
                 "{bad} should be rejected"

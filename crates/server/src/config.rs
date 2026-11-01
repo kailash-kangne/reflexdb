@@ -217,9 +217,13 @@ pub struct Config {
     pub acl_file: Option<PathBuf>,
     /// `metrics-port`: 0 (default) disables. When set, a second listener
     /// on `bind:metrics-port` answers `GET /metrics` with Prometheus
-    /// text exposition — read-only, no auth (scrape over loopback or
-    /// put it behind your network boundary).
+    /// text exposition — read-only. `metrics-token` can require a bearer
+    /// token; otherwise scrape over loopback or guard the port at the
+    /// network boundary.
     pub metrics_port: u16,
+    /// `metrics-token`: when set, the metrics listener requires
+    /// `Authorization: Bearer <token>` and answers 401 otherwise.
+    pub metrics_token: Option<String>,
 }
 
 impl Default for Config {
@@ -276,6 +280,7 @@ impl Default for Config {
             live_pace_ms: 1,
             acl_file: None,
             metrics_port: 0,
+            metrics_token: None,
         }
     }
 }
@@ -354,6 +359,7 @@ impl Config {
                 self.metrics_port =
                     value.parse().map_err(|_| format!("invalid metrics-port: {value}"))?
             }
+            "metrics-token" => self.metrics_token = Some(value.to_string()),
             "databases" => {
                 self.databases = value.parse().map_err(|_| format!("invalid databases: {value}"))?
             }
@@ -582,6 +588,11 @@ mod tests {
     fn metrics_port_parses() {
         assert_eq!(Config::from_args(args(&[])).unwrap().metrics_port, 0);
         assert_eq!(Config::from_args(args(&[("metrics-port", "9121")])).unwrap().metrics_port, 9121);
+        assert_eq!(Config::from_args(args(&[])).unwrap().metrics_token, None);
+        assert_eq!(
+            Config::from_args(args(&[("metrics-token", "s3cret")])).unwrap().metrics_token,
+            Some("s3cret".into())
+        );
         assert!(Config::from_args(args(&[("metrics-port", "abc")])).is_err());
     }
 
