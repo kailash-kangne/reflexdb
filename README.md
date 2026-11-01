@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ ReflexDB
+<img src="logo.png" alt="ReflexDB" width="380">
 
 ### _The state store that lets you **watch** it change and **rewind** it._
 
