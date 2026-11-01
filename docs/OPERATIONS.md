@@ -77,6 +77,25 @@ tls-replication yes             # encrypt the replica→primary link
   floor.
 - `WAIT <n> <ms>` blocks until N replicas have acked the current replication offset.
 
+### Automatic failover (`reflexdb-sentinel`)
+
+```conf
+port 26379
+sentinel monitor mymaster 127.0.0.1 7379 2
+sentinel down-after-milliseconds mymaster 5000
+sentinel known-replica mymaster 127.0.0.1 7380
+sentinel known-sentinel mymaster 127.0.0.1 26380   # peer sentinels, for quorum > 1
+```
+
+`reflexdb-sentinel sentinel.conf` pings the master every second; after
+`down-after-milliseconds` of silence it asks peer sentinels whether they agree
+(`SENTINEL IS-MASTER-DOWN-BY-ADDR`), and once `quorum` votes say down it promotes the
+first `known-replica` (`REPLICAOF NO ONE`), re-points the rest at it, and publishes
+`+switch-master` on `__sentinel__:switch-master`. Simplified vs. real Sentinel: no
+auto-discovery (replicas/peers are configured explicitly), replica choice is
+first-listed not highest-offset, and a revived old primary is not walked back to
+replica duty — stop it yourself before it diverges.
+
 ## Monitoring
 
 Two surfaces:

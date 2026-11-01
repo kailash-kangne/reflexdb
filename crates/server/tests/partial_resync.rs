@@ -326,3 +326,57 @@ fn masterauth_authenticates_the_replication_link() {
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
 }
+
+/// Automatic failover: a sentinel watching the primary must promote the
+/// replica (`REPLICAOF NO ONE`) once the primary stays dead past
+/// `down-after-milliseconds`. The promoted replica then accepts writes
+/// and holds everything replicated before the kill.
+#[test]
+fn sentinel_promotes_replica_on_primary_death() {
+    let _serial = serial();
+    const SENTINEL_BIN: &str = env!("CARGO_BIN_EXE_reflexdb-sentinel");
+    let dir_a = temp_dir("sentinel-primary");
+    let dir_b = temp_dir("sentinel-replica");
+    let dir_s = temp_dir("sentinel-conf");
+    let (port_a, port_b, port_s) = (free_port(), free_port(), free_port());
+    let mut primary = spawn(port_a, &dir_a, &[]);
+    let mut replica = spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}")]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["SET", "k", "v"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "k", &bulk("v"));
+    // Sanity: the replica refuses client writes until promoted.
+    assert!(matches!(rc.cmd(&["SET", "w", "x"]), Reply::Error(_)));
+
+    let conf = dir_s.join("sentinel.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "port {port_s}\n\
+             sentinel monitor mymaster 127.0.0.1 {port_a} 1\n\
+             sentinel down-after-milliseconds mymaster 500\n\
+             sentinel known-replica mymaster 127.0.0.1 {port_b}\n"
+        ),
+    )
+    .unwrap();
+    let mut sentinel = Command::new(SENTINEL_BIN)
+        .arg(&conf)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn reflexdb-sentinel");
+
+    sigkill(&mut primary);
+    wait_info_field(&mut rc, "role", "master");
+
+    // Promoted: writable, and everything replicated pre-kill survived.
+    assert_eq!(rc.cmd(&["SET", "w", "x"]), Reply::Simple("OK".into()));
+    assert_eq!(rc.cmd(&["GET", "k"]), bulk("v"));
+
+    sigkill(&mut sentinel);
+    sigkill(&mut replica);
+    for d in [dir_a, dir_b, dir_s] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
