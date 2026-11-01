@@ -145,8 +145,8 @@ don't reclaim file space until compacted.
 
 Replication uses a separate bounded queue per connected replica (32,768 messages and 64 MiB).
 The normal pub/sub slow-client timeout does not apply to replicas. If the replica queue overflows,
-the missed stream cannot be continued safely, so the connection is closed after five seconds and
-must full-resync.
+the connection is closed after five seconds; the replica then partial-resyncs from the backlog
+(`partial-resync-backlog`, 1 MiB default) when its offset is still covered, else full-resyncs.
 
 ## `LIVE` (reactivity)
 

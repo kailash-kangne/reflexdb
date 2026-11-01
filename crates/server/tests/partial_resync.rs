@@ -1,0 +1,238 @@
+//! End-to-end partial resync checks: a replica whose link drops and
+//! reconnects must catch up incrementally (`PSYNC` → `+CONTINUE`) when
+//! its offset is still covered by the primary's backlog, and must fall
+//! back to `FULLRESYNC` when it isn't.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+const BIN: &str = env!("CARGO_BIN_EXE_reflexdb-server");
+
+#[derive(Debug, PartialEq)]
+enum Reply {
+    Simple(String),
+    Error(String),
+    Int(i64),
+    Bulk(Option<Vec<u8>>),
+    Array(Vec<Reply>),
+}
+
+struct Client {
+    reader: BufReader<TcpStream>,
+    writer: TcpStream,
+}
+
+impl Client {
+    fn connect(port: u16) -> Client {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                    let reader = BufReader::new(stream.try_clone().unwrap());
+                    return Client { reader, writer: stream };
+                }
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => panic!("server never came up on port {port}: {e}"),
+            }
+        }
+    }
+
+    fn cmd(&mut self, args: &[&str]) -> Reply {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        self.writer.write_all(&out).unwrap();
+        self.read_reply()
+    }
+
+    fn read_reply(&mut self) -> Reply {
+        let mut line = String::new();
+        self.reader.read_line(&mut line).unwrap();
+        let line = line.trim_end().to_string();
+        let (tag, rest) = line.split_at(1);
+        match tag {
+            "+" => Reply::Simple(rest.to_string()),
+            "-" => Reply::Error(rest.to_string()),
+            ":" => Reply::Int(rest.parse().unwrap()),
+            "$" => {
+                let len: i64 = rest.parse().unwrap();
+                if len < 0 {
+                    return Reply::Bulk(None);
+                }
+                let mut buf = vec![0u8; len as usize];
+                self.reader.read_exact(&mut buf).unwrap();
+                let mut crlf = [0u8; 2];
+                self.reader.read_exact(&mut crlf).unwrap();
+                Reply::Bulk(Some(buf))
+            }
+            "*" => {
+                let len: i64 = rest.parse().unwrap();
+                if len < 0 {
+                    return Reply::Bulk(None);
+                }
+                Reply::Array((0..len).map(|_| self.read_reply()).collect())
+            }
+            other => panic!("unexpected RESP tag {other:?} in line {line:?}"),
+        }
+    }
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("reflexdb-it-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn spawn(port: u16, dir: &Path, extra: &[&str]) -> Child {
+    Command::new(BIN)
+        .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
+        .args(extra)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn reflexdb-server")
+}
+
+fn sigkill(child: &mut Child) {
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+fn bulk(s: &str) -> Reply {
+    Reply::Bulk(Some(s.as_bytes().to_vec()))
+}
+
+/// Poll `GET key` on `client` until it equals `want` — replication is
+/// asynchronous, so "has the write arrived yet" is a wait, not an assert.
+fn wait_replicated(client: &mut Client, key: &str, want: &Reply) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if client.cmd(&["GET", key]) == *want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "replica never caught up on {key}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Poll `INFO` until `field` equals `want` — resync counters tick when
+/// the replica's new link completes its handshake, which is asynchronous.
+fn wait_info_field(client: &mut Client, field: &str, want: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if info_field(client, field) == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "INFO {field} never became {want}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn info_field(client: &mut Client, field: &str) -> String {
+    match client.cmd(&["INFO"]) {
+        Reply::Bulk(Some(body)) => String::from_utf8_lossy(&body)
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")).map(str::to_string))
+            .unwrap_or_else(|| panic!("INFO missing {field}")),
+        other => panic!("unexpected INFO reply: {other:?}"),
+    }
+}
+
+/// A replica that reconnects with a still-covered offset catches up
+/// incrementally — `REPLICAOF` to the same primary bounces the link, and
+/// the resume cursor makes the next `PSYNC` a `+CONTINUE`.
+#[test]
+fn replica_resumes_with_partial_resync_after_link_bounce() {
+    let dir_a = temp_dir("psync-primary");
+    let dir_b = temp_dir("psync-replica");
+    let (port_a, port_b) = (free_port(), free_port());
+    let mut primary = spawn(port_a, &dir_a, &[]);
+    let mut replica = spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}")]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["SET", "seed", "1"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "seed", &bulk("1"));
+
+    // Bounce the link, then write while the replica is mid-reconnect — the
+    // write lands in the backlog and arrives via catch-up.
+    assert_eq!(rc.cmd(&["REPLICAOF", "127.0.0.1", &port_a.to_string()]), Reply::Simple("OK".into()));
+    assert_eq!(pc.cmd(&["SET", "after", "2"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "after", &bulk("2"));
+
+    wait_info_field(&mut pc, "sync_partial_ok", "1");
+    assert_eq!(info_field(&mut pc, "sync_full"), "1");
+
+    sigkill(&mut primary);
+    sigkill(&mut replica);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// `partial-resync-backlog 0`: every reconnect is a full resync, and the
+/// replica still ends up correct.
+#[test]
+fn replica_falls_back_to_full_resync_when_backlog_disabled() {
+    let dir_a = temp_dir("psyncoff-primary");
+    let dir_b = temp_dir("psyncoff-replica");
+    let (port_a, port_b) = (free_port(), free_port());
+    let mut primary = spawn(port_a, &dir_a, &["--partial-resync-backlog", "0"]);
+    let mut replica = spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}")]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["SET", "seed", "1"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "seed", &bulk("1"));
+
+    assert_eq!(rc.cmd(&["REPLICAOF", "127.0.0.1", &port_a.to_string()]), Reply::Simple("OK".into()));
+    assert_eq!(pc.cmd(&["SET", "after", "2"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "after", &bulk("2"));
+
+    wait_info_field(&mut pc, "sync_full", "2");
+    assert_eq!(info_field(&mut pc, "sync_partial_ok"), "0");
+
+    sigkill(&mut primary);
+    sigkill(&mut replica);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// `REPLICAOF NO ONE` clears the resume cursor — a promoted replica's
+/// data may have diverged, so re-attaching must be a full resync.
+#[test]
+fn replicaof_no_one_clears_resume_cursor() {
+    let dir_a = temp_dir("psyncpromote-primary");
+    let dir_b = temp_dir("psyncpromote-replica");
+    let (port_a, port_b) = (free_port(), free_port());
+    let mut primary = spawn(port_a, &dir_a, &[]);
+    let mut replica = spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}")]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["SET", "seed", "1"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "seed", &bulk("1"));
+
+    assert_eq!(rc.cmd(&["REPLICAOF", "NO", "ONE"]), Reply::Simple("OK".into()));
+    assert_eq!(rc.cmd(&["SET", "local", "x"]), Reply::Simple("OK".into()));
+    assert_eq!(rc.cmd(&["REPLICAOF", "127.0.0.1", &port_a.to_string()]), Reply::Simple("OK".into()));
+    assert_eq!(pc.cmd(&["SET", "after", "2"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "after", &bulk("2"));
+
+    wait_info_field(&mut pc, "sync_full", "2");
+    assert_eq!(info_field(&mut pc, "sync_partial_ok"), "0");
+
+    sigkill(&mut primary);
+    sigkill(&mut replica);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}

@@ -27,26 +27,38 @@ pub fn cmd_keys(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
 
 pub fn cmd_scan(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let [cursor, rest @ ..] = args else { return wrong_args("scan") };
-    if std::str::from_utf8(cursor).ok().and_then(|s| s.parse::<u64>().ok()).is_none() {
+    let Some(cursor) = std::str::from_utf8(cursor).ok().and_then(|s| s.parse::<usize>().ok()) else {
         return err("ERR invalid cursor");
-    }
+    };
     let opts = match scan::parse_opts(rest) {
         Ok(o) => o,
         Err(e) => return err(e),
     };
     let db = ctx.store.db(state.db_index).expect("valid db index");
 
-    let mut items = Vec::new();
-    for key in db.keys_snapshot() {
-        if !scan::matches_pattern(&opts, &key) {
-            continue;
-        }
-        let type_name = db.with_value(&key, |v| v.type_name());
-        let Some(type_name) = type_name else { continue };
-        if !scan::matches_type(&opts, type_name) {
-            continue;
-        }
-        items.push(Value::bulk(key));
-    }
-    reply(ScanReply::done(items).into_value())
+    // Sorted so the cursor (an index into this list) is stable across calls —
+    // key iteration order isn't.
+    let mut matched: Vec<Bytes> = db
+        .keys_snapshot()
+        .into_iter()
+        .filter(|key| {
+            if !scan::matches_pattern(&opts, key) {
+                return false;
+            }
+            // No TYPE filter: a cheap non-promoting exists() check is enough —
+            // avoids pulling every disk-tier key back into RAM on each call.
+            if !opts.has_type_filter() {
+                return db.exists(std::slice::from_ref(key)) > 0;
+            }
+            db.with_value(key, |v| v.type_name()).is_some_and(|t| scan::matches_type(&opts, t))
+        })
+        .collect();
+    matched.sort_unstable();
+
+    let count = opts.count().unwrap_or(10).max(1);
+    let page: Vec<Value> =
+        matched.iter().skip(cursor).take(count).map(|key| Value::bulk(key.clone())).collect();
+    let next = cursor + page.len();
+    let next = if next >= matched.len() { 0 } else { next as u64 };
+    reply(ScanReply::page(next, page).into_value())
 }

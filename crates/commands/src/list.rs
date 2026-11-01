@@ -174,6 +174,26 @@ pub fn cmd_llen(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     }
 }
 
+pub fn cmd_lindex(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    let [key, index] = args else { return wrong_args("lindex") };
+    let Some(index) = parse_i64(index) else {
+        return err("ERR value is not an integer or out of range");
+    };
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    match db.with_value(key, |v| match v {
+        KVal::List(list) => {
+            let len = list.len() as i64;
+            let idx = if index < 0 { index + len } else { index };
+            Ok(if idx < 0 || idx >= len { None } else { Some(list[idx as usize].clone()) })
+        }
+        _ => Err(()),
+    }) {
+        None | Some(Ok(None)) => reply(Value::NullBulk),
+        Some(Ok(Some(item))) => reply(Value::bulk(item)),
+        Some(Err(())) => wrong_type(),
+    }
+}
+
 pub fn cmd_lpos(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     if args.len() < 2 {
         return wrong_args("lpos");
@@ -383,28 +403,32 @@ pub fn cmd_lrem(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let result = db.with_value_mut(key, |v| match v {
         KVal::List(list) => {
+            // Mark the indices to drop in one pass, then a single `retain`
+            // — an index/`remove` loop pays O(n) per removal
+            // (`VecDeque::remove` rotates), making all-match `LREM 0`
+            // quadratic.
+            let mut drop = vec![false; list.len()];
             let mut removed = 0usize;
-            if count >= 0 {
-                let limit = if count == 0 { usize::MAX } else { count as usize };
+            let limit = if count == 0 { usize::MAX } else { count.unsigned_abs() as usize };
+            let mut iter = list.iter().enumerate();
+            loop {
+                if removed >= limit {
+                    break;
+                }
+                let next = if count >= 0 { iter.next() } else { iter.next_back() };
+                let Some((i, item)) = next else { break };
+                if item.as_ref() == value.as_ref() {
+                    drop[i] = true;
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
                 let mut i = 0;
-                while i < list.len() && removed < limit {
-                    if list[i].as_ref() == value.as_ref() {
-                        list.remove(i);
-                        removed += 1;
-                    } else {
-                        i += 1;
-                    }
-                }
-            } else {
-                let limit = (-count) as usize;
-                let mut i = list.len();
-                while i > 0 && removed < limit {
-                    i -= 1;
-                    if list[i].as_ref() == value.as_ref() {
-                        list.remove(i);
-                        removed += 1;
-                    }
-                }
+                list.retain(|_| {
+                    let keep = !drop[i];
+                    i += 1;
+                    keep
+                });
             }
             Ok(removed)
         }

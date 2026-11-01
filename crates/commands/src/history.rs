@@ -21,7 +21,8 @@ const HISTORY_DISABLED: &str = "ERR history is disabled — set `history-enabled
 /// oldest version kept by age retention or the per-key version limit.
 pub fn cmd_getat(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let [key, ts] = args else { return wrong_args("getat") };
-    let Some(writer) = &ctx.history else { return err(HISTORY_DISABLED) };
+    let history = ctx.history.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(writer) = &*history else { return err(HISTORY_DISABLED) };
     let ts_ms: u64 = match std::str::from_utf8(ts).ok().and_then(|s| s.parse().ok()) {
         Some(n) => n,
         None => return err("ERR ms-epoch is not an integer or out of range"),
@@ -49,7 +50,8 @@ pub fn cmd_history(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> 
         }
         _ => return wrong_args("history"),
     };
-    let Some(writer) = &ctx.history else { return err(HISTORY_DISABLED) };
+    let history = ctx.history.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(writer) = &*history else { return err(HISTORY_DISABLED) };
     let items = writer
         .history(state.db_index, key, limit)
         .into_iter()

@@ -1,0 +1,623 @@
+<style>
+  #studioPanel { font-family: system-ui, -apple-system, sans-serif; }
+  #studioPanel ::-webkit-scrollbar { width: 8px; height: 8px; }
+  #studioPanel ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+  #studioPanel .st-sub { color: #55556a; font-size: .83rem; margin: -.4rem 0 1.1rem; }
+  #studioPanel .st-target { color: #8b8b9e; font-size: .78rem; margin: -.4rem 0 1.1rem; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  #studioPanel .st-target b { color: #22d3ee; font-weight: 600; }
+  #studioPanel .st-tabs { display: none; }
+  #studioPanel .st-tab { background: none; border: 0; border-bottom: 2px solid transparent; color: #8b8b9e; padding: .55rem .9rem; cursor: pointer; font-size: .88rem; font-weight: 600; }
+  #studioPanel .st-tab:hover { color: #fff; }
+  #studioPanel .st-tab.active { color: #fff; border-bottom-color: #a78bfa; }
+  #studioPanel .stpage { display: none; }
+  #studioPanel .stpage.active { display: block; animation: stfade .18s ease; }
+  @keyframes stfade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+  #studioPanel .toolbar { display: flex; gap: .55rem; margin-bottom: 1.1rem; flex-wrap: wrap; align-items: center; }
+  #studioPanel input { background: var(--inset); color: #fff; border: 1px solid var(--border); border-radius: 9px; padding: .55rem .75rem; font-family: inherit; }
+  #studioPanel input:focus { outline: none; border-color: #a78bfa; box-shadow: 0 0 0 3px rgba(167,139,250,.15); }
+  #studioPanel button.btn { background: linear-gradient(90deg, #a78bfa, #22d3ee); color: #0a0a10; border: 0; padding: .55rem 1.25rem; border-radius: 9px; cursor: pointer; font-weight: 700; font-size: .85rem; }
+  #studioPanel button.btn:hover { filter: brightness(1.12); }
+  #studioPanel button.ghost { background: var(--panel2); color: #e8e8f0; border: 1px solid var(--border); padding: .55rem 1rem; border-radius: 9px; cursor: pointer; font-weight: 600; font-size: .83rem; }
+  #studioPanel button.ghost:hover { border-color: #a78bfa; }
+  #studioPanel .muted { color: #55556a; font-size: .83rem; }
+  #studioPanel .panel { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 1.1rem 1.3rem; margin-bottom: 1rem; grid-template-columns: none; gap: 0; align-items: initial; }
+  #studioPanel .panel.flush { padding: .4rem .2rem; }
+  #studioPanel table { width: 100%; border-collapse: collapse; font-size: .87rem; }
+  #studioPanel th { text-align: left; color: #55556a; font-weight: 600; font-size: .7rem; text-transform: uppercase; letter-spacing: .07em; padding: .55rem .8rem; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); }
+  #studioPanel td { padding: .55rem .8rem; border-bottom: 1px solid var(--border); font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: .82rem; word-break: break-all; color: #e8e8f0; }
+  #studioPanel tr.key:hover td { background: var(--panel2); cursor: pointer; }
+  #studioPanel tr.key:last-child td { border-bottom: 0; }
+  #studioPanel .pill { display: inline-block; padding: .14rem .55rem; border-radius: 20px; font-size: .68rem; font-weight: 800; letter-spacing: .03em; }
+  #studioPanel .t-string { background: rgba(34,211,238,.14); color: #67e8f9; }
+  #studioPanel .t-hash { background: rgba(167,139,250,.16); color: #c4b5fd; }
+  #studioPanel .t-list { background: rgba(52,211,153,.14); color: #6ee7b7; }
+  #studioPanel .t-set { background: rgba(251,191,36,.14); color: #fcd34d; }
+  #studioPanel .t-zset { background: rgba(244,114,182,.14); color: #f9a8d4; }
+  #studioPanel .t-stream { background: rgba(248,113,113,.14); color: #fca5a5; }
+  #studioPanel .t-none { background: rgba(136,136,158,.14); color: #8b8b9e; }
+  #studioPanel .t-int, #studioPanel .t-float, #studioPanel .t-bool { background: rgba(74,222,128,.14); color: #86efac; }
+  #studioPanel .t-json { background: rgba(251,191,36,.14); color: #fcd34d; }
+  #studioPanel .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px,1fr)); gap: .85rem; }
+  #studioPanel .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: .95rem 1.1rem; position: relative; overflow: hidden; }
+  #studioPanel .card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, #a78bfa, transparent); opacity: .5; }
+  #studioPanel .card .k { color: #55556a; font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 700; }
+  #studioPanel .card .v { font-size: 1.4rem; font-weight: 800; margin-top: .3rem; font-family: ui-monospace, 'SF Mono', Menlo, monospace; color: #e8e8f0; }
+  #studioPanel .card .sub { color: #55556a; font-size: .72rem; margin-top: .25rem; line-height: 1.45; }
+  #studioPanel .ok { color: #34d399; } #studioPanel .warn { color: #fbbf24; } #studioPanel .bad { color: #f87171; }
+  #studioPanel pre { background: var(--inset); border: 1px solid var(--border); border-radius: 10px; padding: .85rem; overflow: auto; font-size: .82rem; max-height: 400px; white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, 'SF Mono', Menlo, monospace; color: #c9c9d8; line-height: 1.55; }
+  #studioPanel code { font-family: ui-monospace, 'SF Mono', Menlo, monospace; background: var(--panel2); padding: .1rem .35rem; border-radius: 5px; font-size: .85em; }
+  #studioPanel .timeline { position: relative; margin-left: .5rem; padding-left: 1.6rem; border-left: 2px solid var(--border); }
+  #studioPanel .tl-entry { position: relative; padding: .55rem .8rem; margin-bottom: .55rem; background: var(--panel); border: 1px solid var(--border); border-radius: 11px; cursor: pointer; }
+  #studioPanel .tl-entry:hover { border-color: var(--border2); }
+  #studioPanel .tl-entry.selected { border-color: #a78bfa; background: rgba(167,139,250,.1); }
+  #studioPanel .tl-entry::before { content: ''; position: absolute; left: -1.98rem; top: 1.05rem; width: 9px; height: 9px; border-radius: 50%; background: #22d3ee; box-shadow: 0 0 8px #22d3ee; }
+  #studioPanel .tl-entry.deleted::before { background: #f87171; box-shadow: 0 0 8px #f87171; }
+  #studioPanel .tl-ts { color: #22d3ee; font-size: .75rem; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  #studioPanel .tl-ver { float: right; color: #55556a; font-size: .7rem; }
+  #studioPanel .tl-val { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: .84rem; margin-top: .3rem; word-break: break-all; color: #c9c9d8; }
+  #studioPanel .diff-cols { display: grid; grid-template-columns: 1fr 1fr; gap: .9rem; }
+  #studioPanel .diff-h { font-size: .72rem; color: #55556a; margin-bottom: .35rem; font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  #studioPanel .diff-del { background: rgba(248,113,113,.13); color: #fca5a5; display: inline; border-radius: 3px; }
+  #studioPanel .diff-add { background: rgba(52,211,153,.13); color: #6ee7b7; display: inline; border-radius: 3px; }
+  #studioPanel .live-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #f87171; animation: stpulse 1.1s infinite; }
+  @keyframes stpulse { 50% { opacity: .3; } }
+  #studioPanel .log-line { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: .8rem; padding: .45rem .6rem; border-bottom: 1px solid var(--border); animation: stfade .15s ease; color: #e8e8f0; }
+  #studioPanel .log-line .t { color: #22d3ee; margin-right: .8rem; font-size: .72rem; }
+  #studioPanel .log-line .val { color: #34d399; }
+  #studioPanel .split { display: grid; grid-template-columns: 1.05fr .95fr; gap: 1.1rem; align-items: start; }
+  #studioPanel .inspector-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: .4rem; }
+  #studioPanel .meta-row { display: flex; gap: 1.2rem; color: #55556a; font-size: .76rem; margin-bottom: .7rem; font-family: ui-monospace, 'SF Mono', Menlo, monospace; align-items: center; }
+  #studioPanel .icon-btn { background: none; border: 1px solid var(--border); border-radius: 7px; color: #8b8b9e; padding: .3rem .6rem; cursor: pointer; font-size: .75rem; }
+  #studioPanel .icon-btn:hover { border-color: #a78bfa; color: #fff; }
+  #studioPanel .kv-table td:first-child { color: #a78bfa; max-width: 200px; }
+  #studioPanel .copy-toast { position: fixed; bottom: 1.4rem; right: 1.6rem; background: var(--panel2); border: 1px solid #a78bfa; padding: .6rem 1.1rem; border-radius: 10px; font-size: .82rem; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 99; }
+</style>
+
+<section id="studioPanel" style="display:none;">
+  <div class="st-sub">Inspect the server the site points at — keys, values, history, LIVE, health, slowlog.</div>
+  <div class="st-target">target →
+    <input id="stHost" value="127.0.0.1" style="width:140px"> : <input id="stPort" value="7379" style="width:72px">
+    <span class="muted" style="margin-left:.6rem">same server as the LIVE demo — mirrored when you open this tab</span>
+  </div>
+  <div class="st-tabs" id="stTabs">
+    <button class="st-tab active" data-stab="keys">Keys</button>
+    <button class="st-tab" data-stab="history">History</button>
+    <button class="st-tab" data-stab="live">LIVE</button>
+    <button class="st-tab" data-stab="health">Health</button>
+    <button class="st-tab" data-stab="slowlog">Slowlog</button>
+    <button class="st-tab" data-stab="settings">Settings</button>
+    <button class="st-tab" data-stab="commands">Commands</button>
+  </div>
+
+  <div class="stpage active" id="stpage-keys">
+    <div class="toolbar">
+      <input id="stKeyPattern" value="*" placeholder="pattern or part of a key, e.g. job:*" style="width:280px">
+      <button class="btn" onclick="stScanKeys(true)">Scan</button>
+      <button class="ghost" id="stMoreBtn" style="display:none" onclick="stScanKeys(false)">Load more</button>
+      <span class="muted" id="stScanStatus"></span>
+    </div>
+    <div class="split">
+      <div class="panel flush">
+        <table><thead><tr><th style="width:52%">Key</th><th>Type</th><th>TTL</th><th>Memory</th></tr></thead><tbody id="stKeyRows"></tbody></table>
+      </div>
+      <div class="panel" id="stInspector"><span class="muted">← Click a key to inspect it.</span></div>
+    </div>
+  </div>
+
+  <div class="stpage" id="stpage-history">
+    <div class="toolbar">
+      <input id="stHistKey" value="live:demo:1" placeholder="key name, e.g. job:123" style="width:280px">
+      <button class="btn" onclick="stLoadHistory()">Load</button>
+      <button class="ghost" onclick="stExportHistory('json')">⇩ JSON</button>
+      <button class="ghost" onclick="stExportHistory('csv')">⇩ CSV</button>
+      <span class="muted" id="stHistStatus"></span>
+    </div>
+    <div class="split">
+      <div class="timeline" id="stTimeline"><span class="muted">Enter a key and hit Load.</span></div>
+      <div class="panel" id="stDiffPanel"><span class="muted">Select two versions to compare them side by side.</span></div>
+    </div>
+  </div>
+
+  <div class="stpage" id="stpage-live">
+    <div class="toolbar">
+      <input id="stLiveQuery" placeholder="key to watch, e.g. job:status" style="width:320px">
+      <button class="btn" onclick="stStartLive()">▶ Watch</button>
+      <button class="ghost" onclick="stStopLive()">■ Stop</button>
+      <span id="stLiveStatus" class="muted"></span>
+    </div>
+    <div class="panel flush" id="stLiveLog" style="max-height:60vh;overflow-y:auto;">
+      <div class="log-line muted" style="border:0">No subscription yet — type a key and hit Watch (or a full query like <code>GET foo</code>).</div>
+    </div>
+  </div>
+
+  <div class="stpage" id="stpage-health">
+    <div class="toolbar"><button class="btn" onclick="stLoadHealth()">↻ Refresh</button><span class="muted" id="stHealthTs"></span></div>
+    <div class="cards" id="stHealthCards"></div>
+    <div class="st-sub" style="margin-top:1.2rem;">Raw INFO</div>
+    <pre id="stRawInfo"></pre>
+  </div>
+
+  <div class="stpage" id="stpage-slowlog">
+    <p class="st-sub" style="margin:0 0 1rem">Commands that took longer than <code>slowlog-log-slower-than</code> µs (tune it in ⚙️ Settings — <code>-1</code> disables). Newest first, capped at <code>slowlog-max-len</code> entries. Durations over 1 ms show amber, over 10 ms red.</p>
+    <div class="toolbar"><button class="btn" onclick="stLoadSlowlog()">↻ Refresh</button><span class="muted" id="stSlowTs"></span></div>
+    <div class="panel flush">
+      <table><thead><tr><th style="width:60px">#</th><th>Time</th><th>Duration</th><th>Command</th></tr></thead><tbody id="stSlowRows"></tbody></table>
+    </div>
+  </div>
+
+  <div class="stpage" id="stpage-settings">
+    <div class="toolbar">
+      <button class="btn" onclick="stLoadConfig()">↻ Refresh</button>
+      <button class="btn" onclick="stResetAllConfig()">Reset all to defaults</button>
+      <span class="muted" id="stCfgStatus"></span>
+    </div>
+    <div class="panel flush">
+      <table><thead><tr><th style="width:32%">Parameter</th><th style="width:30%">Current</th><th style="width:28%">New value</th><th></th></tr></thead><tbody id="stCfgRows"></tbody></table>
+    </div>
+    <div class="muted" style="margin-top:.5rem">Changes apply live via <code>CONFIG SET</code> — they aren't written back to the config file, so a restart restores file values.</div>
+  </div>
+
+  <div class="stpage" id="stpage-commands">
+    <div class="toolbar">
+      <input id="stCmdFilter" placeholder="filter commands…" style="width:220px">
+      <input id="stCmdBox" placeholder="type any command, e.g. GET foo" style="flex:1;min-width:200px">
+      <button class="btn" onclick="stExec()">▶ Run</button>
+      <span class="muted" id="stCmdStatus"></span>
+    </div>
+    <pre id="stCmdOut" style="display:none"></pre>
+    <div class="panel flush">
+      <table><thead><tr><th style="width:180px">Command</th><th>Example</th><th style="width:60px"></th></tr></thead><tbody id="stCmdRows"></tbody></table>
+    </div>
+    <div class="muted">Click an example to load it into the box, or ▶ to run it immediately. Arguments are space-separated (no quoting).</div>
+  </div>
+  <div class="copy-toast" id="stToast">copied</div>
+</section>
+
+<script>
+const st$ = id => document.getElementById(id);
+const ST_REFRESH_MS = 1000;
+let stCursor = "0", stKeyCount = 0, stHistData = [], stSelected = new Set(), stLiveAbort = null, stRefreshTimer = null;
+
+function stSetRefresh(fn) {
+  clearInterval(stRefreshTimer); stRefreshTimer = null;
+  if (!fn) return;
+  stRefreshTimer = setInterval(() => {
+    if (st$('studioPanel').style.display === 'none') { stSetRefresh(null); return; }
+    fn();
+  }, ST_REFRESH_MS);
+}
+
+const stTarget = () => {
+  const host = st$('stHost').value.trim() || '127.0.0.1';
+  const port = st$('stPort').value.trim() || '7379';
+  return `host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`;
+};
+
+document.getElementById('stTabs').addEventListener('click', e => {
+  const b = e.target.closest('.st-tab');
+  if (!b) return;
+  document.querySelectorAll('#stTabs .st-tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('#studioPanel .stpage').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  st$('stpage-' + b.dataset.stab).classList.add('active');
+  if (b.dataset.stab === 'health') stLoadHealth();
+  if (b.dataset.stab === 'slowlog') stLoadSlowlog();
+  if (b.dataset.stab === 'settings') stLoadConfig();
+  if (b.dataset.stab === 'commands') stLoadCommands();
+  stSetRefresh(b.dataset.stab === 'health' ? stLoadHealth : b.dataset.stab === 'slowlog' ? stLoadSlowlog : null);
+});
+
+const stEsc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const stFmtTs = ms => new Date(Number(ms)).toLocaleString();
+const stFmtTtl = ms => ms < 0 ? '∞' : (ms / 1000).toFixed(1) + 's';
+const stFmtBytes = n => n == null || n === 'null' ? '—' : (n = +n) > 1073741824 ? (n/1073741824).toFixed(1)+' GB' : n > 1048576 ? (n/1048576).toFixed(1)+' MB' : n > 1024 ? (n/1024).toFixed(1)+' KB' : n+' B';
+const stApi = async path => (await fetch(path + (path.includes('?') ? '&' : '?') + stTarget())).json();
+const stToastShow = () => { const t = st$('stToast'); t.style.opacity = 1; setTimeout(() => t.style.opacity = 0, 900); };
+const stCopy = txt => { navigator.clipboard.writeText(txt); stToastShow(); };
+
+function stShowStudio() {
+  // Public sandbox mode: claim (or resume) this visitor's own throwaway
+  // instance before the first proxied call — 404 means the pool is off.
+  fetch('/api/session', {method: 'POST'}).catch(() => {});
+  // One-server site: mirror the LIVE demo's target so data written there
+  // shows up here (user can still override the fields afterwards).
+  const lh = document.getElementById('liveHost'), lp = document.getElementById('livePort');
+  if (lh && lp) { st$('stHost').value = lh.value; st$('stPort').value = lp.value; }
+  if (!st$('stKeyRows').children.length) stScanKeys(true);
+}
+
+const stGlob = p => /[*?[]/.test(p) ? p : `*${p}*`;
+
+async function stScanKeys(reset) {
+  if (reset) { stCursor = "0"; stKeyCount = 0; st$('stKeyRows').innerHTML = ''; }
+  const pat = encodeURIComponent(stGlob(st$('stKeyPattern').value.trim() || '*'));
+  const d = await stApi(`/api/keys?pattern=${pat}&cursor=${stCursor}`);
+  if (d.error) { st$('stScanStatus').textContent = d.error; return; }
+  stCursor = d.cursor; stKeyCount += d.keys.length;
+  for (const k of d.keys) {
+    const tr = document.createElement('tr');
+    tr.className = 'key';
+    tr.innerHTML = `<td>${stEsc(k.key)}</td><td><span class="pill t-${k.type}">${k.type}</span></td><td>${stFmtTtl(k.ttl_ms)}</td><td>${stFmtBytes(k.mem_bytes)}</td>`;
+    tr.onclick = () => stInspect(k.key);
+    st$('stKeyRows').appendChild(tr);
+  }
+  st$('stMoreBtn').style.display = stCursor === '0' ? 'none' : '';
+  st$('stScanStatus').textContent = `${stKeyCount} keys${stCursor === '0' ? ' · all scanned' : ''}`;
+}
+
+async function stInspect(key) {
+  const d = await stApi(`/api/key?name=${encodeURIComponent(key)}`);
+  const p = st$('stInspector');
+  if (d.error) { p.innerHTML = `<span class="bad">${stEsc(d.error)}</span>`; return; }
+  let h = `<div class="inspector-head"><b style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:.95rem">${stEsc(key)}</b>
+    <span class="pill t-${d.type}">${d.type}</span></div>
+    <div class="meta-row"><span>ttl <b style="color:#22d3ee">${stFmtTtl(d.ttl_ms)}</b></span>
+    <span>memory <b style="color:#22d3ee">${stFmtBytes(d.memory_bytes)}</b></span>
+    ${d.total ? `<span>entries <b style="color:#22d3ee">${d.total}</b></span>` : ''}
+    <button class="icon-btn" onclick="stCopy(${JSON.stringify(key).replace(/"/g,'&quot;')})">copy key</button></div>`;
+  if (d.type === 'string') h += `<pre>${stEsc(d.value)}</pre>`;
+  else if (d.type === 'hash') h += `<table class="kv-table"><tbody>` +
+    d.value.map(([f,v]) => `<tr><td>${stEsc(f)}</td><td>${stEsc(v)}</td></tr>`).join('') + '</tbody></table>';
+  else if (d.type === 'zset') h += `<table class="kv-table"><tbody>` +
+    d.value.map(([m,s]) => `<tr><td>${stEsc(m)}</td><td style="color:#22d3ee">${stEsc(s)}</td></tr>`).join('') + '</tbody></table>';
+  else if (d.type === 'stream') h += `<table class="kv-table"><tbody>` +
+    d.value.map(([id,f]) => `<tr><td>${stEsc(id)}</td><td>${stEsc(JSON.stringify(f))}</td></tr>`).join('') + '</tbody></table>';
+  else h += `<table><tbody>` + d.value.map(v => `<tr><td>${stEsc(v)}</td></tr>`).join('') + '</tbody></table>';
+  if (d.truncated) h += `<div class="muted">showing first ${d.value.length} of ${d.total} entries</div>`;
+  h += `<div class="toolbar" style="margin-top:.9rem"><button class="ghost" onclick="document.querySelector('[data-stab=history]').click();st$('stHistKey').value=decodeURIComponent('${encodeURIComponent(key)}');stLoadHistory()">⏪ view history</button></div>`;
+  p.innerHTML = h;
+}
+
+async function stLoadHistory() {
+  let key = st$('stHistKey').value.trim();
+  if (!key) return;
+  let d = await stApi(`/api/history?name=${encodeURIComponent(key)}`);
+  // No versions and no glob chars typed → resolve the partial text to the
+  // first matching key and retry, so "demo" finds "live:demo:1".
+  if (!d.error && !(d.entries && d.entries.length) && !/[*?[]/.test(key)) {
+    const k = await stApi(`/api/keys?pattern=${encodeURIComponent(`*${key}*`)}&cursor=0`);
+    if (k.keys && k.keys.length) {
+      key = k.keys[0].key;
+      st$('stHistKey').value = key;
+      d = await stApi(`/api/history?name=${encodeURIComponent(key)}`);
+    }
+  }
+  const tl = st$('stTimeline');
+  stSelected.clear(); st$('stDiffPanel').innerHTML = '<span class="muted">Select two versions to compare them side by side.</span>';
+  if (d.enabled === false) { tl.innerHTML = `<div class="panel"><span class="warn">History is disabled on this server</span> — set <code>history-enabled yes</code> and restart.</div>`; stHistData = []; return; }
+  if (d.error) { tl.innerHTML = `<div class="bad">${stEsc(d.error)}</div>`; stHistData = []; return; }
+  stHistData = d.entries;
+  if (!d.entries.length) { tl.innerHTML = '<div class="muted">No recorded versions for this key.</div>'; st$('stHistStatus').textContent=''; return; }
+  tl.innerHTML = '';
+  d.entries.forEach((e, i) => {
+    const div = document.createElement('div');
+    div.className = 'tl-entry' + (e.value === null ? ' deleted' : '');
+    div.innerHTML = `<span class="tl-ver">v${d.entries.length - i}</span><div class="tl-ts">${stFmtTs(e.ts)}<span class="muted"> · ${e.ts}</span></div><div class="tl-val">${e.value === null ? '∅ <i>deleted / not a string</i>' : stEsc(e.value)}</div>`;
+    div.onclick = () => {
+      if (stSelected.has(i)) stSelected.delete(i);
+      else { stSelected.add(i); if (stSelected.size > 2) stSelected.delete([...stSelected][0]); }
+      tl.querySelectorAll('.tl-entry').forEach((el, j) => el.classList.toggle('selected', stSelected.has(j)));
+      stRenderDiff();
+    };
+    tl.appendChild(div);
+  });
+  st$('stHistStatus').textContent = `${d.entries.length} versions`;
+}
+
+function stRenderDiff() {
+  const p = st$('stDiffPanel');
+  if (stSelected.size !== 2) { p.innerHTML = '<span class="muted">Select two versions to compare them side by side.</span>'; return; }
+  const [a, b] = [...stSelected].sort((x, y) => x - y);
+  const [newer, older] = [stHistData[a], stHistData[b]];
+  const diff = stDiffWords(String(older.value ?? ''), String(newer.value ?? ''));
+  p.innerHTML = `<div class="diff-cols">
+    <div><div class="diff-h">${stFmtTs(older.ts)} · older</div><pre>${diff.left}</pre></div>
+    <div><div class="diff-h">${stFmtTs(newer.ts)} · newer</div><pre>${diff.right}</pre></div></div>
+    <div class="muted" style="margin-top:.6rem">Red = removed in newer · Green = added in newer</div>`;
+}
+
+function stDiffWords(a, b) {
+  const ta = a.split(/(\s+)/), tb = b.split(/(\s+)/);
+  const m = ta.length, n = tb.length;
+  const dp = Array.from({length: m + 1}, () => new Uint16Array(n + 1));
+  for (let i = m - 1; i >= 0; i--) for (let j = n - 1; j >= 0; j--)
+    dp[i][j] = ta[i] === tb[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
+  let i = 0, j = 0, left = '', right = '';
+  while (i < m && j < n) {
+    if (ta[i] === tb[j]) { left += stEsc(ta[i]); right += stEsc(tb[j]); i++; j++; }
+    else if (dp[i+1][j] >= dp[i][j+1]) { left += `<span class="diff-del">${stEsc(ta[i++])}</span>`; }
+    else { right += `<span class="diff-add">${stEsc(tb[j++])}</span>`; }
+  }
+  while (i < m) left += `<span class="diff-del">${stEsc(ta[i++])}</span>`;
+  while (j < n) right += `<span class="diff-add">${stEsc(tb[j++])}</span>`;
+  return {left, right};
+}
+
+function stExportHistory(fmt) {
+  if (!stHistData.length) { st$('stHistStatus').textContent = 'load a key first'; return; }
+  const key = st$('stHistKey').value.trim() || 'key';
+  let blob, name;
+  if (fmt === 'csv') {
+    const rows = ['timestamp_ms,iso_time,value', ...stHistData.map(e => `${e.ts},"${new Date(e.ts).toISOString()}","${String(e.value ?? '').replace(/"/g,'""')}"`)];
+    blob = new Blob([rows.join('\n')], {type: 'text/csv'}); name = `${key}-history.csv`;
+  } else {
+    blob = new Blob([JSON.stringify({key, exported_at: Date.now(), versions: stHistData}, null, 2)], {type: 'application/json'});
+    name = `${key}-history.json`;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function stStartLive() {
+  stStopLive();
+  // Bare key → watch GET <key>; anything with a space is a full LIVE query.
+  const q = st$('stLiveQuery').value.trim();
+  if (!q) return;
+  const liveQ = q.includes(' ') ? q : 'GET ' + q;
+  stLiveAbort = new AbortController();
+  st$('stLiveStatus').innerHTML = '<span class="live-dot"></span> watching <code>' + stEsc(liveQ) + '</code>';
+  try {
+    const resp = await fetch('/api/live?query=' + encodeURIComponent(liveQ) + '&' + stTarget(), {signal: stLiveAbort.signal});
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    if (st$('stLiveLog').querySelector('.muted')) st$('stLiveLog').innerHTML = '';
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      const lines = buf.split('\n'); buf = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const evt = JSON.parse(line);
+        const f = evt.frame;
+        const text = evt.error
+          ? `<span class="bad">✗ ${stEsc(evt.error)}</span>`
+          : Array.isArray(f) && f[0] === 'live'
+            ? `<span class="val">${stEsc(JSON.stringify(f[4]))}</span> <span class="muted">· crc ${stEsc(String(f[2]).slice(0,8))}</span>`
+            : stEsc(JSON.stringify(f ?? evt));
+        const div = document.createElement('div');
+        div.className = 'log-line';
+        div.innerHTML = `<span class="t">${new Date().toLocaleTimeString()}.${String(Date.now()%1000).padStart(3,'0')}</span>${text}`;
+        st$('stLiveLog').prepend(div);
+      }
+    }
+  } catch (e) { if (e.name !== 'AbortError') st$('stLiveStatus').textContent = 'error: ' + e.message; }
+  if (!stLiveAbort) st$('stLiveStatus').textContent = 'stopped';
+}
+function stStopLive() { if (stLiveAbort) { stLiveAbort.abort(); stLiveAbort = null; st$('stLiveStatus').textContent = 'stopped'; } }
+
+async function stLoadHealth() {
+  const d = await stApi('/api/info');
+  if (d.error) { st$('stHealthCards').innerHTML = `<span class="bad">${stEsc(d.error)}</span>`; return; }
+  const i = d.info;
+  const keyCount = Object.keys(i).filter(k => /^db\d+$/.test(k))
+    .reduce((n, k) => n + (parseInt((i[k].match(/keys=(\d+)/) || [])[1]) || 0), 0);
+  const card = (k, v, sub, cls) => `<div class="card"><div class="k">${k}</div><div class="v ${cls||''}">${v}</div><div class="sub">${sub||''}</div></div>`;
+  st$('stHealthCards').innerHTML = [
+    card('Memory', stFmtBytes(i.used_memory), `limit ${+i.maxmemory > 0 ? stFmtBytes(i.maxmemory) : '∞'} · ${i.maxmemory_policy || '—'}`),
+    card('Keys', keyCount, `${i.connected_clients ?? '—'} clients · ${i.blocked_clients ?? 0} blocked`),
+    card('Role', i.role || '—', i.role === 'slave' ? `primary ${i.master_host}:${i.master_port} · link ${i.master_link_status}` : `${i.connected_slaves ?? 0} replicas · offset ${i.master_repl_offset ?? 0}`, i.role === 'slave' && i.master_link_status !== 'up' ? 'bad' : 'ok'),
+    card('AOF', +i.aof_enabled ? 'on' : 'off', +i.aof_enabled ? 'MISCONF gate armed if writes fail' : 'appendonly no', +i.aof_enabled ? 'ok' : ''),
+    card('Last save', +i.rdb_last_save_time ? stFmtTs(+i.rdb_last_save_time * 1000) : 'never', 'SAVE / BGSAVE / shutdown'),
+    card('Tiered', stFmtBytes(i.tiered_disk_used_bytes), `mem ${stFmtBytes(i.tiered_memory_limit)} · disk ${stFmtBytes(i.tiered_disk_limit)} · ${i.tiered_overflow_policy || '—'} · ${i.tiered_rejected_writes ?? 0} rejected`),
+    card('Uptime', `${Math.floor((+i.uptime_in_seconds || 0) / 3600)}h ${Math.floor(((+i.uptime_in_seconds || 0) % 3600) / 60)}m`, `started ${i.uptime_in_days ?? '—'}d ago`),
+    card('History', d.history_enabled ? 'on' : 'off', d.history_enabled ? 'GETAT / HISTORY live' : 'GETAT/HISTORY unavailable', d.history_enabled ? 'ok' : 'warn'),
+    card('Slowlog', d.slowlog_len ?? '—', 'entries recorded'),
+  ].join('');
+  st$('stRawInfo').textContent = d.raw;
+  st$('stHealthTs').textContent = 'updated ' + new Date().toLocaleTimeString() + ' · auto-refreshing';
+}
+
+async function stLoadSlowlog() {
+  const d = await stApi('/api/slowlog');
+  const rows = st$('stSlowRows');
+  rows.innerHTML = '';
+  if (d.error) { rows.innerHTML = `<tr><td colspan="4" class="bad">${stEsc(d.error)}</td></tr>`; return; }
+  if (!d.entries.length) { rows.innerHTML = '<tr><td colspan="4" class="muted" style="text-align:center;padding:2rem">no slow commands recorded</td></tr>'; return; }
+  for (const e of d.entries) {
+    const tr = document.createElement('tr');
+    const cls = e.duration_us > 10000 ? 'bad' : e.duration_us > 1000 ? 'warn' : '';
+    tr.innerHTML = `<td>${e.id}</td><td>${stFmtTs(e.ts * 1000)}</td><td class="${cls}" style="font-weight:700">${e.duration_us} µs</td><td>${stEsc(e.command)}</td>`;
+    rows.appendChild(tr);
+  }
+  st$('stSlowTs').textContent = 'updated ' + new Date().toLocaleTimeString() + ' · auto-refreshing';
+}
+
+const ST_CFG_SETTABLE = new Set(['requirepass','maxmemory','maxmemory-policy','appendonly','appendfsync','history-enabled','slowlog-log-slower-than','slowlog-max-len','notify-keyspace-events','min-replicas-to-write','dir','dbfilename','aclfile']);
+const ST_CFG_DEFAULTS = {
+  requirepass:'', maxmemory:'0', 'maxmemory-policy':'noeviction', appendonly:'no',
+  appendfsync:'no', 'history-enabled':'yes', 'slowlog-log-slower-than':'10000',
+  'slowlog-max-len':'128', 'notify-keyspace-events':'', 'min-replicas-to-write':'0',
+  dir:'.', dbfilename:'dump.rdb', aclfile:'',
+};
+const ST_CFG_HELP = {
+  'requirepass': 'Password clients must send via <code>AUTH</code>. Empty = no auth. Applies to the <code>default</code> ACL user — existing connections stay authenticated.',
+  'maxmemory': 'RAM cap in bytes (or <code>512mb</code>/<code>2gb</code>). <code>0</code> = unlimited. Over it, <code>maxmemory-policy</code> decides what happens to writes.',
+  'maxmemory-policy': 'What to do at <code>maxmemory</code>: <code>noeviction</code> (writes error), <code>allkeys-lru/lfu/random</code>, <code>volatile-lru/lfu/ttl/random</code> (only keys with TTL).',
+  'appendonly': '<code>yes</code>/<code>no</code> — log every write to the AOF for crash durability. Enabling live opens the configured file; writes already queued still land before it turns off.',
+  'appendfsync': 'How often the AOF hits disk: <code>always</code> (fsync every write, safest/slowest), <code>everysec</code> (~1s loss window, default balance), <code>no</code> (OS decides, fastest).',
+  'appendfilename': 'AOF filename inside <code>dir</code>. Startup-only.',
+  'history-enabled': '<code>yes</code>/<code>no</code> — disk-backed per-key version log powering <code>GETAT</code>/<code>HISTORY</code>. Toggle live; recorded versions survive on disk.',
+  'history-dir': 'Directory for the history store (relative to <code>dir</code>). Startup-only.',
+  'history-retention-ms': 'Age after which recorded versions are swept (ms). <code>0</code> = keep forever, bounded only by the per-key cap. Startup-only.',
+  'history-max-versions-per-key': 'Max versions kept per key (1–1000000). Older ones are compacted away. Startup-only.',
+  'slowlog-log-slower-than': 'Log commands slower than this (µs). <code>-1</code> disables, <code>0</code> logs everything.',
+  'slowlog-max-len': 'Slowlog ring-buffer size; oldest entries drop past it.',
+  'notify-keyspace-events': 'Keyspace notification flags, e.g. <code>KEA</code> (keyspace+keyevent, all classes), <code>Ex</code> (keyevent, expire only). <code>""</code> = off.',
+  'min-replicas-to-write': 'Refuse writes (NOREPLICAS) unless this many healthy replicas are connected. <code>0</code> = off.',
+  'dir': 'Working directory — RDB dumps, AOF and history resolve relative to it.',
+  'dbfilename': 'RDB snapshot filename inside <code>dir</code> (written by <code>SAVE</code>/<code>BGSAVE</code>/shutdown).',
+  'aclfile': 'Path to a Redis-format ACL file — <code>ACL SAVE</code> writes it, <code>ACL LOAD</code>/startup reads it. Empty = ACL file disabled.',
+  'databases': 'Number of logical DBs (<code>SELECT</code> index range). Startup-only.',
+  'maxclients': 'Max simultaneous client connections (accept-loop semaphore). Startup-only.',
+  'bind': 'Address the server listens on. Startup-only — restart to move.',
+  'port': 'TCP port clients connect to. Startup-only.',
+  'proto-max-bulk-len': 'Largest single bulk string/element the protocol layer and string commands accept (bytes). Default 64 MiB. Startup-only.',
+  'profile': 'Coarse preset (<code>cache</code>/<code>durable</code>/<code>replicated</code>) that rewrote several directives at boot. Startup-only.',
+  'tiered-storage': '<code>yes</code>/<code>no</code> — spill keys to the disk tier when RAM passes <code>tiered-memory-limit</code> instead of evicting. Startup-only.',
+  'tiered-memory-limit': 'RAM budget in bytes before keys move to the disk tier. Startup-only.',
+  'tiered-dir': 'Directory for the disk tier (relative to <code>dir</code>). Startup-only.',
+  'tiered-disk-limit': 'Cap on the disk tier itself (bytes); empty = unbounded. <code>tiered-overflow-policy</code> applies past it. Startup-only.',
+  'tiered-overflow-policy': 'At <code>tiered-disk-limit</code>: <code>reject-writes</code> (no loss, writes error), <code>evict-oldest</code> (drop oldest tier entries), <code>no-limit</code>. Startup-only.',
+  'eviction-tick-ms': 'How often the background expire/evict sweep runs (ms). Startup-only.',
+  'eviction-low-watermark': 'An eviction pass drains to this fraction of the limit (0–1], not just back under it — headroom against immediate re-triggering. Default 0.5. Startup-only.',
+  'eviction-max-per-tick': 'Max keys one eviction pass may move/drop — bounds worst-case tick latency. Default 10000. Startup-only.',
+  'singleflight-max-wait-ms': 'How long a blocked <code>SINGLEFLIGHT</code> wait retries before erroring (ms). Startup-only.',
+  'replicaof': '<code>host port</code> — replicate from this primary at boot. Empty = standalone primary. Startup-only (use <code>REPLICAOF</code> live).',
+  'tls-port': 'TLS listen port (0 = off). Startup-only.',
+  'tls-cert-file': 'PEM certificate for the TLS port. Startup-only.',
+  'tls-key-file': 'PEM private key for the TLS port. Startup-only.',
+  'tls-ca-cert-file': 'CA bundle for verifying client/replica certs. Startup-only.',
+  'tls-auth-clients': '<code>yes</code>/<code>no</code> — require client certs on the TLS port. Startup-only.',
+  'tls-replication': '<code>yes</code>/<code>no</code> — use TLS for outbound replication links. Startup-only.',
+  'repl-backlog-size': 'Pending-RESP queue depth per replica before it\u2019s flagged slow. Startup-only.',
+  'repl-backlog-max-bytes': 'Bytes of queued commands one replica may hold before being cut as slow. Startup-only.',
+  'partial-resync-backlog': 'Bytes of replicated stream kept for <code>PSYNC</code> catch-up after reconnect; <code>0</code> = always full resync. Startup-only.',
+  'repl-slow-disconnect-delay-ms': 'Grace period before a replica flagged slow is actually disconnected (ms). Startup-only.',
+  'live-sweep-ms': 'How often stale LIVE subscriptions are reaped (ms). Startup-only.',
+  'live-pace-chunk': 'LIVE fan-out batch size per pacing tick. Startup-only.',
+  'live-pace-ms': 'Delay between LIVE fan-out batches (ms). Startup-only.',
+};
+const ST_CFG_ORDER = ['requirepass','maxmemory','maxmemory-policy','appendonly','appendfsync','history-enabled','slowlog-log-slower-than','slowlog-max-len','notify-keyspace-events','min-replicas-to-write','dir','dbfilename','aclfile','databases','maxclients','bind','port','proto-max-bulk-len','appendfilename','profile','replicaof','tiered-storage','tiered-memory-limit','tiered-dir','tiered-disk-limit','tiered-overflow-policy','eviction-tick-ms','eviction-low-watermark','eviction-max-per-tick','singleflight-max-wait-ms','history-dir','history-retention-ms','history-max-versions-per-key','repl-backlog-size','repl-backlog-max-bytes','partial-resync-backlog','repl-slow-disconnect-delay-ms','live-sweep-ms','live-pace-chunk','live-pace-ms','tls-port','tls-cert-file','tls-key-file','tls-ca-cert-file','tls-auth-clients','tls-replication'];
+
+const stCfgInfo = name => ST_CFG_HELP[name]
+  ? `<span class="info-icon" tabindex="0">i<span class="info-tooltip">${ST_CFG_HELP[name]}</span></span>`
+  : '';
+
+async function stLoadConfig() {
+  const d = await stApi('/api/config');
+  const rows = st$('stCfgRows');
+  rows.innerHTML = '';
+  if (d.error) { rows.innerHTML = `<tr><td colspan="4" class="bad">${stEsc(d.error)}</td></tr>`; return; }
+  const names = Object.keys(d.values).sort((a, b) => (ST_CFG_ORDER.indexOf(a) + 1 || 99) - (ST_CFG_ORDER.indexOf(b) + 1 || 99));
+  for (const name of names) {
+    const tr = document.createElement('tr');
+    const ro = !ST_CFG_SETTABLE.has(name);
+    tr.innerHTML = `<td style="color:#a78bfa">${stEsc(name)}${stCfgInfo(name)}</td><td>${stEsc(d.values[name]) || '<span class="muted">—</span>'}</td>` +
+      (ro
+        ? `<td colspan="2" class="muted">startup-only</td>`
+        : `<td><input id="stcfg-${name}" value="${stEsc(d.values[name])}" style="width:100%;box-sizing:border-box"></td>` +
+          `<td><button class="ghost" style="padding:.35rem .8rem" onclick="stSetConfig('${stEsc(name)}')">Apply</button>` +
+          `<button class="ghost" style="padding:.35rem .5rem" title="reset to default" onclick="stResetConfig('${stEsc(name)}')">↺</button></td>`);
+    tr.querySelector('input')?.addEventListener('keydown', e => { if (e.key === 'Enter') stSetConfig(name); });
+    rows.appendChild(tr);
+  }
+  st$('stCfgStatus').textContent = '';
+}
+
+async function stSetConfig(name) {
+  const value = st$(`stcfg-${name}`).value;
+  const d = await stApi(`/api/config-set?name=${encodeURIComponent(name)}&value=${encodeURIComponent(value)}`);
+  const s = st$('stCfgStatus');
+  if (d.error) { s.innerHTML = `<span class="bad">${stEsc(d.error)}</span>`; return; }
+  s.innerHTML = `<span class="ok">${stEsc(name)} → ${stEsc(value)}</span>`;
+  stLoadConfig();
+}
+
+async function stResetConfig(name) {
+  const def = ST_CFG_DEFAULTS[name];
+  if (def === undefined) return;
+  const inp = st$(`stcfg-${name}`);
+  if (inp) inp.value = def;
+  await stSetConfig(name);
+}
+
+async function stResetAllConfig() {
+  if (!confirm('Reset every editable parameter to its built-in default?')) return;
+  for (const [name, def] of Object.entries(ST_CFG_DEFAULTS)) {
+    const d = await stApi(`/api/config-set?name=${encodeURIComponent(name)}&value=${encodeURIComponent(def)}`);
+    if (d.error) { st$('stCfgStatus').innerHTML = `<span class="bad">${stEsc(name)}: ${stEsc(d.error)}</span>`; return; }
+  }
+  st$('stCfgStatus').innerHTML = '<span class="ok">all reset to defaults</span>';
+  stLoadConfig();
+}
+
+// ---------- Commands playground ----------
+const ST_EXAMPLES = {
+  PING:'PING', ECHO:'ECHO hello', AUTH:'AUTH default pass', HELLO:'HELLO 3', TIME:'TIME',
+  SELECT:'SELECT 0', DBSIZE:'DBSIZE', INFO:'INFO server', CONFIG:'CONFIG GET maxmemory',
+  SET:'SET mykey hello', GET:'GET mykey', GETDEL:'GETDEL mykey', GETEX:'GETEX mykey EX 60',
+  SETNX:'SETNX nx 1', MSET:'MSET a 1 b 2', MGET:'MGET a b', INCR:'INCR counter', INCRBY:'INCRBY counter 5',
+  DECR:'DECR counter', APPEND:'APPEND mykey !', STRLEN:'STRLEN mykey', GETRANGE:'GETRANGE mykey 0 4',
+  SETRANGE:'SETRANGE mykey 0 hi', SETEX:'SETEX tmp 60 v', GETSET:'GETSET mykey new',
+  DEL:'DEL mykey', UNLINK:'UNLINK mykey', EXISTS:'EXISTS mykey', KEYS:'KEYS *', SCAN:'SCAN 0 MATCH * COUNT 10',
+  TYPE:'TYPE mykey', TTL:'TTL mykey', PTTL:'PTTL mykey', EXPIRE:'EXPIRE mykey 60', PEXPIRE:'PEXPIRE mykey 60000',
+  PERSIST:'PERSIST mykey', RANDOMKEY:'RANDOMKEY', RENAME:'RENAME mykey mykey2', COPY:'COPY mykey dst',
+  TOUCH:'TOUCH mykey', DUMP:'DUMP mykey', RESTORE:'RESTORE dst 0 "payload"', SORT:'SORT mylist ALPHA',
+  LPUSH:'LPUSH mylist a b c', RPUSH:'RPUSH mylist x', LPOP:'LPOP mylist', RPOP:'RPOP mylist',
+  LLEN:'LLEN mylist', LINDEX:'LINDEX mylist 0', LRANGE:'LRANGE mylist 0 -1', LSET:'LSET mylist 0 v',
+  LTRIM:'LTRIM mylist 0 2', LPOS:'LPOS mylist a', LREM:'LREM mylist 0 a', LINSERT:'LINSERT mylist BEFORE x y',
+  BLPOP:'BLPOP mylist 1', BRPOP:'BRPOP mylist 1', LMOVE:'LMOVE mylist dst LEFT RIGHT', LMPOP:'LMPOP 1 mylist LEFT',
+  HSET:'HSET myhash f1 v1', HGET:'HGET myhash f1', HGETALL:'HGETALL myhash', HDEL:'HDEL myhash f1',
+  HEXISTS:'HEXISTS myhash f1', HKEYS:'HKEYS myhash', HVALS:'HVALS myhash', HLEN:'HLEN myhash',
+  HMGET:'HMGET myhash f1 f2', HSETNX:'HSETNX myhash f2 v2', HINCRBY:'HINCRBY myhash n 1', HSTRLEN:'HSTRLEN myhash f1',
+  SADD:'SADD myset a b c', SMEMBERS:'SMEMBERS myset', SISMEMBER:'SISMEMBER myset a', SREM:'SREM myset a',
+  SCARD:'SCARD myset', SPOP:'SPOP myset', SRANDMEMBER:'SRANDMEMBER myset', SMOVE:'SMOVE myset dst a',
+  SINTER:'SINTER s1 s2', SUNION:'SUNION s1 s2', SDIFF:'SDIFF s1 s2', SINTERCARD:'SINTERCARD 2 s1 s2',
+  ZADD:'ZADD myzset 1 a 2 b', ZSCORE:'ZSCORE myzset a', ZRANGE:'ZRANGE myzset 0 -1 WITHSCORES',
+  ZCARD:'ZCARD myzset', ZRANK:'ZRANK myzset a', ZINCRBY:'ZINCRBY myzset 1 a', ZREM:'ZREM myzset a',
+  ZPOPMIN:'ZPOPMIN myzset', ZPOPMAX:'ZPOPMAX myzset', ZCOUNT:'ZCOUNT myzset 0 5',
+  XADD:'XADD mystream * f v', XLEN:'XLEN mystream', XRANGE:'XRANGE mystream - +', XREAD:'XREAD COUNT 5 STREAMS mystream 0',
+  INCRBYFLOAT:'INCRBYFLOAT n 0.5', GETBIT:'GETBIT mykey 0', SETBIT:'SETBIT mykey 0 1', BITCOUNT:'BITCOUNT mykey',
+  PSETEX:'PSETEX tmp 5000 v', SETBITNX:'SETNX nx2 v', MSETNX:'MSETNX x1 1 x2 2', EXPIREAT:'EXPIREAT mykey 2000000000',
+  EXPIRETIME:'EXPIRETIME mykey', MOVE:'MOVE mykey 1', OBJECT:'OBJECT ENCODING mykey', SWAPDB:'SWAPDB 0 1',
+  WAIT:'WAIT 0 100', WAITAOF:'WAITAOF 0 0 100', ROLE:'ROLE', REPLICAOF:'REPLICAOF NO ONE', SLOWLOG:'SLOWLOG GET 5',
+  MEMORY:'MEMORY USAGE mykey', CLIENT:'CLIENT LIST', ACL:'ACL WHOAMI', LASTSAVE:'LASTSAVE', BGSAVE:'BGSAVE',
+  SAVE:'SAVE', SHUTDOWN:'SHUTDOWN NOSAVE', FLUSHALL:'FLUSHALL', FLUSHDB:'FLUSHDB', COMMAND:'COMMAND COUNT',
+  MULTI:'MULTI', EXEC:'EXEC', DISCARD:'DISCARD', WATCH:'WATCH mykey', UNWATCH:'UNWATCH',
+  EVAL:'EVAL "return 1" 0', SCRIPT:'SCRIPT EXISTS abc', PUBLISH:'PUBLISH chan msg', SUBSCRIBE:'SUBSCRIBE chan',
+  LIVE:'LIVE GET mykey', HISTORY:'HISTORY mykey', GETAT:'GETAT mykey 0', SCHEDULE:'SCHEDULE 1000 PING',
+  RESET:'RESET', QUIT:'QUIT', SORT_RO:'SORT_RO mylist ALPHA', LPUSHX:'LPUSHX mylist v', RPUSHX:'RPUSHX mylist v',
+  HINCRBYFLOAT:'HINCRBYFLOAT myhash n 0.5', HRANDFIELD:'HRANDFIELD myhash', ZREVRANGE:'ZREVRANGE myzset 0 -1',
+  ZRANGEBYSCORE:'ZRANGEBYSCORE myzset 0 5', ZMSCORE:'ZMSCORE myzset a', ZRANDMEMBER:'ZRANDMEMBER myzset',
+  SMISMEMBER:'SMISMEMBER myset a b', SINTERSTORE:'SINTERSTORE dst s1 s2', SUNIONSTORE:'SUNIONSTORE dst s1 s2',
+  SDIFFSTORE:'SDIFFSTORE dst s1 s2', SSCAN:'SSCAN myset 0', HSCAN:'HSCAN myhash 0', ZSCAN:'ZSCAN myzset 0',
+  BITPOS:'BITPOS mykey 1', RUN:'RUN LIST', IDEMPOTENT:'IDEMPOTENT idem1 60000 SET k v',
+};
+let stCmds = null;
+
+async function stLoadCommands() {
+  if (stCmds) { stRenderCommands(); return; }
+  const d = await stApi('/api/commands');
+  if (d.error) { st$('stCmdStatus').textContent = d.error; return; }
+  stCmds = d.commands;
+  stRenderCommands();
+}
+
+function stRenderCommands() {
+  const f = (st$('stCmdFilter').value || '').toUpperCase();
+  const rows = st$('stCmdRows');
+  rows.innerHTML = '';
+  const list = stCmds.filter(c => c.includes(f));
+  for (const name of list) {
+    const ex = ST_EXAMPLES[name] || name;
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><span class="pill t-string">${stEsc(name)}</span></td>
+      <td><code style="background:none;padding:0;cursor:pointer;color:#22d3ee" title="click to load">${stEsc(ex)}</code></td>
+      <td><button class="icon-btn" title="run now">▶</button></td>`;
+    tr.querySelector('code').onclick = () => { st$('stCmdBox').value = ex; st$('stCmdBox').focus(); };
+    tr.querySelector('button').onclick = () => { st$('stCmdBox').value = ex; stExec(); };
+    rows.appendChild(tr);
+  }
+  st$('stCmdStatus').textContent = list.length + ' commands';
+}
+
+async function stExec() {
+  const cmd = st$('stCmdBox').value.trim();
+  if (!cmd) return;
+  const d = await stApi('/api/exec?cmd=' + encodeURIComponent(cmd));
+  const out = st$('stCmdOut');
+  out.style.display = '';
+  out.textContent = d.error ? '✗ ' + d.error : '→ ' + JSON.stringify(d.reply, null, 2);
+}
+
+st$('stCmdFilter').addEventListener('input', stRenderCommands);
+st$('stCmdBox').addEventListener('keydown', e => { if (e.key === 'Enter') stExec(); });
+st$('stHost').addEventListener('keydown', e => { if (e.key === 'Enter') stScanKeys(true); });
+st$('stPort').addEventListener('keydown', e => { if (e.key === 'Enter') stScanKeys(true); });
+st$('stKeyPattern').addEventListener('keydown', e => { if (e.key === 'Enter') stScanKeys(true); });
+st$('stHistKey').addEventListener('keydown', e => { if (e.key === 'Enter') stLoadHistory(); });
+st$('stLiveQuery').addEventListener('keydown', e => { if (e.key === 'Enter') stStartLive(); });
+</script>

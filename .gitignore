@@ -16,6 +16,7 @@
 appendonly.aof
 /data/
 /tiered/
+/history/
 *.log
 
 # Secrets / local env overrides — never commit these

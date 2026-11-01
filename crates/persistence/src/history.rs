@@ -64,7 +64,7 @@ const BY_KEY: u8 = 1;
 const BY_TIME: u8 = 2;
 const BY_COUNT: u8 = 3;
 const HISTORY_LIMIT_META: &[u8] = b"\0max_versions_per_key";
-const DEFAULT_MAX_VERSIONS_PER_KEY: usize = 200;
+pub const DEFAULT_MAX_VERSIONS_PER_KEY: usize = 200;
 const MAX_VERSIONS_PER_KEY: usize = 1_000_000;
 const COMPACT_BATCH: usize = 4096;
 

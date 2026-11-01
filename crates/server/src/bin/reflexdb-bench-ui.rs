@@ -10,59 +10,100 @@ use tracing::{info, warn};
 
 const LOGO_PNG: &[u8] = include_bytes!("../../assets/logo.png");
 
-const HTML: &str = r###"<!DOCTYPE html>
+const HTML: &str = concat!(
+    r###"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/png" href="/logo.png">
-<title>ReflexDB benchmark UI</title>
+<title>ReflexDB Studio</title>
 <style>
   * { box-sizing: border-box; }
-  body { font-family: system-ui, -apple-system, sans-serif; background: #090910; color: #e8e8ee; max-width: 1300px; margin: 0 auto; padding: 2rem; }
+  :root { --bg: #07070d; --inset: #0c0c14; --panel: #111119; --panel2: #1a1a24; --border: #22222f; --border2: #333345; --navpad: 258px; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: #e8e8ee; max-width: 1300px; margin: 0 auto; padding: 2rem 2rem 2rem var(--navpad); transition: padding .2s ease; }
+  body.nav-hidden { --navpad: 2rem; }
+  body.nav-hidden #tabRow { transform: translateX(-100%); }
+  #navToggle { display: none; position: fixed; left: .7rem; top: .7rem; z-index: 60; background: var(--panel2); border: 1px solid var(--border2); color: #c5c5d0; border-radius: 8px; padding: .4rem .6rem; font-size: .95rem; cursor: pointer; }
+  body.nav-hidden #navToggle { display: block; }
+  .nav-foot { margin-top: auto; padding: .8rem .3rem .2rem; border-top: 1px solid var(--border); }
+  .swatch-row { display: flex; align-items: center; gap: .45rem; margin-bottom: .6rem; }
+  .swatch { width: 17px; height: 17px; border-radius: 50%; border: 2px solid var(--border2); cursor: pointer; padding: 0; background: var(--c); }
+  .swatch.active { border-color: #a78bfa; }
+  .nav-collapse { width: 100%; background: none; border: 1px solid var(--border); color: #8b8b9e; border-radius: 8px; padding: .35rem 0; font-size: .8rem; cursor: pointer; }
+  .nav-collapse:hover { color: #fff; border-color: #a78bfa; }
   .brand { display: flex; align-items: center; gap: .9rem; }
   .brand img { width: 52px; height: 52px; filter: drop-shadow(0 0 14px rgba(239, 68, 68, .45)); }
+  .brand-tag { align-self: flex-end; padding-bottom: .5rem; font-size: .66rem; color: #55556a; letter-spacing: .16em; text-transform: uppercase; font-weight: 800; }
+  #tabRow { position: fixed; left: 0; top: 0; bottom: 0; width: 226px; background: linear-gradient(180deg, var(--panel), var(--inset)); border-right: 1px solid var(--border); padding: 1.2rem .65rem; display: flex; flex-direction: column; gap: .2rem; overflow-y: auto; z-index: 50; transition: transform .2s ease; }
+  #tabRow .logo { display: flex; align-items: center; gap: .6rem; margin: 0 .3rem 1.2rem; }
+  #tabRow .logo img { width: 38px; height: 38px; filter: drop-shadow(0 0 12px rgba(239,68,68,.5)); }
+  #tabRow .logo .lname { font-size: 1.05rem; font-weight: 800; background: linear-gradient(90deg, #a78bfa, #22d3ee); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  #tabRow .logo .lsub { font-size: .6rem; color: #55556a; letter-spacing: .14em; text-transform: uppercase; font-weight: 800; }
+  #tabRow .nav-group { font-size: .6rem; color: #44445a; letter-spacing: .14em; text-transform: uppercase; font-weight: 800; padding: .95rem .7rem .3rem; }
   h1 { font-size: 2.1rem; margin-bottom: .2rem; background: linear-gradient(90deg, #a78bfa, #22d3ee); -webkit-background-clip: text; background-clip: text; color: transparent; }
   h2 { color: #d4d4de; font-size: 1.25rem; margin: 2rem 0 .9rem; }
   .subtitle { color: #8a8a99; margin-bottom: 1.5rem; }
-  form, .panel { background: #14141c; border: 1px solid #2a2a38; border-radius: 16px; padding: 1.4rem; display: grid; gap: .9rem; grid-template-columns: auto 1fr; align-items: center; }
+  form, .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 1.4rem; display: grid; gap: .9rem; grid-template-columns: auto 1fr; align-items: center; }
   label { color: #9a9aa8; font-size: .88rem; }
-  input, select { background: #0c0c12; color: #fff; border: 1px solid #2a2a38; border-radius: 9px; padding: .55rem .7rem; font-family: inherit; }
-  input:focus, select:focus { outline: 2px solid #8b5cf6; border-color: #8b5cf6; }
+  input, select { background: var(--inset); color: #fff; border: 1px solid var(--border); border-radius: 9px; padding: .55rem .7rem; font-family: inherit; }
+  input:focus, select:focus { outline: 2px solid #a78bfa; border-color: #a78bfa; }
+  .frow { grid-column: 1 / -1; display: grid; grid-template-columns: 148px 1fr 118px 1fr; gap: .55rem .9rem; align-items: center; }
+  .frow input { width: 100%; max-width: none; }
+  .frow input.grow { grid-column: 2 / -1; }
   .actions { grid-column: 1 / -1; display: flex; gap: 1rem; margin-top: .5rem; flex-wrap: wrap; align-items: center; }
-  button { background: linear-gradient(90deg, #8b5cf6, #22d3ee); color: #0a0a10; border: 0; padding: .7rem 1.5rem; border-radius: 9px; cursor: pointer; font-weight: 700; font-size: .92rem; }
+  button { background: linear-gradient(90deg, #a78bfa, #22d3ee); color: #0a0a10; border: 0; padding: .7rem 1.5rem; border-radius: 9px; cursor: pointer; font-weight: 700; font-size: .92rem; }
   button:disabled { opacity: .4; cursor: not-allowed; }
-  button.secondary { background: #1e1e2a; color: #e8e8ee; font-weight: 600; }
+  button.secondary { background: var(--panel2); color: #e8e8ee; font-weight: 600; }
   .preset-row { grid-column: 1 / -1; display: flex; gap: .6rem; flex-wrap: wrap; margin-bottom: .2rem; }
-  .preset-btn { background: #1a1a24; border: 1px solid #333345; color: #c9c9d4; padding: .5rem 1rem; border-radius: 22px; font-size: .82rem; font-weight: 600; cursor: pointer; transition: all .15s; }
-  .preset-btn:hover { border-color: #8b5cf6; color: #fff; transform: translateY(-1px); }
-  .preset-btn.active { background: linear-gradient(90deg, #8b5cf6, #22d3ee); border-color: transparent; color: #0a0a10; }
+  .preset-btn { background: var(--panel2); border: 1px solid var(--border2); color: #c9c9d4; padding: .5rem 1rem; border-radius: 22px; font-size: .82rem; font-weight: 600; cursor: pointer; transition: all .15s; }
+  .preset-btn:hover { border-color: #a78bfa; color: #fff; transform: translateY(-1px); }
+  .preset-btn.active { background: linear-gradient(90deg, #a78bfa, #22d3ee); border-color: transparent; color: #0a0a10; }
 
-  .tab-row { display: flex; gap: .5rem; margin-bottom: 1rem; border-bottom: 1px solid #2a2a38; padding-bottom: 0; }
-  .tab-btn { background: transparent; color: #8a8a99; border: 0; border-bottom: 2px solid transparent; padding: .7rem 1.1rem; font-weight: 700; font-size: .9rem; cursor: pointer; border-radius: 0; }
-  .tab-btn:hover { color: #d4d4de; }
-  .tab-btn.active { color: #fff; border-bottom-color: #8b5cf6; }
+  .tab-row { display: flex; gap: .5rem; margin-bottom: 1rem; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+  .tab-btn { display: flex; align-items: center; gap: .55rem; width: 100%; background: none; color: #8b8b9e; border: 0; border-left: 3px solid transparent; padding: .55rem .7rem; font-weight: 600; font-size: .88rem; cursor: pointer; border-radius: 8px; text-align: left; }
+  .tab-btn:hover { background: var(--panel2); color: #fff; }
+  .tab-btn.active { background: linear-gradient(90deg, rgba(167,139,250,.16), rgba(34,211,238,.07)); border-left-color: #a78bfa; color: #fff; }
   .tab-btn[hidden] { display: none; }
   .tab-badge { display: inline-block; background: #22c55e; color: #06140b; font-size: .62rem; font-weight: 800; padding: .08rem .4rem; border-radius: 8px; margin-left: .4rem; vertical-align: middle; }
 
-  #output { background: #0c0c12; border: 1px solid #2a2a38; border-radius: 14px; padding: 1rem; white-space: pre-wrap; min-height: 100px; max-height: 300px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; color: #9a9aa8; }
-  #statsRaw { background: #0c0c12; border: 1px solid #2a2a38; border-radius: 10px; padding: .8rem; font-family: ui-monospace, Menlo, monospace; font-size: .78rem; color: #777; }
-  .note { background: #171722; border-left: 4px solid #8b5cf6; padding: 1rem 1.2rem; border-radius: 10px; margin-bottom: 1.2rem; font-size: .9rem; color: #c5c5d0; line-height: 1.5; }
-  .note code { background: #0c0c12; padding: .1rem .4rem; border-radius: 5px; }
-  .info-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; background: #2a2a38; color: #9a9aa8; font-size: .66rem; font-weight: 800; font-style: italic; cursor: pointer; margin-left: .35rem; vertical-align: middle; position: relative; user-select: none; }
-  .info-icon:hover, .info-icon.open { background: #8b5cf6; color: #fff; }
-  .info-tooltip { display: none; position: absolute; top: 140%; left: 0; z-index: 30; width: 270px; background: #1a1a24; border: 1px solid #333345; border-radius: 10px; padding: .8rem .9rem; font-size: .78rem; line-height: 1.5; color: #c5c5d0; font-weight: 400; font-style: normal; text-transform: none; letter-spacing: normal; box-shadow: 0 10px 28px rgba(0,0,0,.45); cursor: default; }
-  .info-tooltip code { background: #0c0c12; padding: .1rem .35rem; border-radius: 4px; }
+  #output { background: var(--inset); border: 1px solid var(--border); border-radius: 14px; padding: 1rem; white-space: pre-wrap; min-height: 100px; max-height: 300px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .8rem; color: #9a9aa8; }
+  .note { background: var(--panel2); border-left: 4px solid #a78bfa; padding: 1rem 1.2rem; border-radius: 10px; margin-bottom: 1.2rem; font-size: .9rem; color: #c5c5d0; line-height: 1.5; }
+  .note code { background: var(--inset); padding: .1rem .4rem; border-radius: 5px; }
+  .info-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; background: var(--border); color: #9a9aa8; font-size: .66rem; font-weight: 800; font-style: italic; cursor: pointer; margin-left: .35rem; vertical-align: middle; position: relative; user-select: none; }
+  .info-icon:hover, .info-icon.open { background: #a78bfa; color: #fff; }
+  .info-tooltip { display: none; position: absolute; top: 140%; left: 0; z-index: 30; width: 270px; background: var(--panel2); border: 1px solid var(--border2); border-radius: 10px; padding: .8rem .9rem; font-size: .78rem; line-height: 1.5; color: #c5c5d0; font-weight: 400; font-style: normal; text-transform: none; letter-spacing: normal; box-shadow: 0 10px 28px rgba(0,0,0,.45); cursor: default; }
+  .info-tooltip code { background: var(--inset); padding: .1rem .35rem; border-radius: 4px; }
   .info-icon:hover .info-tooltip, .info-icon.open .info-tooltip { display: block; }
-  .limit-inputs { display: grid; grid-template-columns: auto 1fr auto 1fr; gap: 1rem; background: #14141c; border: 1px solid #2a2a38; border-radius: 16px; padding: 1.1rem; margin-bottom: 1rem; }
-  .bar-wrap { background: #24242f; border-radius: 9px; height: 26px; overflow: hidden; margin-top: .4rem; }
-  .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #8b5cf6, #22d3ee); transition: width .4s ease; border-radius: 9px; }
+  .topstats { display: flex; gap: 1.4rem; align-items: center; background: var(--inset); border: 1px solid var(--border); border-radius: 10px; padding: .4rem .9rem; margin-bottom: 1rem; font-size: .78rem; color: #9a9aa8; }
+  .topstats .ts { display: flex; align-items: center; gap: .45rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .topstats .ts #ramText, .topstats .ts #diskText { display: inline-block; min-width: 17ch; }
+  .topstats .ts b { color: #55556a; font-size: .68rem; letter-spacing: .08em; }
+  .topstats .mini-wrap { display: inline-block; width: 72px; height: 9px; background: var(--border); border-radius: 5px; overflow: hidden; }
+  .topstats .mini-wrap .bar-fill { display: block; height: 100%; width: 0; border-radius: 5px; }
+  .topstats .ts input { width: 52px; padding: .2rem .35rem; font-size: .76rem; border-radius: 6px; }
+  .topstats .ts-btn { margin-left: auto; background: none; border: 1px solid var(--border); color: #9a9aa8; border-radius: 6px; padding: .2rem .55rem; font-size: .72rem; cursor: pointer; }
+  .topstats .ts-btn:hover { color: #fff; border-color: #a78bfa; }
+  .topstats .ts-btn + .ts-btn { margin-left: 0; }
+  .topstats #refreshStats { width: 5.6em; }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 8px #4ade80; animation: livePulse 1.2s ease-in-out infinite; }
+  .live-dot.off { background: #55556a; box-shadow: none; animation: none; }
+  @keyframes livePulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.75); } }
+  .topstats.live .mini-wrap .bar-fill { transition: width .5s ease, background .3s ease; }
+  .topstats.live .mini-wrap { box-shadow: 0 0 10px rgba(167, 139, 250, .12); }
+  .topstats.big { display: grid; grid-template-columns: 1fr 1fr; gap: .7rem 1.4rem; padding: .8rem 1rem; }
+  .topstats.big .ts { font-size: .85rem; }
+  .topstats.big .ts b { font-size: .76rem; }
+  .topstats.big .mini-wrap { flex: 1; width: auto; height: 15px; }
+  .topstats.big .ts-warn { grid-column: 1 / -2; }
+  .bar-wrap { background: var(--border); border-radius: 7px; height: 16px; overflow: hidden; margin-top: .3rem; }
+  .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #a78bfa, #22d3ee); transition: width .4s ease; border-radius: 9px; }
   .bar-fill.warn { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
   .bar-fill.danger { background: linear-gradient(90deg, #ef4444, #f87171); }
   .bar-label { display: flex; justify-content: space-between; font-size: .88rem; color: #9a9aa8; margin-top: .3rem; }
 
   .hero-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1rem; margin: 1.2rem 0 .5rem; }
-  .hero-card { background: linear-gradient(160deg, #181824, #101018); border: 1px solid #2a2a38; border-radius: 14px; padding: 1.1rem; text-align: center; }
+  .hero-card { background: linear-gradient(160deg, var(--panel2), var(--panel)); border: 1px solid var(--border); border-radius: 14px; padding: 1.1rem; text-align: center; }
   .hero-card .k { color: #8a8a99; font-size: .76rem; text-transform: uppercase; letter-spacing: .04em; }
   .hero-card .v { font-size: 1.7rem; font-weight: 800; margin-top: .35rem; }
   .hero-card .v.purple { color: #a78bfa; }
@@ -70,54 +111,83 @@ const HTML: &str = r###"<!DOCTYPE html>
   .hero-card .v.red { color: #f87171; }
   .hero-card .v.green { color: #4ade80; }
 
+  .landing-hero { background: radial-gradient(1200px 300px at 30% -40%, rgba(167,139,250,.18), transparent), linear-gradient(160deg, var(--panel2), var(--panel)); border: 1px solid var(--border); border-radius: 18px; padding: 1.6rem 1.8rem 1.4rem; margin-bottom: 1.2rem; overflow: hidden; }
+  .landing-hero .mission { font-size: 2.4rem; font-weight: 900; line-height: 1.15; letter-spacing: -.02em; margin: 0 0 .5rem; background: linear-gradient(90deg, #a78bfa, #22d3ee, #f472b6, #a78bfa); background-size: 300% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 6s linear infinite; filter: drop-shadow(0 0 22px rgba(167,139,250,.35)); }
+  .landing-hero .mission span { display: inline-block; opacity: 0; animation: wordIn .7s cubic-bezier(.22,1,.36,1) forwards; }
+  .landing-hero .mission span:nth-child(2) { animation-delay: .07s; }
+  .landing-hero .mission span:nth-child(3) { animation-delay: .14s; }
+  .landing-hero .mission span:nth-child(4) { animation-delay: .21s; }
+  .landing-hero .mission span:nth-child(5) { animation-delay: .28s; }
+  .landing-hero .mission span:nth-child(6) { animation-delay: .35s; }
+  .landing-hero .mission span:nth-child(7) { animation-delay: .42s; }
+  @keyframes wordIn { from { opacity: 0; transform: translateY(.45em) scale(.94); filter: blur(6px); } to { opacity: 1; transform: none; filter: none; } }
+  @keyframes shimmer { to { background-position: 300% 0; } }
+  .landing-hero .tagline { color: #8a8a99; font-size: .92rem; margin: 0 0 1.3rem; }
+  .hbar-row { display: grid; grid-template-columns: 104px 1fr 96px; align-items: center; gap: .8rem; margin-bottom: .55rem; }
+  .hbar-row .engine { font-size: .8rem; font-weight: 700; color: #c9c9d4; text-align: right; }
+  .hbar-track { background: var(--inset); border: 1px solid var(--border); border-radius: 8px; height: 18px; overflow: hidden; }
+  .hbar-fill { height: 100%; width: 0; border-radius: 8px; transition: width 1.2s cubic-bezier(.22,1,.36,1); }
+  .hbar-fill.redis { background: linear-gradient(90deg, #f87171, #fca5a5); }
+  .hbar-fill.dragonfly { background: linear-gradient(90deg, #60a5fa, #93c5fd); }
+  .hbar-fill.reflexdb { background: linear-gradient(90deg, #a78bfa, #22d3ee); box-shadow: 0 0 14px rgba(167,139,250,.55); }
+  .hbar-row .ops { font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: .8rem; color: #e8e8f0; text-align: right; }
+  .metric-card { display: grid; grid-template-columns: 168px 1fr; gap: 1.4rem; background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 1.1rem; margin-bottom: 1rem; }
+  .metric-stat { background: var(--panel2); border-radius: 12px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; padding: 1rem .8rem; }
+  .metric-stat .big { font-size: 2.1rem; font-weight: 900; line-height: 1.05; }
+  .metric-stat .cap { color: #8a8a99; font-size: .78rem; margin-top: .4rem; line-height: 1.35; }
+  .metric-bars .mname { color: #8a8a99; font-size: .82rem; font-weight: 600; margin: .15rem 0 .8rem; }
+  .metric-legend { display: flex; gap: 1.3rem; align-items: center; flex-wrap: wrap; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: .7rem 1.1rem; margin-bottom: 1.2rem; }
+  .metric-legend .src { margin-left: auto; display: grid; gap: .15rem; }
+  .metric-legend .src a { color: #8a8a99; font-size: .74rem; text-decoration: underline; }
+
   .progress-line { display: flex; align-items: center; gap: .7rem; color: #c5c5d0; font-size: .92rem; margin: .8rem 0; flex-wrap: wrap; }
-  .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid #2a2a38; border-top-color: #8b5cf6; animation: spin .7s linear infinite; flex-shrink: 0; }
+  .spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border); border-top-color: #a78bfa; animation: spin .7s linear infinite; flex-shrink: 0; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .live-ticker { font-family: ui-monospace, Menlo, monospace; font-size: .82rem; color: #4ade80; background: #0c0c12; padding: .2rem .6rem; border-radius: 6px; border: 1px solid #1f3a28; }
+  .live-ticker { font-family: ui-monospace, Menlo, monospace; font-size: .82rem; color: #4ade80; background: var(--inset); padding: .2rem .6rem; border-radius: 6px; border: 1px solid #1f3a28; }
 
   .cmd-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 1.1rem; }
-  .cmd-card { background: #14141c; border: 1px solid #2a2a38; border-radius: 16px; padding: 1.1rem; border-top: 3px solid var(--accent, #8b5cf6); transition: transform .15s, border-color .15s; }
-  .cmd-card:hover { transform: translateY(-2px); border-color: #3a3a4a; }
-  .latency-panel { display: grid; gap: 1rem; background: #14141c; border: 1px solid #2a2a38; border-radius: 16px; padding: 1.25rem; }
+  .cmd-card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 1.1rem; border-top: 3px solid var(--accent, #a78bfa); transition: transform .15s, border-color .15s; }
+  .cmd-card:hover { transform: translateY(-2px); border-color: var(--border2); }
+  .latency-panel { display: grid; gap: 1rem; background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 1.25rem; }
   .latency-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: .8rem; }
   .latency-field { display: grid; gap: .35rem; }
   .latency-field label { color: #9a9aa8; font-size: .82rem; }
   .latency-field input { width: 100%; }
   .scenario-picks { display: flex; gap: .55rem; flex-wrap: wrap; }
-  .scenario-pick { display: flex; align-items: center; gap: .45rem; background: #0c0c12; border: 1px solid #2a2a38; padding: .55rem .75rem; border-radius: 9px; color: #c5c5d0; font-size: .84rem; }
+  .scenario-pick { display: flex; align-items: center; gap: .45rem; background: var(--inset); border: 1px solid var(--border); padding: .55rem .75rem; border-radius: 9px; color: #c5c5d0; font-size: .84rem; }
   .scenario-pick input { accent-color: #a78bfa; }
   .latency-results { display: grid; gap: 1rem; }
-  .latency-card { background: linear-gradient(155deg,#171722,#101018); border: 1px solid #2a2a38; border-radius: 14px; padding: 1rem 1.15rem; }
+  .latency-card { background: linear-gradient(155deg,var(--panel2),var(--panel)); border: 1px solid var(--border); border-radius: 14px; padding: 1rem 1.15rem; }
   .latency-card h3 { margin: 0 0 .8rem; color: #e8e8ee; font-size: 1rem; }
   .latency-kpis { display: grid; grid-template-columns: repeat(auto-fit,minmax(125px,1fr)); gap: .6rem; }
-  .latency-kpi { background:#0c0c12; border:1px solid #24242f; border-radius:10px; padding:.7rem; }
+  .latency-kpi { background:var(--inset); border:1px solid var(--border); border-radius:10px; padding:.7rem; }
   .latency-kpi span { display:block; color:#8a8a99; font-size:.7rem; text-transform:uppercase; letter-spacing:.04em; }
   .latency-kpi strong { display:block; color:#e8e8ee; font-size:1.2rem; margin-top:.25rem; }
   .latency-table-wrap { overflow-x:auto; }
   #latencyTable { min-width:760px; }
-  .latency-empty { color:#8a8a99; border:1px dashed #333345; padding:1rem; border-radius:10px; text-align:center; }
-  .latency-chart-wrap { background:#101018; border:1px solid #2a2a38; border-radius:14px; padding:1rem; overflow-x:auto; }
+  .latency-empty { color:#8a8a99; border:1px dashed var(--border2); padding:1rem; border-radius:10px; text-align:center; }
+  .latency-chart-wrap { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:1rem; overflow-x:auto; }
   #shootoutChart { width:100%; min-width:620px; height:auto; display:block; }
   .chart-legend { display:flex; gap:1rem; flex-wrap:wrap; color:#a8a8b5; font-size:.78rem; margin:.2rem 0 .75rem; }
   .legend-dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:.35rem; }
   #shootoutTable { min-width:760px; }
   .shootout-engine-grid { display:flex; flex-direction:column; gap: 1rem; }
-  .shootout-engine-card { background:#101018; border:1px solid #2a2a38; border-radius:14px; padding:1rem; border-top: 3px solid var(--accent, #8b5cf6); }
+  .shootout-engine-card { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:1rem; border-top: 3px solid var(--accent, #a78bfa); }
   .shootout-engine-card h3 { margin: 0 0 .6rem; color:#e8e8ee; font-size:1rem; display:flex; align-items:center; gap:.5rem; }
   .shootout-engine-card .engine-status { font-size:.74rem; color:#9a9aa8; font-weight: 400; }
   .shootout-engine-card svg { width:100%; max-width:460px; height:auto; display:block; }
   .shootout-status-row { display:flex; gap:.6rem; flex-wrap:wrap; margin: .75rem 0; }
-  .shootout-status-chip { display:flex; align-items:center; gap:.4rem; background:#101018; border:1px solid #2a2a38; border-radius:20px; padding:.3rem .75rem; font-size:.78rem; color:#d4d4de; }
+  .shootout-status-chip { display:flex; align-items:center; gap:.4rem; background:var(--panel); border:1px solid var(--border); border-radius:20px; padding:.3rem .75rem; font-size:.78rem; color:#d4d4de; }
   .shootout-status-chip .legend-dot { margin-right:0; }
   .shootout-status-chip .chip-status { color:#9a9aa8; }
-  #shootoutTable tbody tr.workload-group-start td { border-top: 2px solid #4a4a5c; }
+  #shootoutTable tbody tr.workload-group-start td { border-top: 2px solid var(--border2); }
   .cmd-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: .5rem; }
   .cmd-name { font-weight: 800; font-size: 1.05rem; letter-spacing: .02em; }
   .cmd-status { font-size: .72rem; font-weight: 700; padding: .2rem .6rem; border-radius: 20px; text-transform: uppercase; letter-spacing: .03em; }
   .cmd-status.running { background: #3f2e0f; color: #fbbf24; }
   .cmd-status.done { background: #14301f; color: #4ade80; }
   .cmd-live { font-family: ui-monospace, Menlo, monospace; font-size: .72rem; color: #67e8a8; margin-bottom: .6rem; min-height: 1em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .cmd-variant { margin-bottom: .6rem; padding-bottom: .5rem; border-bottom: 1px dashed #24242f; }
+  .cmd-variant { margin-bottom: .6rem; padding-bottom: .5rem; border-bottom: 1px dashed var(--border); }
   .cmd-variant:last-child { border-bottom: none; }
   .cmd-variant-label { font-size: .78rem; color: #8a8a99; margin-bottom: .25rem; }
   .cmd-stat-row { display: flex; gap: 1.1rem; flex-wrap: wrap; }
@@ -131,7 +201,7 @@ const HTML: &str = r###"<!DOCTYPE html>
   canvas.mini-spark { width: 100%; height: 54px; display: block; border-radius: 6px; margin-top: .3rem; }
 
   #liveFeed { max-height: 360px; overflow-y: auto; margin-bottom: 1rem; }
-  .live-feed-row { background: #14141c; border: 1px solid #2a2a38; border-left: 4px solid #22d3ee; border-radius: 10px; padding: .7rem 1rem; margin-bottom: .6rem; font-size: .88rem; }
+  .live-feed-row { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid #22d3ee; border-radius: 10px; padding: .7rem 1rem; margin-bottom: .6rem; font-size: .88rem; }
   .live-feed-row .lf-time { color: #8a8a99; font-size: .74rem; }
   .live-feed-row .lf-key { color: #a78bfa; font-weight: 700; }
   .live-feed-row .lf-result { font-weight: 700; color: #4ade80; margin-top: .25rem; font-family: ui-monospace, Menlo, monospace; }
@@ -140,49 +210,150 @@ const HTML: &str = r###"<!DOCTYPE html>
   .live-row button { padding: .4rem .7rem; font-size: .8rem; }
 
   table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: .85rem; }
-  th, td { padding: .5rem .65rem; text-align: right; border-bottom: 1px solid #24242f; }
+  th, td { padding: .5rem .65rem; text-align: right; border-bottom: 1px solid var(--border); }
   th:first-child, td:first-child { text-align: left; }
   th { color: #8a8a99; font-weight: 600; font-size: .78rem; text-transform: uppercase; }
-  tr:hover td { background: #191924; }
+  tr:hover td { background: var(--panel2); }
+  td.win { font-weight: 800; color: #22d3ee; }
+  td.win::before { content: '🏆 '; }
+  th.e-redis { color: #f87171; }
+  th.e-dragonfly { color: #60a5fa; }
+  th.e-reflexdb { color: #22d3ee; }
+  .hero-card .d { font-size: .78rem; color: #8a8a99; margin-top: .4rem; line-height: 1.5; }
+  code { font-family: ui-monospace, 'SF Mono', Menlo, monospace; background: var(--inset); padding: .1rem .35rem; border-radius: 5px; font-size: .85em; }
 </style>
 </head>
 <body>
-<div class="brand">
-  <img src="/logo.png" alt="ReflexDB logo">
-  <h1>ReflexDB benchmark UI</h1>
+<div class="topstats">
+  <span class="ts"><b>RAM</b> <span class="mini-wrap"><span id="ramBar"></span></span> <span id="ramText">–</span></span>
+  <span class="ts"><b>DISK</b> <span class="mini-wrap"><span id="diskBar"></span></span> <span id="diskText">–</span></span>
+  <span class="ts ts-warn">warn above — RAM <input id="ramLimitGB" type="number" value="8" step="0.1" min="0.1"> GB · Disk <input id="diskLimitGB" type="number" value="20" step="0.1" min="0.1"> GB</span>
+  <button class="ts-btn" id="statsExpand" type="button" title="Expand">⤢</button>
+  <button class="ts-btn" id="refreshStats" type="button"><span class="live-dot off" id="liveDot"></span> <span id="liveLabel">live</span></button>
 </div>
-<p class="subtitle">Pick a workload, run it, and watch RAM &amp; disk move in real time &mdash; one card per command.</p>
+<p class="subtitle">Run workloads and demos, then flip to the <b>Studio</b> section to inspect the data they wrote — keys, values, history, LIVE, health, slowlog.</p>
 
-<div class="limit-inputs">
-  <label for="ramLimitGB">Warn above (GB RAM)</label>
-  <input id="ramLimitGB" type="number" value="8" step="0.1" min="0.1">
-  <label for="diskLimitGB">Warn above (GB disk)</label>
-  <input id="diskLimitGB" type="number" value="20" step="0.1" min="0.1">
-</div>
-
-<button id="refreshStats" class="secondary">Show host memory &amp; disk</button>
-<div id="statsArea" style="margin: 1rem 0; display:none;">
-  <div style="margin-bottom:1rem;">
-    <div class="bar-label"><span>Host RAM (live)</span><span id="ramText">-</span></div>
-    <div class="bar-wrap"><div id="ramBar" class="bar-fill"></div></div>
+<section id="homePanel">
+<div class="landing-hero" id="landingHero">
+  <div class="mission"><span>Accelerating</span> <span>the</span> <span>future</span> <span>with</span> <span>a</span> <span>modern</span> <span>cache.</span></div>
+  <p class="tagline">Redis-compatible, built in Rust — with time-travel key history and LIVE push queries, not just GET/SET.</p>
+  <div class="metric-card">
+    <div class="metric-stat"><div class="big" style="color:#a78bfa">8/8</div><div class="cap">head-to-head medians won</div></div>
+    <div class="metric-bars">
+      <div class="mname">Throughput — pipeline 16, mixed workload, 4 vCPU containers</div>
+      <div class="hbar-row"><div class="engine">🏆 ReflexDB</div><div class="hbar-track"><div class="hbar-fill reflexdb" data-w="100"></div></div><div class="ops"><span class="ops-count" data-n="154605">0</span> ops/s</div></div>
+      <div class="hbar-row"><div class="engine">🥈 Redis 7</div><div class="hbar-track"><div class="hbar-fill redis" data-w="99"></div></div><div class="ops"><span class="ops-count" data-n="153239">0</span> ops/s</div></div>
+      <div class="hbar-row"><div class="engine">🥉 Dragonfly</div><div class="hbar-track"><div class="hbar-fill dragonfly" data-w="94"></div></div><div class="ops"><span class="ops-count" data-n="144954">0</span> ops/s</div></div>
+    </div>
   </div>
-  <div>
-    <div class="bar-label"><span>Host Disk (live)</span><span id="diskText">-</span></div>
-    <div class="bar-wrap"><div id="diskBar" class="bar-fill"></div></div>
+  <div class="metric-card">
+    <div class="metric-stat"><div class="big" style="color:#22d3ee">287K</div><div class="cap">peak ops/s — deep pipeline</div></div>
+    <div class="metric-bars">
+      <div class="mname">Deep pipeline — 16 clients, pipeline 64, mixed workload</div>
+      <div class="hbar-row"><div class="engine">🏆 ReflexDB</div><div class="hbar-track"><div class="hbar-fill reflexdb" data-w="100"></div></div><div class="ops"><span class="ops-count" data-n="286638">0</span> ops/s</div></div>
+      <div class="hbar-row"><div class="engine">🥈 Redis 7</div><div class="hbar-track"><div class="hbar-fill redis" data-w="99"></div></div><div class="ops"><span class="ops-count" data-n="282380">0</span> ops/s</div></div>
+      <div class="hbar-row"><div class="engine">🥉 Dragonfly</div><div class="hbar-track"><div class="hbar-fill dragonfly" data-w="94"></div></div><div class="ops"><span class="ops-count" data-n="270308">0</span> ops/s</div></div>
+    </div>
   </div>
-  <pre id="statsRaw" style="display:none;"></pre>
+  <div class="metric-card">
+    <div class="metric-stat"><div class="big" style="color:#f472b6">8KiB</div><div class="cap">values — payload-bound workload</div></div>
+    <div class="metric-bars">
+      <div class="mname">Large values — 8 KiB payloads, pipeline 16</div>
+      <div class="hbar-row"><div class="engine">🏆 ReflexDB</div><div class="hbar-track"><div class="hbar-fill reflexdb" data-w="100"></div></div><div class="ops"><span class="ops-count" data-n="50688">0</span> ops/s</div></div>
+      <div class="hbar-row"><div class="engine">🥈 Redis 7</div><div class="hbar-track"><div class="hbar-fill redis" data-w="95"></div></div><div class="ops"><span class="ops-count" data-n="48356">0</span> ops/s</div></div>
+      <div class="hbar-row"><div class="engine">🥉 Dragonfly</div><div class="hbar-track"><div class="hbar-fill dragonfly" data-w="92"></div></div><div class="ops"><span class="ops-count" data-n="46633">0</span> ops/s</div></div>
+    </div>
+  </div>
+  <div class="metric-legend">
+    <span><span class="legend-dot" style="background:linear-gradient(90deg,#a78bfa,#22d3ee)"></span>ReflexDB</span>
+    <span><span class="legend-dot" style="background:#f87171"></span>Redis 7</span>
+    <span><span class="legend-dot" style="background:#60a5fa"></span>Dragonfly</span>
+    <div class="src"><a href="https://github.com/kailash-kangne/reflexdb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">Benchmark source &amp; methodology</a><a href="https://github.com/kailash-kangne/reflexdb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">Full tables (all workloads)</a></div>
+  </div>
 </div>
 
-<div class="tab-row" id="tabRow">
-  <button type="button" class="tab-btn active" data-tab="sequential">Sequential</button>
-  <button type="button" class="tab-btn" data-tab="parallel">Parallel (all at once)</button>
-  <button type="button" class="tab-btn" data-tab="latency">Latency lab</button>
-  <button type="button" class="tab-btn" data-tab="durability">Durability / crash recovery<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+<div class="hero-row">
+  <div class="hero-card"><div class="k">Drop-in compatible</div><div class="d">Speaks RESP — point <code>redis-cli</code>, <code>redis-benchmark</code>, or any Redis client at it, unchanged.</div></div>
+  <div class="hero-card"><div class="k">Time-travel history</div><div class="d"><code>GETAT</code>/<code>HISTORY</code> — read any key as it was at a point in time, per-key version log.</div></div>
+  <div class="hero-card"><div class="k">LIVE push queries</div><div class="d"><code>LIVE GET</code> subscribes to a key and pushes every change — no polling.</div></div>
+  <div class="hero-card"><div class="k">Tiered storage</div><div class="d">Hot keys in RAM, cold keys spill to disk — datasets bigger than memory.</div></div>
+</div>
+
+<div class="panel">
+  <h3 style="margin:.2rem 0 0;">Benchmarks — measured, not claimed<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    ops/sec, medians of 3 runs. Capped rows: all three engines in identical containers
+    (<code>--cpus</code>/<code>--memory</code>), same workload replayed one engine at a time.
+    Machine specs and full methodology in <code>docs/BENCHMARKS.md</code>.
+  </span></span></h3>
+  <table>
+    <thead>
+      <tr><th rowspan="2">Workload</th><th rowspan="2">CPUs</th>
+        <th colspan="3" style="text-align:center;">Pipeline 1</th>
+        <th colspan="3" style="text-align:center;">Pipeline 16</th></tr>
+      <tr><th class="e-redis">Redis</th><th class="e-dragonfly">Dragonfly</th><th class="e-reflexdb">ReflexDB</th><th class="e-redis">Redis</th><th class="e-dragonfly">Dragonfly</th><th class="e-reflexdb">ReflexDB</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>small-mixed<span class="info-icon" tabindex="0">i<span class="info-tooltip">Small 8–64B keys, realistic mixed read/write traffic — the everyday cache shape.</span></span></td>
+        <td>1</td><td>12,734</td><td>11,264</td><td class="win">17,249</td><td>146,259</td><td>128,202</td><td class="win">149,301</td></tr>
+      <tr><td>small-mixed</td>
+        <td>4</td><td>14,699</td><td>14,388</td><td class="win">16,200</td><td>153,239</td><td>144,954</td><td class="win">154,605</td></tr>
+      <tr><td>hot-key<span class="info-icon" tabindex="0">i<span class="info-tooltip">All traffic hammers a small hot key set — worst case for lock contention.</span></span></td>
+        <td>1</td><td>15,494</td><td>12,010</td><td class="win">16,708</td><td>147,983</td><td>142,760</td><td class="win">152,644</td></tr>
+      <tr><td>hot-key</td>
+        <td>4</td><td>14,925</td><td>13,990</td><td class="win">16,866</td><td>161,254</td><td>153,218</td><td class="win">163,143</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:1.6rem 0 0;">Second pass — idle host<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Same engine-comparison rerun on an <em>idle</em> arm64 host (earlier tree, pre-hardening) —
+    absolute numbers are higher without background load; placement is what matters.
+  </span></span></h3>
+  <table>
+    <thead>
+      <tr><th rowspan="2">Workload</th><th rowspan="2">CPUs</th>
+        <th colspan="3" style="text-align:center;">Pipeline 1</th>
+        <th colspan="3" style="text-align:center;">Pipeline 16</th></tr>
+      <tr><th class="e-redis">Redis</th><th class="e-dragonfly">Dragonfly</th><th class="e-reflexdb">ReflexDB</th><th class="e-redis">Redis</th><th class="e-dragonfly">Dragonfly</th><th class="e-reflexdb">ReflexDB</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>small-mixed</td><td>1</td><td>18,814</td><td>17,007</td><td class="win">21,498</td><td>172,702</td><td>161,951</td><td class="win">187,945</td></tr>
+      <tr><td>small-mixed</td><td>4</td><td>18,842</td><td>14,815</td><td class="win">20,574</td><td>174,222</td><td>134,244</td><td class="win">181,563</td></tr>
+      <tr><td>hot-key</td><td>1</td><td>19,003</td><td>15,895</td><td class="win">22,366</td><td>180,397</td><td>158,948</td><td class="win">201,045</td></tr>
+      <tr><td>hot-key</td><td>4</td><td>18,652</td><td>14,838</td><td class="win">21,773</td><td>175,988</td><td>172,598</td><td class="win">199,243</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="margin:1.6rem 0 0;">Aggressive profile<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+    Stress dimensions the main table doesn't: client count, pipeline depth, keyspace size,
+    value size. Same loaded-host setup (<code>--cpus 4</code>, <code>small-mixed</code>, median of 3 × 5s).
+  </span></span></h3>
+  <table>
+    <thead><tr><th>Case</th><th class="e-redis">Redis</th><th class="e-dragonfly">Dragonfly</th><th class="e-reflexdb">ReflexDB</th></tr></thead>
+    <tbody>
+      <tr><td>64 clients, pipeline 1</td><td>15,244</td><td>16,485</td><td class="win">18,314</td></tr>
+      <tr><td>64 clients, pipeline 1, hot-key</td><td>18,146</td><td>18,206</td><td class="win">19,205</td></tr>
+      <tr><td>16 clients, pipeline 64<span class="info-icon" tabindex="0">i<span class="info-tooltip">Deep pipelines scale best for every engine — P64 roughly triples the P16 baseline.</span></span></td><td>282,380</td><td>270,308</td><td class="win">286,638</td></tr>
+      <tr><td>100k-key keyspace, pipeline 16</td><td>140,996</td><td>147,472</td><td class="win">149,601</td></tr>
+      <tr><td>8 KiB values, pipeline 16<span class="info-icon" tabindex="0">i<span class="info-tooltip">Payload/alloc-bound — ~51k ops/s is ~400 MiB/s of stored payload on ReflexDB.</span></span></td><td>48,356</td><td>46,633</td><td class="win">50,688</td></tr>
+    </tbody>
+  </table>
+</div>
+</section>
+
+<div id="tabRow">
+  <div class="logo"><img src="/logo.png" alt=""><div><div class="lname">ReflexDB</div><div class="lsub">bench &amp; studio</div></div></div>
+  <button type="button" class="tab-btn active" data-tab="home">🏠 Home</button>
+  <div class="nav-group">Benchmark</div>
+  <button type="button" class="tab-btn" data-tab="sequential">⚡ Sequential</button>
+  <button type="button" class="tab-btn" data-tab="parallel">🚀 Parallel</button>
+  <button type="button" class="tab-btn" data-tab="latency">📈 Latency lab</button>
+  <div class="nav-group">Test</div>
+  <button type="button" class="tab-btn" data-tab="durability">💥 Durability / crash<span class="info-icon" tabindex="0">i<span class="info-tooltip">
     Spawns its own throwaway <code>reflexdb-server</code> (not your running one), writes under load,
     force-kills it (<code>SIGKILL</code>), restarts it against the same data dir, and compares
     acknowledged writes to what AOF replay actually recovered — per <code>appendfsync</code> policy.
   </span></span></button>
-  <button type="button" class="tab-btn" data-tab="reslimit">Resource limits (OOM / disk-full)<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+  <button type="button" class="tab-btn" data-tab="reslimit">🧱 Resource limits<span class="info-icon" tabindex="0">i<span class="info-tooltip">
     Runs <code>reflexdb-server</code> in one Docker container with a real, OS-enforced
     <code>--memory</code> cap and a size-capped <code>--tmpfs /data</code> mount applied at the
     same time — not reflexdb's own <code>maxmemory</code> (which degrades gracefully by rejecting
@@ -191,7 +362,7 @@ const HTML: &str = r###"<!DOCTYPE html>
     Needs Docker running and <code>docker build -f Dockerfile.bench -t reflexdb-bench:latest .</code>
     done once beforehand.
   </span></span></button>
-  <button type="button" class="tab-btn" data-tab="shootout">Engine shootout<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+  <button type="button" class="tab-btn" data-tab="shootout">⚔️ Engine shootout<span class="info-icon" tabindex="0">i<span class="info-tooltip">
     Runs Redis, Dragonfly, and ReflexDB each in their own Docker container with an identical
     <code>--memory</code>/<code>--cpus</code> cap, feeds each the exact same workload (one at a
     time, never concurrently — otherwise they'd be competing for the same physical CPU/memory
@@ -199,41 +370,67 @@ const HTML: &str = r###"<!DOCTYPE html>
     <code>redis:7-alpine</code> and the Dragonfly image automatically the first time, and needs
     <code>docker build -f Dockerfile.bench -t reflexdb-bench:latest .</code> done once for ReflexDB.
   </span></span></button>
-  <button type="button" class="tab-btn" data-tab="history" hidden id="historyTabBtn">History (GETAT/HISTORY)<span class="tab-badge">on</span><span class="info-icon" tabindex="0">i<span class="info-tooltip">
+  <button type="button" class="tab-btn" data-tab="history" hidden id="historyTabBtn">⏪ History bench<span class="tab-badge">on</span><span class="info-icon" tabindex="0">i<span class="info-tooltip">
     <strong>History mode</strong> runs three steps in order: (1) <code>SET</code> writes to populate a keyspace
     (history is recorded automatically on every write once <code>history-enabled yes</code> is set), then
     (2) <code>GETAT</code> point-in-time reads and (3) <code>HISTORY</code> version-log reads against those same keys.
   </span></span></button>
-  <button type="button" class="tab-btn" data-tab="live">LIVE demo<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+  <button type="button" class="tab-btn" data-tab="live">🔴 LIVE demo<span class="info-icon" tabindex="0">i<span class="info-tooltip">
     Subscribes to <code>LIVE GET &lt;key&gt;</code> on a running server and shows every pushed
     update as it arrives — no polling. Use the "Set value" button to trigger one.
   </span></span></button>
-  <button type="button" class="tab-btn" data-tab="tiered">Tiered storage demo<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+  <button type="button" class="tab-btn" data-tab="tiered">💾 Tiered demo<span class="info-icon" tabindex="0">i<span class="info-tooltip">
     Writes real keys to a running server, then shows how many stayed in RAM (<code>DBSIZE</code>)
     vs. spilled to the on-disk tier, and times a <code>GET</code> that promotes an evicted key
     back. Needs a server started with <code>tiered-storage yes</code> and a small
     <code>tiered-memory-limit</code> to actually see eviction happen.
   </span></span></button>
+  <div class="nav-group">Studio</div>
+  <button type="button" class="tab-btn" data-tab="studio:keys">🔑 Keys</button>
+  <button type="button" class="tab-btn" data-tab="studio:history">🕰️ History</button>
+  <button type="button" class="tab-btn" data-tab="studio:live">📡 LIVE viewer</button>
+  <button type="button" class="tab-btn" data-tab="studio:health">🩺 Health</button>
+  <button type="button" class="tab-btn" data-tab="studio:slowlog">🐢 Slowlog</button>
+  <button type="button" class="tab-btn" data-tab="studio:settings">⚙️ Settings</button>
+  <button type="button" class="tab-btn" data-tab="studio:commands">⌨️ Commands</button>
+  <div class="nav-foot">
+    <div class="swatch-row" id="themeSwatches">
+      <span class="muted" style="font-size:.66rem;color:#55556a;letter-spacing:.1em;">THEME</span>
+      <button type="button" class="swatch" style="--c:#111119" data-theme="default" title="Default"></button>
+      <button type="button" class="swatch" style="--c:#0f1729" data-theme="navy" title="Navy"></button>
+      <button type="button" class="swatch" style="--c:#171029" data-theme="purple" title="Purple"></button>
+      <button type="button" class="swatch" style="--c:#0f1d15" data-theme="forest" title="Forest"></button>
+      <button type="button" class="swatch" style="--c:#1c150f" data-theme="ember" title="Ember"></button>
+      <button type="button" class="swatch" style="--c:#151515" data-theme="graphite" title="Graphite"></button>
+    </div>
+    <button type="button" class="nav-collapse" id="navCollapse">« hide sidebar</button>
+  </div>
 </div>
+<button type="button" id="navToggle" title="Show sidebar">☰</button>
 
 <form id="bench" class="panel">
   <div class="preset-row" id="presetRow"></div>
-  <label>Host</label><input name="host" value="127.0.0.1">
-  <label>Port</label><input name="port" value="7379">
-  <label data-mode="history">Data dir (for disk tracking)</label><input data-mode="history" name="dir" value="data">
-  <div data-mode="sequential,parallel">
-    <label>Commands</label>
-  </div>
-  <input data-mode="sequential,parallel" name="cmd" id="cmdField" value="ping,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_500,mset,xadd">
-  <label>Requests per command</label><input name="n" id="nField" value="200000" type="number">
-  <label>Clients</label><input name="c" id="cField" value="50" type="number">
-  <label data-mode="sequential,parallel">Pipeline</label><input data-mode="sequential,parallel" name="p" id="pField" value="10" type="number">
-  <label data-mode="sequential,parallel">Data size (bytes)</label><input data-mode="sequential,parallel" name="d" id="dField" value="20" type="number">
-  <label>Keyspace (-r, 0 = same key)<span class="info-icon" tabindex="0">i<span class="info-tooltip">
+  <div class="frow"><label>Host</label><input name="host" value="127.0.0.1">
+    <label>Port</label><input name="port" value="7379"></div>
+  <div class="frow"><label>Requests per command</label><input name="n" id="nField" value="200000" type="number">
+    <label>Clients</label><input name="c" id="cField" value="50" type="number"></div>
+  <div class="frow" data-mode="sequential,parallel"><label>Pipeline</label><input data-mode="sequential,parallel" name="p" id="pField" value="10" type="number">
+    <label>Data size (bytes)</label><input data-mode="sequential,parallel" name="d" id="dField" value="20" type="number"></div>
+  <div class="frow"><label>Keyspace (-r, 0 = same key)<span class="info-icon" tabindex="0">i<span class="info-tooltip">
     <strong>Keyspace (-r)</strong> spreads writes/reads across many keys instead of hammering one. Without it,
     <code>redis-benchmark</code> reuses a single key over and over, so memory barely moves — set it close to
     "Requests" to actually see memory/disk climb per operation. Presets set it automatically.
   </span></span></label><input name="r" id="rField" value="100000" type="number">
+    <label data-mode="history">Data dir</label><input data-mode="history" name="dir" value="data"></div>
+  <div class="note" data-mode="history" style="grid-column:1/-1; margin:0;">
+    <strong>3 steps, not a command list:</strong> (1) <code>SET</code> writes populate the keyspace —
+    with <code>history-enabled yes</code> every write also records a version, so this shows history's
+    write overhead; (2) <code>GETAT</code> point-in-time reads over those keys; (3) <code>HISTORY</code>
+    version-log reads. Fields below still apply; the command list doesn't (these run as literal
+    command lines).
+  </div>
+  <div class="frow" data-mode="sequential,parallel"><label>Commands</label>
+    <input name="cmd" id="cmdField" class="grow" value="ping,ping_mbulk,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_300,lrange_500,lrange_600,mset,xadd"></div>
   <div class="actions">
     <button type="submit" id="runBtn">Run benchmark</button>
     <button type="button" id="stopBtn" disabled class="secondary">Stop</button>
@@ -356,6 +553,14 @@ const HTML: &str = r###"<!DOCTYPE html>
     running" is no longer true. Persistence is off on all three. This keeps running even if you switch
     to another tab; use Stop to actually cancel it.
   </div>
+  <div class="note" style="margin:0; border-left-color:#f59e0b;">
+    <strong>⚠️ Requires Docker — run this locally.</strong> Every engine is launched as a real
+    container by the bench-UI <em>host</em>, so Docker must be installed and running wherever this
+    UI server runs, plus a one-time <code>docker build -f Dockerfile.bench -t reflexdb-bench:latest .</code>
+    (the Redis and Dragonfly images pull automatically on first run). It's disabled in public
+    sandbox mode — <code>/run-*</code> endpoints are blocked there — and on a remote host without
+    Docker the run just fails.
+  </div>
   <div class="latency-fields">
     <div class="latency-field"><label for="sMemMB">Memory limit (MB, each engine)</label><input id="sMemMB" type="number" value="512" min="64" max="65536"></div>
     <div class="latency-field"><label for="sCpus">CPU limit (cores, each engine)</label><input id="sCpus" type="number" value="1" step="0.1" min="0.1" max="64"></div>
@@ -394,8 +599,8 @@ const HTML: &str = r###"<!DOCTYPE html>
 </section>
 
 <div id="liveDemoPanel" class="panel" style="display:none;">
-  <label>Host</label><input id="liveHost" value="127.0.0.1">
-  <label>Port</label><input id="livePort" value="7379" type="number">
+  <div class="frow"><label>Host</label><input id="liveHost" value="127.0.0.1">
+    <label>Port</label><input id="livePort" value="7379" type="number"></div>
   <label>Keys &amp; values<span class="info-icon" tabindex="0">i<span class="info-tooltip">
     Each row subscribes to its own <code>LIVE GET &lt;key&gt;</code> over the same connection —
     add more rows to watch several keys at once. "Set" fires a one-off <code>SET</code> for that
@@ -408,9 +613,9 @@ const HTML: &str = r###"<!DOCTYPE html>
   <label>Auto-change</label>
   <div class="actions">
     <span style="color:#9a9aa8; font-size:.88rem;">for</span>
-    <input id="liveAutoSeconds" value="10" type="number" min="1" style="width:5rem;">
+    <input id="liveAutoSeconds" value="60" type="number" min="1" style="width:5rem;">
     <span style="color:#9a9aa8; font-size:.88rem;">seconds, every</span>
-    <input id="liveAutoIntervalMs" value="1000" type="number" min="100" style="width:6rem;">
+    <input id="liveAutoIntervalMs" value="10" type="number" min="10" style="width:6rem;">
     <span style="color:#9a9aa8; font-size:.88rem;">ms</span>
     <button type="button" id="liveAutoBtn">Start auto-change</button>
     <button type="button" id="liveAutoStopBtn" disabled class="secondary">Stop auto-change</button>
@@ -483,8 +688,10 @@ const HTML: &str = r###"<!DOCTYPE html>
   <div class="hero-card"><div class="k">Promote GET time</div><div class="v red" id="tsPromote">-</div></div>
 </div>
 
+<div id="outputSection">
 <h2>Live output</h2>
 <pre id="output">Pick a preset (or edit fields) and click "Run benchmark". A card appears for every command as it starts, and fills in live.</pre>
+</div>
 
 <div id="benchResults">
   <div id="heroSection" style="display:none;">
@@ -513,22 +720,20 @@ const HTML: &str = r###"<!DOCTYPE html>
 
 <script>
 const PRESETS = {
-  'Default command mix': { n: 100000, c: 50, p: 1, d: 3, r: 100000, cmd: 'ping,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_500,mset,xadd' },
+  'Default command mix': { n: 100000, c: 50, p: 1, d: 3, r: 100000, cmd: 'ping,ping_mbulk,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_300,lrange_500,lrange_600,mset,xadd' },
   'Pipelined (prod-like)': { n: 500000, c: 50, p: 16, d: 3, r: 500000, cmd: 'ping,set,get,incr,lpush,rpush,sadd,hset,zadd,mset,xadd' },
   'High concurrency': { n: 500000, c: 200, p: 32, d: 100, r: 500000, cmd: 'set,get,incr,lpush,sadd,hset,zadd' },
   'Large payload (object cache)': { n: 100000, c: 50, p: 1, d: 1024, r: 100000, cmd: 'set,get,mset' },
   'Memory stress (write heavy)': { n: 1000000, c: 100, p: 16, d: 100, r: 1000000, cmd: 'set,lpush,sadd,hset,zadd,xadd' },
-  'Everything (all commands)': { n: 1000000, c: 50, p: 16, d: 20, r: 1000000, cmd: 'ping,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_500,mset,xadd' },
+  'Everything (all commands)': { n: 1000000, c: 50, p: 16, d: 20, r: 1000000, cmd: 'ping,ping_mbulk,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_300,lrange_500,lrange_600,mset,xadd' },
 };
 
-const CMD_COLORS = ['#8b5cf6', '#22d3ee', '#f59e0b', '#ef4444', '#22c55e', '#60a5fa', '#f472b6', '#facc15', '#a78bfa', '#34d399', '#fb923c', '#38bdf8', '#e879f9', '#4ade80', '#c084fc', '#fca5a5', '#86efac', '#93c5fd', '#fde047'];
+const CMD_COLORS = ['#a78bfa', '#22d3ee', '#f59e0b', '#ef4444', '#22c55e', '#60a5fa', '#f472b6', '#facc15', '#a78bfa', '#34d399', '#fb923c', '#38bdf8', '#e879f9', '#4ade80', '#c084fc', '#fca5a5', '#86efac', '#93c5fd', '#fde047'];
 
 const bench = document.getElementById('bench');
 const output = document.getElementById('output');
 const runBtn = document.getElementById('runBtn');
 const stopBtn = document.getElementById('stopBtn');
-const statsArea = document.getElementById('statsArea');
-const statsRaw = document.getElementById('statsRaw');
 const refreshStats = document.getElementById('refreshStats');
 const ramLimitGB = document.getElementById('ramLimitGB');
 const diskLimitGB = document.getElementById('diskLimitGB');
@@ -578,6 +783,39 @@ let currentTab = 'sequential';
 let liveStartedAt = 0;
 let liveWatchedKeyCount = 0;
 
+// Sidebar collapse + whole-UI theme, both persisted across reloads. Each
+// theme re-shades every surface (bg/inset/panel/borders) in the same hue —
+// accents (purple/cyan) stay fixed so the current look is 'default'.
+const THEMES = {
+  default:  { bg: '#07070d', inset: '#0c0c14', panel: '#111119', panel2: '#1a1a24', border: '#22222f', border2: '#333345' },
+  navy:     { bg: '#060a13', inset: '#0a101f', panel: '#0f1729', panel2: '#16203a', border: '#1f2c4a', border2: '#2c3d63' },
+  purple:   { bg: '#0b0614', inset: '#110b1f', panel: '#171029', panel2: '#20163a', border: '#2e2150', border2: '#453169' },
+  forest:   { bg: '#060c09', inset: '#0a1410', panel: '#0f1d15', panel2: '#14281f', border: '#1e3a2e', border2: '#2d5344' },
+  ember:    { bg: '#0d0806', inset: '#150f0a', panel: '#1c150f', panel2: '#271d14', border: '#3a2b1f', border2: '#543e2b' },
+  graphite: { bg: '#090909', inset: '#101010', panel: '#151515', panel2: '#1d1d1d', border: '#272727', border2: '#3a3a3a' },
+};
+const navToggle = document.getElementById('navToggle');
+const navCollapse = document.getElementById('navCollapse');
+const setNavHidden = hidden => {
+  document.body.classList.toggle('nav-hidden', hidden);
+  localStorage.setItem('ui.navHidden', hidden ? '1' : '');
+};
+const setTheme = name => {
+  const t = THEMES[name];
+  if (!t) return;
+  for (const [k, v] of Object.entries(t)) document.documentElement.style.setProperty('--' + k, v);
+  localStorage.setItem('ui.theme', name);
+  document.querySelectorAll('#themeSwatches .swatch').forEach(s => s.classList.toggle('active', s.dataset.theme === name));
+};
+navToggle.onclick = () => setNavHidden(false);
+navCollapse.onclick = () => setNavHidden(true);
+document.getElementById('themeSwatches').addEventListener('click', e => {
+  const s = e.target.closest('.swatch');
+  if (s) setTheme(s.dataset.theme);
+});
+if (localStorage.getItem('ui.navHidden')) setNavHidden(true);
+setTheme(localStorage.getItem('ui.theme') || 'default');
+
 for (const name of Object.keys(PRESETS)) {
   const btn = document.createElement('button');
   btn.type = 'button';
@@ -599,31 +837,43 @@ for (const name of Object.keys(PRESETS)) {
 
 function setTab(tab) {
   currentTab = tab;
+  const base = tab.split(':')[0], sub = tab.split(':')[1];
   [...tabRow.children].forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
   [...bench.querySelectorAll('[data-mode]')].forEach(el => {
-    el.style.display = el.dataset.mode.split(',').includes(tab) ? '' : 'none';
+    el.style.display = el.dataset.mode.split(',').includes(base) ? '' : 'none';
   });
-  runBtn.textContent = tab === 'parallel' ? 'Run all commands in parallel' : tab === 'history' ? 'Run history benchmark' : 'Run benchmark';
+  runBtn.textContent = base === 'parallel' ? 'Run all commands in parallel' : base === 'history' ? 'Run history benchmark' : 'Run benchmark';
 
-  const isLive = tab === 'live';
-  const isTiered = tab === 'tiered';
-  const isLatency = tab === 'latency';
-  const isDurability = tab === 'durability';
-  const isReslimit = tab === 'reslimit';
-  const isShootout = tab === 'shootout';
-  bench.style.display = (isLive || isTiered || isLatency || isDurability || isReslimit || isShootout) ? 'none' : '';
-  benchResults.style.display = (isLive || isTiered || isLatency || isDurability || isReslimit || isShootout) ? 'none' : '';
+  const isLive = base === 'live';
+  const isTiered = base === 'tiered';
+  const isLatency = base === 'latency';
+  const isDurability = base === 'durability';
+  const isReslimit = base === 'reslimit';
+  const isShootout = base === 'shootout';
+  const isStudio = base === 'studio';
+  const isHome = base === 'home';
+  bench.style.display = (isHome || isLive || isTiered || isLatency || isDurability || isReslimit || isShootout || isStudio) ? 'none' : '';
+  benchResults.style.display = (isHome || isLive || isTiered || isLatency || isDurability || isReslimit || isShootout || isStudio) ? 'none' : '';
+  const hp = document.getElementById('homePanel');
+  if (hp) hp.style.display = isHome ? '' : 'none';
+  document.getElementById('outputSection').style.display = (isHome || isStudio) ? 'none' : '';
   latencyPanel.style.display = isLatency ? 'grid' : 'none';
   durabilityPanel.style.display = isDurability ? 'grid' : 'none';
   reslimitPanel.style.display = isReslimit ? 'grid' : 'none';
   shootoutPanel.style.display = isShootout ? 'grid' : 'none';
+  const sp = document.getElementById('studioPanel');
+  if (sp) sp.style.display = isStudio ? '' : 'none';
+  if (isStudio && window.stShowStudio) stShowStudio();
+  if (isStudio && sub) document.querySelector('#stTabs .st-tab[data-stab="' + sub + '"]')?.click();
+  // Deliberately NOT stopping the demo's LIVE watch/auto-change or the
+  // studio LIVE subscription here: all are explicit user actions with
+  // their own Stop buttons, and killing them on navigation made a watch
+  // receive nothing — writes stopped the moment you switched tabs.
   liveDemoPanel.style.display = isLive ? 'grid' : 'none';
   tieredDemoPanel.style.display = isTiered ? 'grid' : 'none';
   liveFeed.style.display = isLive ? '' : 'none';
   liveStats.style.display = isLive ? 'grid' : 'none';
   liveExplain.style.display = isLive ? '' : 'none';
-  if (!isLive && liveController) { liveController.abort(); liveController = null; }
-  if (!isLive && liveAutoController) { liveAutoController.abort(); liveAutoController = null; }
   if (!isTiered && tieredController) { tieredController.abort(); tieredController = null; }
   if (!isLatency && latencyController) { latencyController.abort(); latencyController = null; }
   if (!isDurability && durabilityController) { durabilityController.abort(); durabilityController = null; }
@@ -640,7 +890,7 @@ tabRow.addEventListener('click', (e) => {
   const btn = e.target.closest('.tab-btn');
   if (btn && !btn.hidden) setTab(btn.dataset.tab);
 });
-setTab('sequential');
+setTab('home');
 
 // Info icons (the small "i" badges next to labels/tabs): click to toggle
 // the tooltip open (for touch/no-hover devices), click anywhere else to
@@ -654,6 +904,22 @@ document.addEventListener('click', (e) => {
     e.stopPropagation();
     icon.classList.toggle('open');
   }
+});
+
+// Landing hero: grow the bars and count the numbers up once on load.
+requestAnimationFrame(() => {
+  document.querySelectorAll('#landingHero .hbar-fill').forEach(el => {
+    el.style.width = el.dataset.w + '%';
+  });
+  document.querySelectorAll('#landingHero .ops-count').forEach(el => {
+    const target = Number(el.dataset.n), t0 = performance.now();
+    const tick = now => {
+      const p = Math.min((now - t0) / 1200, 1);
+      el.textContent = Math.round(target * (1 - Math.pow(1 - p, 3))).toLocaleString();
+      if (p < 1) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
 });
 
 // Only show the History tab if the target server actually has
@@ -691,11 +957,13 @@ function updateBar(usedKb, totalKb, warnAboveGB, fill, text) {
   const usedGB = usedKb / 1024 / 1024;
   fill.style.width = pct + '%';
   fill.className = 'bar-fill' + (usedGB > warnAboveGB ? ' danger' : pct > 70 ? ' warn' : '');
-  const totalText = totalKb > 0 ? `${fmtGB(totalKb)} GB` : 'unknown';
-  text.textContent = `${fmtGB(usedKb)} GB / ${totalText} used (${pct.toFixed(1)}%)`;
+  const totalText = totalKb > 0 ? `${fmtGB(totalKb)} GB` : '?';
+  text.textContent = `${fmtGB(usedKb)}/${totalText} · ${pct.toFixed(0)}%`;
 }
 
 let statsPollTimer = null;
+
+let statsFailCount = 0;
 
 async function pollStatsOnce() {
   try {
@@ -706,26 +974,42 @@ async function pollStatsOnce() {
       const [k, v] = line.split(':').map(s => s.trim());
       if (k && v) map[k] = parseFloat(v) || 0;
     });
-    statsRaw.textContent = text;
+    if (!map.ram_total_kb && !map.disk_total_kb) throw new Error('no stats');
+    statsFailCount = 0;
+    topstats.style.display = '';
     updateBar(map.ram_used_kb, map.ram_total_kb, parseFloat(ramLimitGB.value) || Infinity, ramBar, ramText);
     updateBar(map.disk_used_kb, map.disk_total_kb, parseFloat(diskLimitGB.value) || Infinity, diskBar, diskText);
   } catch (e) {
-    statsRaw.textContent = 'Failed to load stats: ' + e.message;
+    if (++statsFailCount >= 2) topstats.style.display = 'none';
   }
 }
 
+const liveDot = document.getElementById('liveDot');
+const liveLabel = document.getElementById('liveLabel');
+const topstats = document.querySelector('.topstats');
 refreshStats.onclick = () => {
   if (statsPollTimer) {
     clearInterval(statsPollTimer);
     statsPollTimer = null;
-    refreshStats.textContent = 'Show host memory & disk';
+    liveLabel.textContent = 'paused';
+    liveDot.classList.add('off');
+    topstats.classList.remove('live');
     return;
   }
-  statsArea.style.display = 'block';
-  refreshStats.textContent = 'Stop live memory & disk';
+  liveLabel.textContent = 'live';
+  liveDot.classList.remove('off');
+  topstats.classList.add('live');
   pollStatsOnce();
   statsPollTimer = setInterval(pollStatsOnce, 1500);
 };
+refreshStats.click();
+
+document.getElementById('statsExpand').onclick = (e) => {
+  const big = document.querySelector('.topstats').classList.toggle('big');
+  e.target.textContent = big ? '⤡' : '⤢';
+  localStorage.setItem('ui.statsBig', big ? '1' : '');
+};
+if (localStorage.getItem('ui.statsBig')) document.getElementById('statsExpand').click();
 
 // Reads the fixed set of percentile/latency pairs redis-benchmark prints
 // under "Latency by percentile distribution:" (0%, 50%, 75%, 87.5%, ...)
@@ -801,7 +1085,7 @@ function setupHiDpi(canvas, cssHeight) {
 function drawDeltaBar(canvas, before, after, accentColor) {
   const { ctx, w, h } = setupHiDpi(canvas, 26);
   ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#24242f';
+  ctx.fillStyle = 'var(--border)';
   ctx.fillRect(0, 0, w, h);
 
   const scale = Math.max(before, after, 1);
@@ -1108,8 +1392,8 @@ liveAutoBtn.onclick = async () => {
   liveAutoController = new AbortController();
   liveAutoBtn.disabled = true;
   liveAutoStopBtn.disabled = false;
-  const seconds = parseFloat(document.getElementById('liveAutoSeconds').value) || 10;
-  const intervalMs = parseInt(document.getElementById('liveAutoIntervalMs').value, 10) || 1000;
+  const seconds = parseFloat(document.getElementById('liveAutoSeconds').value) || 60;
+  const intervalMs = parseInt(document.getElementById('liveAutoIntervalMs').value, 10) || 10;
   const qs = new URLSearchParams({
     host: document.getElementById('liveHost').value,
     port: document.getElementById('livePort').value,
@@ -1724,7 +2008,7 @@ function renderShootoutStatusRow() {
   shootoutEngineStatusRow.innerHTML = engineIds
     .map(id => {
       const label = SHOOTOUT_LABELS[id] || id;
-      const dotColor = SHOOTOUT_COLORS[id] || '#8b5cf6';
+      const dotColor = SHOOTOUT_COLORS[id] || '#a78bfa';
       return `<span class="shootout-status-chip"><span class="legend-dot" style="background:${dotColor}"></span>` +
         `<b>${label}</b><span class="chip-status">${shootoutEngineStatus[id] || ''}</span></span>`;
     })
@@ -1842,9 +2126,12 @@ sRunBtn.onclick = async () => {
 sStopBtn.onclick = () => { if (shootoutController) shootoutController.abort(); };
 
 ramLimitGB.onchange = diskLimitGB.onchange = () => { if (statsPollTimer) pollStatsOnce(); };
-</script>
+</script>"###,
+    include_str!("studio_ui.html"),
+    r###"
 </body>
-</html>"###;
+</html>"###
+);
 
 fn percent_decode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1879,6 +2166,10 @@ fn parse_query(query: &str) -> HashMap<String, String> {
         }
     }
     map
+}
+
+fn params_to_query(params: &HashMap<String, String>) -> String {
+    params.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
 }
 
 fn json_escape(s: &str) -> String {
@@ -2324,14 +2615,12 @@ async fn handle_live_set(query: Option<&str>, socket: &mut TcpStream) -> std::io
     Ok(())
 }
 
-/// Generates an `n`-byte random alphanumeric value — used by
-/// `/live-autoset` so repeated ticks actually produce a visibly different
-/// pushed result each time, not just the same string over and over.
-fn random_value(n: usize) -> String {
-    use rand::Rng;
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
-    (0..n).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect()
+/// `/live-autoset` values — a readable, ordered string per tick
+/// (`update #N · HH:MM:SS UTC`) instead of random noise, so the demo's
+/// history/export reads sensibly.
+fn demo_value(seq: u64) -> String {
+    let secs = now_s().rem_euclid(86_400);
+    format!("update #{seq} · {:02}:{:02}:{:02} UTC", secs / 3600, secs % 3600 / 60, secs % 60)
 }
 
 /// Repeatedly `SET`s every key in `keys` to a fresh random value on
@@ -2381,9 +2670,11 @@ async fn handle_live_autoset(query: Option<&str>, socket: &mut TcpStream) -> std
     let deadline = Instant::now() + Duration::from_millis(duration_ms);
     let mut tick = tokio::time::interval(Duration::from_millis(interval_ms));
     tick.tick().await; // first tick fires immediately
+    let mut seq = 0u64;
     while Instant::now() < deadline {
         for key in &keys {
-            let value = random_value(8);
+            seq += 1;
+            let value = demo_value(seq);
             if client.call(&["SET", key, &value]).await.is_err() {
                 let _ = write_chunk(
                     socket,
@@ -2677,7 +2968,7 @@ fn parse_run_params(query: Option<&str>) -> RunParams {
         .get("cmd")
         .filter(|s| !s.is_empty())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "ping,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_500,mset,xadd".to_string());
+        .unwrap_or_else(|| "ping,ping_mbulk,set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,spop,zadd,zpopmin,lrange_100,lrange_300,lrange_500,lrange_600,mset,xadd".to_string());
     let n = params.get("n").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1_000_000);
     let c = params.get("c").and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
     let p = params.get("p").and_then(|s| s.parse::<usize>().ok()).unwrap_or(16);
@@ -2811,7 +3102,11 @@ async fn run_bench_process(
         return;
     }
 
-    let spawned = Command::new(&bench_bin).args(&bench_args).stdout(std::process::Stdio::piped()).spawn();
+    let spawned = Command::new(&bench_bin)
+        .args(&bench_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
@@ -2825,8 +3120,23 @@ async fn run_bench_process(
     };
 
     let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<(bool, String)>();
+    let stderr_tx = line_tx.clone();
     let reader_task = tokio::spawn(stream_bench_output(stdout, line_tx));
+    tokio::spawn(async move {
+        // stderr is plain lines (connect failures, usage errors) — no
+        // \r-progress to split, so forward each line as a log line.
+        let mut r = tokio::io::BufReader::new(stderr);
+        let mut buf = String::new();
+        while tokio::io::AsyncBufReadExt::read_line(&mut r, &mut buf).await.unwrap_or(0) > 0 {
+            let line = buf.trim_end().to_string();
+            buf.clear();
+            if line.is_empty() || stderr_tx.send((false, line)).is_err() {
+                return;
+            }
+        }
+    });
 
     let mut interval = tokio::time::interval(Duration::from_millis(300));
     interval.tick().await; // first tick fires immediately
@@ -4029,6 +4339,746 @@ async fn run_shootout_engine(run: ShootoutEngineRun) {
     let _ = Command::new("docker").args(["rm", "-f", &name]).output().await;
 }
 
+// ---------------- Studio API (key browser / history / health / slowlog / LIVE) ----------------
+
+const STUDIO_SCAN_PAGE: usize = 200;
+const STUDIO_INSPECT_LIMIT: usize = 200;
+
+fn studio_target(params: &HashMap<String, String>) -> (String, u16) {
+    let host = params
+        .get("host")
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = params.get("port").and_then(|s| s.parse::<u16>().ok()).unwrap_or(7379);
+    (host, port)
+}
+
+async fn http_json(socket: &mut TcpStream, status: &str, body: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(head.as_bytes()).await?;
+    socket.write_all(body.as_bytes()).await
+}
+
+fn studio_err_json(msg: impl AsRef<str>) -> String {
+    format!("{{\"error\":\"{}\"}}", json_escape(msg.as_ref()))
+}
+
+fn studio_reply_str(r: &Reply) -> String {
+    match r {
+        Reply::Simple(s) | Reply::Error(s) => s.clone(),
+        Reply::Integer(i) => i.to_string(),
+        Reply::Bulk(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+        Reply::Bulk(None) => String::new(),
+        Reply::Array(_) => format!("{r:?}"),
+    }
+}
+
+async fn studio_connect(params: &HashMap<String, String>) -> Result<RespClient, std::io::Error> {
+    let (h, p) = studio_target(params);
+    RespClient::connect(&h, p).await
+}
+
+fn studio_int_reply(r: &std::io::Result<Reply>) -> i64 {
+    match r {
+        Ok(Reply::Integer(n)) => *n,
+        _ => 0,
+    }
+}
+
+fn studio_items_json(r: &std::io::Result<Reply>) -> String {
+    match r {
+        Ok(Reply::Array(Some(items))) => {
+            let inner: Vec<String> = items.iter().map(reply_to_json_value).collect();
+            format!("[{}]", inner.join(","))
+        }
+        Ok(Reply::Error(e)) => format!("{{\"error\":\"{}\"}}", json_escape(e)),
+        _ => "[]".into(),
+    }
+}
+
+fn studio_pairs_json(r: &std::io::Result<Reply>) -> String {
+    match r {
+        Ok(Reply::Array(Some(flat))) => {
+            let mut pairs = Vec::with_capacity(flat.len() / 2);
+            for pair in flat.chunks(2) {
+                let f = pair.first().map(reply_to_json_value).unwrap_or_else(|| "null".into());
+                let v = pair.get(1).map(reply_to_json_value).unwrap_or_else(|| "null".into());
+                pairs.push(format!("[{f},{v}]"));
+            }
+            format!("[{}]", pairs.join(","))
+        }
+        _ => "[]".into(),
+    }
+}
+
+fn studio_stream_json(r: &std::io::Result<Reply>) -> String {
+    match r {
+        Ok(Reply::Array(Some(entries))) => {
+            let mut out = Vec::with_capacity(entries.len());
+            for e in entries {
+                if let Reply::Array(Some(pair)) = e {
+                    let id = pair.first().map(reply_to_json_value).unwrap_or_else(|| "null".into());
+                    let fields = match pair.get(1) {
+                        Some(Reply::Array(Some(flat))) => {
+                            let mut obj = Vec::with_capacity(flat.len() / 2);
+                            for p in flat.chunks(2) {
+                                let f = p.first().map(studio_reply_str).unwrap_or_default();
+                                let v = p.get(1).map(reply_to_json_value).unwrap_or_else(|| "null".into());
+                                obj.push(format!("\"{}\":{v}", json_escape(&f)));
+                            }
+                            format!("{{{}}}", obj.join(","))
+                        }
+                        _ => "{}".into(),
+                    };
+                    out.push(format!("[{id},{fields}]"));
+                }
+            }
+            format!("[{}]", out.join(","))
+        }
+        _ => "[]".into(),
+    }
+}
+
+async fn api_keys(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let pattern = params.get("pattern").cloned().unwrap_or_else(|| "*".into());
+    let cursor = params.get("cursor").cloned().unwrap_or_else(|| "0".into());
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    let reply = c.call(&["SCAN", &cursor, "MATCH", &pattern, "COUNT", &STUDIO_SCAN_PAGE.to_string()]).await;
+    let (next, keys) = match reply {
+        Ok(Reply::Array(Some(items))) if items.len() == 2 => (
+            studio_reply_str(&items[0]),
+            match &items[1] {
+                Reply::Array(Some(k)) => k.iter().map(studio_reply_str).collect::<Vec<String>>(),
+                _ => vec![],
+            },
+        ),
+        Ok(Reply::Error(e)) => return http_json(socket, "200 OK", &studio_err_json(e)).await,
+        _ => return http_json(socket, "502 Bad Gateway", &studio_err_json("bad SCAN reply")).await,
+    };
+    // TYPE+PTTL+MEMORY per key, pipelined — one write burst instead of
+    // round-trips per key (a 500-key page on a busy server would otherwise
+    // stall for seconds). A second burst fetches the first 64 bytes of
+    // string keys to refine the type (int/float/bool/json).
+    let mut cmds: Vec<Vec<&str>> = Vec::with_capacity(keys.len() * 3);
+    for key in &keys {
+        cmds.push(vec!["TYPE", key]);
+        cmds.push(vec!["PTTL", key]);
+        cmds.push(vec!["MEMORY", "USAGE", key]);
+    }
+    let replies = match c.call_many(&cmds).await {
+        Ok(r) => r,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    let string_idx: Vec<usize> = keys
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| matches!(replies.get(i * 3), Some(Reply::Simple(t)) if t == "string"))
+        .map(|(i, _)| i)
+        .collect();
+    let get_cmds: Vec<Vec<&str>> =
+        string_idx.iter().map(|&i| vec!["GETRANGE", keys[i].as_str(), "0", "63"]).collect();
+    let string_replies = match c.call_many(&get_cmds).await {
+        Ok(r) => r,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    let classify = |s: &str| -> &str {
+        let t = s.trim();
+        if t == "true" || t == "false" {
+            "bool"
+        } else if t.parse::<i64>().is_ok() {
+            "int"
+        } else if t.parse::<f64>().is_ok() {
+            "float"
+        } else if t.starts_with('{') || t.starts_with('[') {
+            "json"
+        } else {
+            "string"
+        }
+    };
+    let mut rows = Vec::with_capacity(keys.len());
+    let mut si = 0;
+    for (i, key) in keys.iter().enumerate() {
+        let mut ty = match replies.get(i * 3) {
+            Some(Reply::Simple(s)) => s.clone(),
+            _ => "?".into(),
+        };
+        let ttl = match replies.get(i * 3 + 1) {
+            Some(Reply::Integer(ms)) => *ms,
+            _ => -2,
+        };
+        let mem = match replies.get(i * 3 + 2) {
+            Some(Reply::Integer(b)) => b.to_string(),
+            _ => "null".into(),
+        };
+        if ty == "string" {
+            if let Some(Reply::Bulk(Some(b))) = string_replies.get(si) {
+                ty = classify(&String::from_utf8_lossy(b)).to_string();
+            }
+            si += 1;
+        }
+        rows.push(format!(
+            "{{\"key\":\"{}\",\"type\":\"{}\",\"ttl_ms\":{ttl},\"mem_bytes\":{mem}}}",
+            json_escape(key),
+            json_escape(&ty)
+        ));
+    }
+    http_json(
+        socket,
+        "200 OK",
+        &format!("{{\"cursor\":\"{}\",\"keys\":[{}]}}", json_escape(&next), rows.join(",")),
+    )
+    .await
+}
+
+async fn api_key(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let Some(name) = params.get("name") else {
+        return http_json(socket, "400 Bad Request", &studio_err_json("missing name")).await;
+    };
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    let ty = c.call(&["TYPE", name]).await.map(|r| studio_reply_str(&r)).unwrap_or_else(|_| "none".into());
+    if ty == "none" {
+        return http_json(socket, "200 OK", &studio_err_json("key not found")).await;
+    }
+    let ttl = match c.call(&["PTTL", name]).await {
+        Ok(Reply::Integer(ms)) => ms,
+        _ => -2,
+    };
+    let mem = match c.call(&["MEMORY", "USAGE", name]).await {
+        Ok(Reply::Integer(b)) => b.to_string(),
+        _ => "null".into(),
+    };
+    let lim = STUDIO_INSPECT_LIMIT.to_string();
+    let (value_json, truncated, total) = match ty.as_str() {
+        "string" => match c.call(&["GET", name]).await {
+            Ok(Reply::Bulk(Some(b))) => {
+                let s = String::from_utf8_lossy(&b);
+                (format!("\"{}\"", json_escape(&s)), false, 0)
+            }
+            Ok(Reply::Error(e)) => return http_json(socket, "200 OK", &studio_err_json(e)).await,
+            _ => ("null".into(), false, 0),
+        },
+        "hash" => (studio_pairs_json(&c.call(&["HGETALL", name]).await), false, 0),
+        "list" => {
+            let len = studio_int_reply(&c.call(&["LLEN", name]).await);
+            let items = c.call(&["LRANGE", name, "0", &(STUDIO_INSPECT_LIMIT - 1).to_string()]).await;
+            (studio_items_json(&items), len > STUDIO_INSPECT_LIMIT as i64, len.max(0) as usize)
+        }
+        "set" => {
+            let len = studio_int_reply(&c.call(&["SCARD", name]).await);
+            let items = c.call(&["SRANDMEMBER", name, &lim]).await;
+            (studio_items_json(&items), len > STUDIO_INSPECT_LIMIT as i64, len.max(0) as usize)
+        }
+        "zset" => {
+            let len = studio_int_reply(&c.call(&["ZCARD", name]).await);
+            let items =
+                c.call(&["ZRANGE", name, "0", &(STUDIO_INSPECT_LIMIT - 1).to_string(), "WITHSCORES"]).await;
+            (studio_pairs_json(&items), len > STUDIO_INSPECT_LIMIT as i64, len.max(0) as usize)
+        }
+        "stream" => {
+            let len = studio_int_reply(&c.call(&["XLEN", name]).await);
+            let items = c.call(&["XRANGE", name, "-", "+", "COUNT", "50"]).await;
+            (studio_stream_json(&items), len > 50, len.max(0) as usize)
+        }
+        other => (format!("\"unsupported type {other}\""), false, 0),
+    };
+    let body = format!(
+        "{{\"type\":\"{}\",\"ttl_ms\":{ttl},\"memory_bytes\":{mem},\"value\":{value_json},\"truncated\":{truncated},\"total\":{total}}}",
+        json_escape(&ty)
+    );
+    http_json(socket, "200 OK", &body).await
+}
+
+async fn api_history(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let Some(name) = params.get("name") else {
+        return http_json(socket, "400 Bad Request", &studio_err_json("missing name")).await;
+    };
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    match c.call(&["HISTORY", name, "LIMIT", "500"]).await {
+        Ok(Reply::Error(e)) if e.contains("history is disabled") => {
+            http_json(socket, "200 OK", "{\"enabled\":false,\"entries\":[]}").await
+        }
+        Ok(Reply::Error(e)) => http_json(socket, "200 OK", &studio_err_json(e)).await,
+        Ok(Reply::Array(Some(items))) => {
+            let mut entries = Vec::with_capacity(items.len());
+            for item in items {
+                if let Reply::Array(Some(pair)) = &item {
+                    let ts = match pair.first() {
+                        Some(Reply::Integer(t)) => *t,
+                        _ => 0,
+                    };
+                    let v = pair.get(1).map(reply_to_json_value).unwrap_or_else(|| "null".into());
+                    entries.push(format!("{{\"ts\":{ts},\"value\":{v}}}"));
+                }
+            }
+            http_json(socket, "200 OK", &format!("{{\"enabled\":true,\"entries\":[{}]}}", entries.join(",")))
+                .await
+        }
+        _ => http_json(socket, "502 Bad Gateway", &studio_err_json("bad HISTORY reply")).await,
+    }
+}
+
+async fn api_info(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    let raw = match c.call(&["INFO"]).await {
+        Ok(r) => studio_reply_str(&r),
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    let mut fields = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            fields.push(format!("\"{}\":\"{}\"", json_escape(k), json_escape(v)));
+        }
+    }
+    let slowlog_len = match c.call(&["SLOWLOG", "LEN"]).await {
+        Ok(Reply::Integer(n)) => n.to_string(),
+        _ => "null".into(),
+    };
+    let history_enabled = match c.call(&["HISTORY", "__studio_probe__", "LIMIT", "1"]).await {
+        Ok(Reply::Error(e)) if e.contains("disabled") => false,
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    let body = format!(
+        "{{\"info\":{{{}}},\"slowlog_len\":{slowlog_len},\"history_enabled\":{history_enabled},\"raw\":\"{}\"}}",
+        fields.join(","),
+        json_escape(&raw)
+    );
+    http_json(socket, "200 OK", &body).await
+}
+
+async fn api_slowlog(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    match c.call(&["SLOWLOG", "GET", "50"]).await {
+        Ok(Reply::Array(Some(items))) => {
+            let mut entries = Vec::with_capacity(items.len());
+            for item in items {
+                if let Reply::Array(Some(f)) = &item {
+                    let id = match f.first() {
+                        Some(Reply::Integer(n)) => *n,
+                        _ => 0,
+                    };
+                    let ts = match f.get(1) {
+                        Some(Reply::Integer(n)) => *n,
+                        _ => 0,
+                    };
+                    let dur = match f.get(2) {
+                        Some(Reply::Integer(n)) => *n,
+                        _ => 0,
+                    };
+                    let cmd = match f.get(3) {
+                        Some(Reply::Array(Some(args))) => {
+                            args.iter().map(studio_reply_str).collect::<Vec<_>>().join(" ")
+                        }
+                        _ => String::new(),
+                    };
+                    entries.push(format!(
+                        "{{\"id\":{id},\"ts\":{ts},\"duration_us\":{dur},\"command\":\"{}\"}}",
+                        json_escape(&cmd)
+                    ));
+                }
+            }
+            http_json(socket, "200 OK", &format!("{{\"entries\":[{}]}}", entries.join(","))).await
+        }
+        Ok(Reply::Error(e)) => http_json(socket, "200 OK", &studio_err_json(e)).await,
+        _ => http_json(socket, "502 Bad Gateway", &studio_err_json("bad SLOWLOG reply")).await,
+    }
+}
+
+/// `/api/config` — `CONFIG GET *` flattened to `{"values":{"name":"val"}}`.
+async fn api_config(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    match c.call(&["CONFIG", "GET", "*"]).await {
+        Ok(Reply::Array(Some(flat))) => {
+            let mut pairs = Vec::with_capacity(flat.len() / 2);
+            for pair in flat.chunks(2) {
+                let name = pair.first().map(studio_reply_str).unwrap_or_default();
+                let value = pair.get(1).map(studio_reply_str).unwrap_or_default();
+                pairs.push(format!("\"{}\":\"{}\"", json_escape(&name), json_escape(&value)));
+            }
+            http_json(socket, "200 OK", &format!("{{\"values\":{{{}}}}}", pairs.join(","))).await
+        }
+        Ok(Reply::Error(e)) => http_json(socket, "200 OK", &studio_err_json(e)).await,
+        _ => http_json(socket, "502 Bad Gateway", &studio_err_json("bad CONFIG GET reply")).await,
+    }
+}
+
+/// `/api/config-set?name=<param>&value=<val>` — `CONFIG SET name value`.
+async fn api_config_set(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let (Some(name), Some(value)) = (params.get("name"), params.get("value")) else {
+        return http_json(socket, "400 Bad Request", &studio_err_json("missing name/value")).await;
+    };
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    match c.call(&["CONFIG", "SET", name, value]).await {
+        Ok(Reply::Simple(_)) => http_json(socket, "200 OK", "{\"ok\":true}").await,
+        Ok(Reply::Error(e)) => http_json(socket, "200 OK", &studio_err_json(e)).await,
+        _ => http_json(socket, "502 Bad Gateway", &studio_err_json("bad CONFIG SET reply")).await,
+    }
+}
+
+/// `/api/commands` — the server's live command list via `COMMAND`.
+async fn api_commands(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    match c.call(&["COMMAND"]).await {
+        Ok(Reply::Array(Some(items))) => {
+            let names: Vec<String> = items
+                .iter()
+                .filter_map(|item| match item {
+                    Reply::Array(Some(entry)) => entry
+                        .first()
+                        .map(|n| format!("\"{}\"", json_escape(&studio_reply_str(n).to_uppercase()))),
+                    _ => None,
+                })
+                .collect();
+            http_json(socket, "200 OK", &format!("{{\"commands\":[{}]}}", names.join(","))).await
+        }
+        Ok(Reply::Error(e)) => http_json(socket, "200 OK", &studio_err_json(e)).await,
+        _ => http_json(socket, "502 Bad Gateway", &studio_err_json("bad COMMAND reply")).await,
+    }
+}
+
+/// `/api/exec?cmd=<words>` — run one command, reply as JSON. Args are
+/// whitespace-split (no quoting) — a playground, not a shell.
+async fn api_exec(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let Some(cmd) = params.get("cmd") else {
+        return http_json(socket, "400 Bad Request", &studio_err_json("missing cmd")).await;
+    };
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    if words.is_empty() {
+        return http_json(socket, "400 Bad Request", &studio_err_json("empty cmd")).await;
+    }
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    match c.call(&words).await {
+        Ok(r) => http_json(socket, "200 OK", &format!("{{\"reply\":{}}}", reply_to_json_value(&r))).await,
+        Err(e) => http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    }
+}
+
+/// `/api/live?query=<words>&host=..&port=..` — `LIVE <words...>` on a
+/// dedicated connection, each pushed frame streamed as one JSON line.
+async fn api_live(socket: &mut TcpStream, params: &HashMap<String, String>) -> std::io::Result<()> {
+    let Some(query) = params.get("query") else {
+        return http_json(socket, "400 Bad Request", &studio_err_json("missing query")).await;
+    };
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        return http_json(socket, "400 Bad Request", &studio_err_json("empty query")).await;
+    }
+    let mut c = match studio_connect(params).await {
+        Ok(c) => c,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+    };
+    let mut args = vec!["LIVE"];
+    args.extend(words.iter());
+    let first = match c.call(&args).await {
+        Ok(Reply::Error(e)) => return http_json(socket, "200 OK", &studio_err_json(e)).await,
+        Err(e) => return http_json(socket, "502 Bad Gateway", &studio_err_json(e.to_string())).await,
+        Ok(r) => r,
+    };
+    socket
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+        .await?;
+    // The subscribe reply IS the first `live` frame (current value) —
+    // forward it so the viewer isn't blank until the next write.
+    let line = format!("{{\"frame\":{}}}\n", reply_to_json_value(&first));
+    let chunk = format!("{:x}\r\n{}\r\n", line.len(), line);
+    if socket.write_all(chunk.as_bytes()).await.is_err() {
+        return Ok(());
+    }
+    while let Ok(frame) = c.read_next().await {
+        let line = format!("{{\"frame\":{}}}\n", reply_to_json_value(&frame));
+        let chunk = format!("{:x}\r\n{}\r\n", line.len(), line);
+        if socket.write_all(chunk.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+    let _ = socket.write_all(b"0\r\n\r\n").await;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public sandbox pool (`BENCH_UI_PUBLIC=1`): N small reflexdb-server
+// instances spawned at startup; each visitor's session claims one, the
+// instance is wiped (FLUSHALL) and returned when the session ends or goes
+// idle. Sessions are recorded in SQLite (who had what, when). The pool
+// pins every proxied call to the session's own instance — host/port query
+// params are ignored and `/run-*` spawn endpoints are closed.
+// ---------------------------------------------------------------------------
+
+struct PoolInstance {
+    port: u16,
+    _dir: std::path::PathBuf,
+    _child: tokio::process::Child,
+    free: bool,
+}
+
+struct Pool {
+    instances: Vec<PoolInstance>,
+    sessions: HashMap<String, usize>, // token -> instance index
+    started: HashMap<String, i64>,
+    last_seen: HashMap<String, i64>,
+    session_ip: HashMap<String, String>,
+    db: rusqlite::Connection,
+    idle_s: i64,
+}
+
+static POOL: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<Pool>>> = std::sync::OnceLock::new();
+
+fn now_s() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn new_token() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..24).map(|_| std::char::from_digit(rng.gen_range(0..16), 16).unwrap()).collect()
+}
+
+async fn wait_ready(port: u16, tries: usize) -> bool {
+    for _ in 0..tries {
+        if let Ok(mut c) = RespClient::connect("127.0.0.1", port).await {
+            if c.call(&["PING"]).await.is_ok() {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    false
+}
+
+async fn pool_spawn() -> std::io::Result<()> {
+    let size: usize = std::env::var("BENCH_UI_POOL_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    let base: u16 =
+        std::env::var("BENCH_UI_POOL_BASE_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(21100);
+    let idle_s: i64 =
+        std::env::var("BENCH_UI_SESSION_IDLE_S").ok().and_then(|s| s.parse().ok()).unwrap_or(1200);
+    let maxmem = std::env::var("BENCH_UI_POOL_MAXMEM").unwrap_or_else(|_| "32mb".into());
+    let db_path = std::env::var("BENCH_UI_SESSION_DB")
+        .unwrap_or_else(|_| std::env::temp_dir().join("reflexdb-bench-sessions.db").display().to_string());
+    let server = reflexdb_server_bin();
+
+    let db = rusqlite::Connection::open(&db_path).map_err(|e| std::io::Error::other(e.to_string()))?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sessions(
+            token TEXT PRIMARY KEY, ip TEXT, port INTEGER,
+            started INTEGER, last_seen INTEGER, ended INTEGER);",
+    )
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    let mut instances = Vec::new();
+    for i in 0..size {
+        let port = base + i as u16;
+        let dir = std::env::temp_dir().join(format!("rdb-pool-{}-{i}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let child = Command::new(&server)
+            .args([
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--dir",
+                &dir.display().to_string(),
+                "--appendonly",
+                "no",
+                "--maxmemory",
+                &maxmem,
+            ])
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        instances.push(PoolInstance { port, _dir: dir, _child: child, free: true });
+    }
+    for inst in &instances {
+        if !wait_ready(inst.port, 30).await {
+            warn!("pool instance on port {} not ready", inst.port);
+        }
+    }
+    info!(
+        "sandbox pool: {} instances on ports {}-{} (idle {}s)",
+        instances.len(),
+        base,
+        base + size as u16 - 1,
+        idle_s
+    );
+    POOL.set(std::sync::Arc::new(tokio::sync::Mutex::new(Pool {
+        instances,
+        sessions: HashMap::new(),
+        started: HashMap::new(),
+        last_seen: HashMap::new(),
+        session_ip: HashMap::new(),
+        db,
+        idle_s,
+    })))
+    .map_err(|_| std::io::Error::other("pool already set"))?;
+    Ok(())
+}
+
+/// Allocate a free instance to a new token; `None` when the pool is full.
+fn pool_allocate(pool: &mut Pool, ip: &str) -> Option<String> {
+    let idx = pool.instances.iter().position(|i| i.free)?;
+    let token = new_token();
+    pool.instances[idx].free = false;
+    pool.sessions.insert(token.clone(), idx);
+    let now = now_s();
+    pool.started.insert(token.clone(), now);
+    pool.last_seen.insert(token.clone(), now);
+    pool.session_ip.insert(token.clone(), ip.to_string());
+    let port = pool.instances[idx].port as i64;
+    let _ = pool.db.execute(
+        "INSERT INTO sessions(token,ip,port,started,last_seen) VALUES(?1,?2,?3,?4,?4)",
+        rusqlite::params![token, ip, port, now],
+    );
+    Some(token)
+}
+
+/// Wipe the instance and mark the session ended — the slot goes back to
+/// the pool for the next visitor.
+async fn pool_release(pool: &mut Pool, token: &str) {
+    let Some(idx) = pool.sessions.remove(token) else { return };
+    let port = pool.instances[idx].port;
+    if let Ok(mut c) = RespClient::connect("127.0.0.1", port).await {
+        let _ = c.call(&["FLUSHALL"]).await;
+    }
+    pool.instances[idx].free = true;
+    let now = now_s();
+    let _ = pool.db.execute("UPDATE sessions SET ended=?1 WHERE token=?2", rusqlite::params![now, token]);
+    pool.started.remove(token);
+    pool.last_seen.remove(token);
+    pool.session_ip.remove(token);
+}
+
+async fn pool_reaper() {
+    loop {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let Some(pool) = POOL.get() else { return };
+        let mut pool = pool.lock().await;
+        let cutoff = now_s() - pool.idle_s;
+        let expired: Vec<String> =
+            pool.last_seen.iter().filter(|(_, &t)| t < cutoff).map(|(t, _)| t.clone()).collect();
+        for token in expired {
+            info!("session expired (idle) — instance recycled");
+            pool_release(&mut pool, &token).await;
+        }
+    }
+}
+
+fn session_cookie(request: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(request);
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("Cookie:").or_else(|| line.strip_prefix("cookie:")) {
+            for part in v.split(';') {
+                let part = part.trim();
+                if let Some(t) = part.strip_prefix("rdb_sess=") {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn handle_session(socket: &mut TcpStream, request: &[u8], method: &str) -> std::io::Result<()> {
+    let Some(pool_arc) = POOL.get() else {
+        return http_json(socket, "404 Not Found", &studio_err_json("sandbox pool disabled")).await;
+    };
+    let mut pool = pool_arc.lock().await;
+    let peer_ip = socket.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+    if method == "POST" {
+        if let Some(token) = session_cookie(request) {
+            if pool.sessions.contains_key(&token) {
+                let port = pool.sessions[&token] as i64;
+                pool.last_seen.insert(token.clone(), now_s());
+                let body = format!(
+                    "{{\"session\":\"{}\",\"state\":\"active\",\"instance\":{port}}}",
+                    json_escape(&token)
+                );
+                return http_json(socket, "200 OK", &body).await;
+            }
+        }
+        match pool_allocate(&mut pool, &peer_ip) {
+            Some(token) => {
+                let port = pool.sessions[&token] as i64;
+                let body = format!(
+                    "{{\"session\":\"{}\",\"state\":\"active\",\"instance\":{port},\"idle_s\":{}}}",
+                    json_escape(&token),
+                    pool.idle_s
+                );
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: rdb_sess={token}; Path=/; SameSite=Lax\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len());
+                socket.write_all(head.as_bytes()).await?;
+                return socket.write_all(body.as_bytes()).await;
+            }
+            None => {
+                return http_json(
+                    socket,
+                    "503 Service Unavailable",
+                    &studio_err_json("all sandboxes busy — try again later"),
+                )
+                .await
+            }
+        }
+    }
+    if method == "DELETE" || method == "POST" {
+        if let Some(token) = session_cookie(request) {
+            pool_release(&mut pool, &token).await;
+            return http_json(socket, "200 OK", "{\"state\":\"released\"}").await;
+        }
+    }
+    // GET — session status
+    match session_cookie(request).and_then(|t| pool.sessions.get(&t).map(|i| (t, i))) {
+        Some((token, idx)) => {
+            let port = pool.instances[*idx].port;
+            let idle = pool.idle_s - (now_s() - pool.last_seen.get(&token).copied().unwrap_or(0));
+            http_json(
+                socket,
+                "200 OK",
+                &format!("{{\"state\":\"active\",\"instance\":{port},\"expires_in_s\":{idle}}}"),
+            )
+            .await
+        }
+        None => {
+            let free = pool.instances.iter().filter(|i| i.free).count();
+            http_json(socket, "200 OK", &format!("{{\"state\":\"none\",\"free_sandboxes\":{free}}}")).await
+        }
+    }
+}
+
 async fn handle_connection(socket: &mut TcpStream) -> std::io::Result<()> {
     let mut buf = [0u8; 8192];
     let mut request = Vec::new();
@@ -4057,6 +5107,78 @@ async fn handle_connection(socket: &mut TcpStream) -> std::io::Result<()> {
     let path_query = std::str::from_utf8(parts[1]).unwrap_or("");
     let (path, query) = path_query.split_once('?').map(|(p, q)| (p, Some(q))).unwrap_or((path_query, None));
 
+    // Public sandbox mode: session endpoints, target pinning and lockout
+    // of the local spawn/benchmark routes.
+    if POOL.get().is_some() {
+        if path == "/api/session" {
+            return handle_session(socket, &request, method).await;
+        }
+        if path.starts_with("/run-") {
+            return http_json(
+                socket,
+                "403 Forbidden",
+                &studio_err_json("benchmark spawning is disabled in public sandbox mode"),
+            )
+            .await;
+        }
+        let needs_target = path.starts_with("/api/")
+            || path.starts_with("/live-")
+            || path == "/tiered-demo"
+            || path == "/history-status";
+        if needs_target {
+            let mut params = query.map(parse_query).unwrap_or_default();
+            let Some(pool_arc) = POOL.get() else { unreachable!() };
+            let mut pool = pool_arc.lock().await;
+            let token = session_cookie(&request).unwrap_or_default();
+            match pool.sessions.get(&token).copied() {
+                Some(idx) => {
+                    pool.last_seen.insert(token.clone(), now_s());
+                    let _ = pool.db.execute(
+                        "UPDATE sessions SET last_seen=?1 WHERE token=?2",
+                        rusqlite::params![now_s(), token],
+                    );
+                    let port = pool.instances[idx].port;
+                    drop(pool);
+                    params.insert("host".into(), "127.0.0.1".into());
+                    params.insert("port".into(), port.to_string());
+                }
+                None => {
+                    return http_json(
+                        socket,
+                        "401 Unauthorized",
+                        &studio_err_json("no sandbox session — POST /api/session first"),
+                    )
+                    .await;
+                }
+            }
+            return match (method, path) {
+                ("GET", "/api/keys") => api_keys(socket, &params).await,
+                ("GET", "/api/key") => api_key(socket, &params).await,
+                ("GET", "/api/history") => api_history(socket, &params).await,
+                ("GET", "/api/info") => api_info(socket, &params).await,
+                ("GET", "/api/slowlog") => api_slowlog(socket, &params).await,
+                ("GET", "/api/config") => api_config(socket, &params).await,
+                ("GET", "/api/config-set") => api_config_set(socket, &params).await,
+                ("GET", "/api/live") => api_live(socket, &params).await,
+                ("GET", "/api/commands") => api_commands(socket, &params).await,
+                ("GET", "/api/exec") => api_exec(socket, &params).await,
+                ("GET", "/live-watch") => handle_live_watch(Some(&params_to_query(&params)), socket).await,
+                ("GET", "/live-set") => handle_live_set(Some(&params_to_query(&params)), socket).await,
+                ("GET", "/live-autoset") => {
+                    handle_live_autoset(Some(&params_to_query(&params)), socket).await
+                }
+                ("GET", "/tiered-demo") => handle_tiered_demo(Some(&params_to_query(&params)), socket).await,
+                ("GET", "/history-status") => {
+                    handle_history_status(Some(&params_to_query(&params)), socket).await
+                }
+                _ => {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await?;
+                    Ok(())
+                }
+            };
+        }
+    }
+
     match (method, path) {
         ("GET", "/") => handle_root(socket).await,
         ("GET", "/logo.png") => handle_logo(socket).await,
@@ -4072,6 +5194,18 @@ async fn handle_connection(socket: &mut TcpStream) -> std::io::Result<()> {
         ("GET", "/live-autoset") => handle_live_autoset(query, socket).await,
         ("GET", "/tiered-demo") => handle_tiered_demo(query, socket).await,
         ("GET", "/stats") => handle_stats(socket).await,
+        ("GET", "/api/keys") => api_keys(socket, &query.map(parse_query).unwrap_or_default()).await,
+        ("GET", "/api/key") => api_key(socket, &query.map(parse_query).unwrap_or_default()).await,
+        ("GET", "/api/history") => api_history(socket, &query.map(parse_query).unwrap_or_default()).await,
+        ("GET", "/api/info") => api_info(socket, &query.map(parse_query).unwrap_or_default()).await,
+        ("GET", "/api/slowlog") => api_slowlog(socket, &query.map(parse_query).unwrap_or_default()).await,
+        ("GET", "/api/config") => api_config(socket, &query.map(parse_query).unwrap_or_default()).await,
+        ("GET", "/api/config-set") => {
+            api_config_set(socket, &query.map(parse_query).unwrap_or_default()).await
+        }
+        ("GET", "/api/live") => api_live(socket, &query.map(parse_query).unwrap_or_default()).await,
+        ("GET", "/api/commands") => api_commands(socket, &query.map(parse_query).unwrap_or_default()).await,
+        ("GET", "/api/exec") => api_exec(socket, &query.map(parse_query).unwrap_or_default()).await,
         _ => {
             socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await?;
             Ok(())
@@ -4087,6 +5221,12 @@ async fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| "127.0.0.1:8080".parse().unwrap());
+
+    if std::env::var("BENCH_UI_PUBLIC").is_ok_and(|v| v == "1") {
+        pool_spawn().await?;
+        tokio::spawn(pool_reaper());
+        info!("public sandbox mode: /api/* pinned to per-session instances; /run-* disabled");
+    }
 
     let listener = TcpListener::bind(bind).await?;
     info!("reflexdb-bench-ui listening on http://{bind}");

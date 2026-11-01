@@ -1,169 +1,227 @@
-# reflexdb
+<div align="center">
 
-A database that speaks RESP and explores recoverable live state for long-running
-workflows, written in **Rust**. The current prototype combines live query updates
-(`LIVE` / `UNLIVE`), optional per-key string history (`GETAT` / `HISTORY`), and tiered storage.
+# ⚡ ReflexDB
 
-The product hypothesis is that developers need to inspect and recover workflow state after a
-bad step, while still using a fast shared store. This is a hypothesis, not a validated market
-position. ReflexDB has not established a speed, memory, or cost advantage across representative
-production workloads. See
-[the product direction](docs/PRODUCT_DIRECTION.md) and [benchmark notes](docs/BENCHMARKS.md).
+### _The state store that lets you **watch** it change and **rewind** it._
 
-RESP2/RESP3 compatibility is intended to make experiments easier; an optional binary wire
-format, [RFX](docs/RFX.md), is auto-detected per connection for clients that want it. Command
-and behavior coverage is limited and should be checked before use.
+A **RESP-compatible**, **Rust-native** data store with three things Redis doesn't have:
+**live query push**, **per-key time travel**, and **RAM→disk tiering**.
 
-Everything is original Rust code.
+[![License: BUSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
+[![Built in Rust](https://img.shields.io/badge/built%20in-Rust-orange.svg)](https://www.rust-lang.org)
+[![Protocol: RESP](https://img.shields.io/badge/protocol-RESP2%2F3%20%2B%20RFX-green.svg)](docs/RFX.md)
+[![Benchmarks](https://img.shields.io/badge/led%20all%208%20shootout%20cells-ReflexDB-brightgreen.svg)](docs/BENCHMARKS.md)
 
-## Demo
+**`SET` it. `LIVE` it. `GETAT` yesterday.**
 
-[▶ Watch the demo recording](docs/assets/demo.mov)
+</div>
 
-## Quick start
+---
 
-Build and run the server (requires the Rust toolchain — [rustup.rs](https://rustup.rs)):
+## 🔥 Why ReflexDB
+
+Your background job wrote a **wrong value at 3am**. With any other fast store, that state is
+*gone*. With ReflexDB:
+
+```text
+> HISTORY job:123        ← every version the key ever had
+> GETAT job:123 <ts>     ← the value *before* the bad deploy
+> LIVE GET job:status    ← pushed the new result on every write, no polling
+```
+
+- 🔴 **`LIVE` / `UNLIVE`** — subscribe to a *query's result*, get pushed every change.
+  A dedicated fan-out thread + configurable sweep/pace windows keep 5,000 watchers at
+  **~3.3k writes/s, p50 ≈ 150µs** — without taxing connections that subscribe to nothing.
+- ⏪ **`GETAT` / `HISTORY`** — per-key version history, disk-backed, TTL'd, capped.
+  *"What did this key look like before the incident?"* is now a one-word answer.
+- 💾 **Tiered storage** — cold keys spill to a `fjall` LSM disk tier and promote back on
+  read. Working set **>** RAM budget. Full tier? Your call: `reject-writes`,
+  `evict-oldest`, or `no-limit`.
+- 🛡️ **Hardened** — real ACL enforcement (`+@categories`, `%R~`/`%W~` key scopes),
+  `port 0` TLS-only mode, `MISCONF` on AOF failure, `SHUTDOWN` + signal-graceful exit.
+- 🔄 **Durable your way** — `profile cache | durable | replicated` presets,
+  `min-replicas-to-write`, `WAIT`/`WAITAOF` ack points, compressed RDB + AOF.
+- 🔌 **Drop-in RESP** — point `redis-cli` at it. Optional **RFX** binary wire format
+  auto-detected per connection for clients that want less parsing.
+
+---
+
+## 🚀 Try it in 5 minutes
+
+No experience needed — three steps.
+
+**1️⃣ Install Rust** (skip if you already have it):
 
 ```sh
-git clone <this-repo>
-cd reflexdb
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+**2️⃣ Build & run:**
+
+```sh
+git clone <this-repo> && cd reflexdb
 cargo build --release
 ./target/release/reflexdb-server reflexdb.conf
 ```
 
-By default it listens on `127.0.0.1:7379`. Try supported commands with `redis-cli` or another RESP client:
+You should see `reflexdb-server listening addr=127.0.0.1:7379`. That's it — the database is up.
+Prefer Docker? `docker build -t reflexdb . && docker run -p 7379:6379 reflexdb`.
+
+**3️⃣ Talk to it.** You already have a client: `redis-cli` ships with Redis and with
+`brew install redis` on macOS — and ReflexDB speaks the same protocol:
 
 ```sh
-redis-cli -p 7379 set foo bar
-redis-cli -p 7379 get foo
+redis-cli -p 7379 set foo bar     # OK
+redis-cli -p 7379 get foo         # "bar"
 ```
 
-Or use the bundled CLI instead of `redis-cli`:
+Or use the built-in CLI: `cargo run --release --bin reflexdb-cli -- -p 7379`
 
-```sh
-cargo run --release --bin reflexdb-cli -- -p 7379
-```
+---
 
-Try the live query prototype:
+## 🎮 The fun part — 3 things to try right now
 
-```sh
-# LIVE: subscribe to a command's result, get pushed the new result on every change
+### 🔴 1. Watch a key change *live* (no polling)
+
+Open **two terminals**, run `redis-cli -p 7379` in each:
+
+```text
+Terminal 1                          Terminal 2
 > LIVE GET foo
-1) "live"  2) "fingerprint"  3) "<hex crc64>"  4) "result"  5) "bar"
-# (from another connection) SET foo baz  →  pushes an updated result automatically
+1) "live"  2) "fingerprint"
+3) "<crc64>"  4) "result"
+5) "bar"
 
-# Tiered storage: evicted keys spill to disk instead of being dropped, and
-# come back transparently on the next read. Turn it on in reflexdb.conf:
-#   tiered-storage yes
-#   tiered-memory-limit 250mb
+                                    > SET foo changed!
+  ← pushed automatically: 5) "changed!"
 ```
 
-See `reflexdb.conf` in the repo root for all config directives (passwords, persistence,
-replication, TLS, etc.), and [docs/COMMANDS.md](docs/COMMANDS.md) for the full command list.
+Every write anywhere instantly pushes the new result to every watcher. `UNLIVE` to stop.
 
-Run the test suite with `cargo test`, or build the production Docker image with
-`docker build -t reflexdb .`.
+### ⏪ 2. Travel back in time
 
-To try the server together with the visual benchmark UI in one go:
+History is on by default (`history-enabled yes` in `reflexdb.conf` — set `no` to save the
+per-write disk I/O). With it running:
+
+```text
+> SET job:status running
+> SET job:status crashed
+> HISTORY job:status          ← every version + when it was written
+> GETAT job:status <earlier>  ← the value *before* the crash
+```
+
+### 💾 3. Store more than your RAM
+
+```text
+# in reflexdb.conf:
+tiered-storage yes
+tiered-memory-limit 250mb     # hot keys stay in RAM
+tiered-disk-limit 2gb         # cold keys spill to disk — reads bring them back
+```
+
+RAM fills? Oldest keys move to disk *instead of being dropped*. Disk full too? The
+`tiered-overflow-policy` decides: `reject-writes` (safe, nothing lost),
+`evict-oldest` (cache semantics), or `no-limit`.
+
+### 🧪 …or just click around in the browser
+
+**reflexdb-bench-ui** — the web UI for *everything*: benchmarks, demos, and Studio:
 
 ```sh
-cargo build --release --bin reflexdb-server --bin reflexdb-bench-ui && \
-./target/release/reflexdb-server reflexdb.conf & BENCH_UI_BIND=127.0.0.1:8080 ./target/release/reflexdb-bench-ui
+cargo build --release --bin reflexdb-server --bin reflexdb-bench-ui
+./target/release/reflexdb-server reflexdb.conf &
+BENCH_UI_BIND=127.0.0.1:8080 ./target/release/reflexdb-bench-ui
 ```
 
-Then open `http://127.0.0.1:8080` and pick a workload tab.
+Open `http://127.0.0.1:8080` — run workloads, watch latency charts, fire the
+**LIVE fan-out demo**, fill the disk tier in the **tiered overflow demo**, and
+pit Redis vs Dragonfly vs ReflexDB in the **Engine Shootout** tab. Then flip to
+the **Studio** tab to inspect the data those runs just wrote: **key browser**
+with pattern search, **value inspector** (strings, hashes, lists, sets, zsets,
+streams), **history timeline** with two-version diff + JSON/CSV export,
+**LIVE query viewer**, **health dashboard** (memory, disk, replication, AOF),
+and the **slowlog**. No commands to memorize.
 
-## What's new
+**Public sandbox mode** — let visitors try ReflexDB without touching your server. A
+warm pool of throwaway `reflexdb-server` instances is checked out one per browser
+session, wiped (`FLUSHALL`) and recycled on release or idle expiry; every session
+is logged to sqlite. Disabled by default — enable with env vars:
 
-- **Engine shootout benchmark** — a tab in `reflexdb-bench-ui` that runs Redis, Dragonfly, and
-  ReflexDB side by side in Docker, each under the same `--memory`/`--cpus` cap, and charts
-  throughput/tail latency per workload so engines are compared directly, bar-for-bar, instead of
-  across separate reports. See [the real numbers below](#one-real-comparison-so-far).
-- **Resource-limit (OOM/disk-full) test** — runs `reflexdb-server` in Docker with a real
-  OS-enforced memory cap and a size-capped disk mount at the same time, and reports whether/why it
-  stops responding, rather than relying on `maxmemory`'s own graceful degradation.
-- **Durability / crash-recovery test** — force-kills a running server (`SIGKILL`) under write load
-  per `appendfsync` policy and compares acknowledged writes to what AOF replay actually recovered.
-- **Tiered storage demo** and **LIVE demo** tabs in the same UI, for watching eviction-to-disk and
-  push updates happen in real time against a running server.
-- `appendfsync` now defaults explicitly to `no` (fastest, OS decides when to flush) instead of
-  silently behaving like `everysec` — set it explicitly in `reflexdb.conf` if you need a bounded
-  worst case (see the comments in `reflexdb.conf`).
+```sh
+BENCH_UI_BIND=0.0.0.0:8080 \
+BENCH_UI_POOL_SIZE=10 \          # sandboxes kept warm (max concurrent visitors)
+BENCH_UI_PORT_BASE=21100 \       # sandbox instances listen on 21100+
+BENCH_UI_SESSION_IDLE_SECS=300 \ # idle sessions expire and recycle
+BENCH_UI_SESSION_DB=/var/lib/reflexdb/sessions.db \
+./target/release/reflexdb-bench-ui
+```
 
-### One real comparison so far
+In public mode `/run-*` benchmark endpoints are blocked and `/api/*` needs a
+session cookie (`POST /api/session` issues one; the Studio page does this
+automatically). Put it behind TLS (Caddy/nginx) and add a per-IP rate limit
+before exposing it — each pool slot is real RAM.
 
-Redis, Dragonfly, and ReflexDB were tested in Docker with the same 2 GiB memory
-cap, 16 clients, and workloads, running one engine at a time (median of 3 runs per case).
-Pipeline depth 16 delivered roughly 9–10× the throughput of depth 1. ReflexDB led all eight
-cases on an idle host, and again on a loaded-host rerun with an unrelated container stack
-running alongside — all three engines within ~±15% of each other. Repeat the test before drawing firm
-performance conclusions. See
-[the benchmark setup and results](docs/BENCHMARKS.md#engine-shootout-reflexdb-vs-redis-vs-dragonfly).
+---
 
-### Where ReflexDB may fit better
+## 📊 Benchmarks — measured, not claimed
 
-The throughput comparison tests basic commands. ReflexDB also combines capabilities that can help
-when a workload needs them:
+Redis 7 · Dragonfly · ReflexDB — same Docker caps (2 GiB, `--cpus`), same clients,
+same workloads, median of 3. On a loaded host:
 
-- **Disk-backed tiering:** cold keys can move from RAM to a Fjall disk store and promote on access,
-  letting the working set exceed the RAM budget. Cold reads trade latency for memory savings.
-- **Live query results:** `LIVE` pushes updated results of supported read-only commands, reducing
-  application polling. Slow connections can miss intermediate updates; query reevaluation adds
-  work to writes for watched keys.
-- **History:** optional disk-backed string versions support `GETAT` and `HISTORY` for inspection.
-  Age retention defaults to 24 hours (`history-retention-ms 0` disables age expiry); the per-key
-  cap defaults to 200 (`history-max-versions-per-key`). This is not a complete workflow
-  checkpoint or rollback guarantee.
-- **Persistence and replication:** compressed RDB/AOF files can reduce disk use; primary/replica
-  replication supports `WAIT`/`WAITAOF` acknowledgements. Replication currently uses full resyncs.
+| | Pipeline 1 | Pipeline 16 |
+|---|--:|--:|
+| small-mixed, 1 CPU | **ReflexDB — 17,249** ops/s | **ReflexDB — 149,301** ops/s |
+| hot-key, 4 CPUs | **ReflexDB — 16,866** ops/s | **ReflexDB — 163,143** ops/s |
 
-The Docker shootout does not measure tiering, history, persistence, `LIVE`, or replication. Its
-results describe basic command throughput only.
+**ReflexDB led all eight shootout cells** — plus all five aggressive cases
+(64 clients, deep P64 pipelines, 100k keys, 8 KiB values). All engines within ~±15%;
+*one machine, one session — re-measure before quoting.*
+Full tables: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-## Vision
+---
 
-ReflexDB's bet: most teams running long-lived or multi-step workflows (agents, pipelines, job
-queues) eventually hit the same wall — a step fails or produces bad state, and nothing in their
-fast shared store tells them what changed, which step changed it, or how to get back to a
-known-good point. Today that means bolting on separate logging, snapshotting, or event-sourcing
-infrastructure next to whatever cache/store they already run. The idea is one RESP-compatible store
-that is fast enough to use as the primary hot path *and* keeps enough history/rewind machinery
-(`LIVE`, `GETAT`/`HISTORY`, tiered storage) to answer "what changed and how do I recover" without a
-second system. This is a hypothesis, not a finished product: see
-[docs/PRODUCT_DIRECTION.md](docs/PRODUCT_DIRECTION.md) for what's validated, what's still a guess,
-and what we're explicitly not building yet.
+## 🧰 The fleet
 
-## Product direction (hypothesis)
+| Binary | What it does |
+|--------|--------------|
+| 🗄️ `reflexdb-server` | **The database itself.** |
+| 🔀 `reflexdb-proxy` | Zero-parsing pass-through relay in front of an *existing* RESP server — try ReflexDB without migrating a byte. |
+| 🚨 `reflexdb-sentinel` | Automatic failover watcher for primary/replica groups. |
+| 💻 `reflexdb-cli` | Interactive CLI client. |
+| 📈 `reflexdb-bench-ui` | Local web UI — workloads, latency charts, LIVE/tiered demos, engine shootout, **plus Studio** (key browser, value inspector, history timeline + diff/export, LIVE viewer, health, slowlog). |
 
-The first customer problem to test is recovering and inspecting state in long-running workflows:
-what changed, which step changed it, and how to resume from a known-good point. The current
-prototype does not provide a complete workflow checkpoint or rollback guarantee. `LIVE` and
-`GETAT`/`HISTORY` are experiments that may help prove the idea, not finished promises. See
-[docs/PRODUCT_DIRECTION.md](docs/PRODUCT_DIRECTION.md) for the validation plan and scope.
+---
 
-## Binaries
-
-| Binary | Purpose |
-|--------|---------|
-| `reflexdb-server` | The database itself. |
-| `reflexdb-proxy` | A pass-through relay (`--listen`/`--upstream`) that sits in front of an *existing* RESP-compatible server — pure byte splice, no RESP parsing, zero data migration required to try. Doesn't add any feature on its own yet — it's the foundation a future `LIVE`/single-flight-at-the-proxy layer would sit on top of. |
-| `reflexdb-sentinel` | Automatic failover watcher for a monitored primary/replica group. |
-| `reflexdb-cli` | Interactive CLI client. |
-| `reflexdb-bench-ui` | Local web UI for running and comparing workloads against a running server, with editable pipeline/concurrency/fan-out settings and p50/p99/p999 latency charts. |
-
-## Documentation Index
+## 📚 Docs
 
 | File | Contents |
 |------|----------|
-| [docs/FEATURES.md](docs/FEATURES.md) | Everything reflexdb has today: data types, persistence, replication, security, scripting, `LIVE`, time travel, single-flight |
-| [docs/COMMANDS.md](docs/COMMANDS.md) | Full command reference, grouped, with what's cut/planned vs. implemented |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, concurrency model, internals, dependency choices |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Focused sequence of product and engineering decisions |
-| [docs/PRODUCT_DIRECTION.md](docs/PRODUCT_DIRECTION.md) | Customer hypothesis, validation plan, and proposed scope |
-| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Development measurements and reproducibility notes |
+| [docs/FEATURES.md](docs/FEATURES.md) | Everything shipped: types, persistence, security, LIVE, time travel, tiering |
+| [docs/COMMANDS.md](docs/COMMANDS.md) | Full command reference — implemented vs. planned, honestly labeled |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, concurrency model, commit order, internals |
+| [docs/SECURITY.md](docs/SECURITY.md) | Threat model, ACL semantics, known gaps — *read this before prod* |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Numbers above, reproduced |
+| [docs/TIERED.md](docs/TIERED.md) | RAM→disk tiering and the overflow policies |
+| [docs/RFX.md](docs/RFX.md) | The binary wire format |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Product and engineering sequence |
+| [docs/PRODUCT_DIRECTION.md](docs/PRODUCT_DIRECTION.md) | The hypothesis, validation plan, what we're *not* building |
 
-## Compatibility
+---
 
-ReflexDB implements a subset of the Redis command protocol over RESP. Compatibility varies by
-command and behavior; check [docs/COMMANDS.md](docs/COMMANDS.md) before connecting an application.
-We write our own implementation from scratch.
+## 🧭 Honest status
+
+- This is a **prototype with a hypothesis**: long-running workflows (agents, pipelines, job
+  queues) need a fast store that can *also* answer _"what changed and how do I recover"_ —
+  without bolting on separate logging/snapshot/event-sourcing infra. Not yet a validated
+  product; see [docs/PRODUCT_DIRECTION.md](docs/PRODUCT_DIRECTION.md).
+- Command coverage is a **subset** of Redis — check [docs/COMMANDS.md](docs/COMMANDS.md)
+  before pointing an app at it.
+- Memory-first store. Durability is configurable (`profile durable`), but this is not a
+  system of record.
+- Everything here is **original Rust** — no borrowed Redis code.
+
+## 📜 License
+
+**Business Source License 1.1** — free for essentially everything, including production
+use, *except* offering ReflexDB to third parties as a hosted/managed service. Converts to
+**Apache-2.0** four years after each release. See [LICENSE](LICENSE).

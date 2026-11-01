@@ -111,6 +111,21 @@ pub struct Config {
     pub tls_port: u16,
     pub tls_cert_file: Option<PathBuf>,
     pub tls_key_file: Option<PathBuf>,
+    /// `tls-ca-cert-file`: CA bundle (PEM) that client certificates
+    /// (`tls-auth-clients`) and the primary's certificate
+    /// (`tls-replication`) are verified against. There is no system-roots
+    /// fallback — an explicit file keeps the trust source obvious.
+    pub tls_ca_cert_file: Option<PathBuf>,
+    /// `tls-auth-clients yes/no` (mTLS): clients on `tls-port` must present
+    /// a certificate chaining to `tls-ca-cert-file`. Requires
+    /// `tls-ca-cert-file`.
+    pub tls_auth_clients: bool,
+    /// `tls-replication yes/no`: wrap the outbound replica→primary link in
+    /// TLS (the replica dials the primary's `tls-port`). Requires
+    /// `tls-ca-cert-file`; the replica's `tls-cert-file`/`tls-key-file`
+    /// double as its client certificate when the primary runs
+    /// `tls-auth-clients`.
+    pub tls_replication: bool,
     /// `notify-keyspace-events` — raw flag string (parsed into
     /// `NotifyFlags` once, in `main.rs`, when building `ServerContext`).
     pub notify_keyspace_events: String,
@@ -149,11 +164,19 @@ pub struct Config {
     pub replica_backlog_max_bytes: usize,
     /// `repl-slow-disconnect-delay-ms`: how long a replica can stay
     /// flagged slow before its connection is actually dropped (forcing a
-    /// full resync on reconnect). Default `5000` (5s). Pro of a longer
+    /// resync on reconnect). Default `5000` (5s). Pro of a longer
     /// delay: survives a brief network blip without losing the link. Con:
     /// a replica that's behind keeps counting as connected (for `WAIT`/
     /// `CLIENT LIST`) for longer before being cut loose.
     pub replica_slow_disconnect_ms: u64,
+    /// `partial-resync-backlog`: bytes of the replicated command stream
+    /// kept on the primary so a replica that reconnects with a still-
+    /// covered offset catches up incrementally (`PSYNC` → `+CONTINUE`)
+    /// instead of re-fetching a full snapshot. Default `1mb` (same as
+    /// Redis's `repl-backlog-size`). Pro of a larger value: longer
+    /// replica outages still resync incrementally. Con: that much extra
+    /// memory held on the primary. `0` disables partial resync.
+    pub partial_resync_backlog: usize,
     /// `live-sweep-ms`: idle gap between LIVE fan-out sweeps — writes
     /// landing in the gap dedup into one re-evaluation. Default `10`.
     /// Pro of a larger value: less fan-out CPU under a sustained write
@@ -168,6 +191,13 @@ pub struct Config {
     pub live_pace_chunk: usize,
     /// `live-pace-ms`: yield length per `live-pace-chunk` writes. Default `1`.
     pub live_pace_ms: u64,
+    /// `aclfile`: path to an ACL file in Redis format (`user <name>
+    /// <rules>` per line). Loaded at startup — a missing file warns and
+    /// starts with the in-memory defaults, a malformed file refuses to
+    /// start. `ACL SAVE` writes the live table back here; `ACL LOAD`
+    /// re-reads it. Resolved as given (cwd-relative or absolute), not
+    /// relative to `dir`.
+    pub acl_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -201,8 +231,11 @@ impl Default for Config {
             tls_port: 0,
             tls_cert_file: None,
             tls_key_file: None,
+            tls_ca_cert_file: None,
+            tls_auth_clients: false,
+            tls_replication: false,
             notify_keyspace_events: String::new(),
-            history_enabled: false,
+            history_enabled: true,
             history_dir: PathBuf::from("history"),
             history_retention_ms: 24 * 60 * 60 * 1000,
             history_max_versions_per_key: 200,
@@ -211,9 +244,11 @@ impl Default for Config {
             replica_backlog_size: 32_768,
             replica_backlog_max_bytes: 64 * 1024 * 1024,
             replica_slow_disconnect_ms: 5_000,
+            partial_resync_backlog: 1024 * 1024,
             live_sweep_ms: 10,
             live_pace_chunk: 64,
             live_pace_ms: 1,
+            acl_file: None,
         }
     }
 }
@@ -383,6 +418,9 @@ impl Config {
             "tls-port" => self.tls_port = value.parse().map_err(|_| format!("invalid tls-port: {value}"))?,
             "tls-cert-file" => self.tls_cert_file = Some(PathBuf::from(value)),
             "tls-key-file" => self.tls_key_file = Some(PathBuf::from(value)),
+            "tls-ca-cert-file" => self.tls_ca_cert_file = Some(PathBuf::from(value)),
+            "tls-auth-clients" => self.tls_auth_clients = value.eq_ignore_ascii_case("yes"),
+            "tls-replication" => self.tls_replication = value.eq_ignore_ascii_case("yes"),
             "notify-keyspace-events" => self.notify_keyspace_events = value.to_string(),
             "history-enabled" => self.history_enabled = value.eq_ignore_ascii_case("yes"),
             "history-dir" => self.history_dir = PathBuf::from(value),
@@ -411,6 +449,7 @@ impl Config {
                     value.parse().map_err(|_| format!("invalid repl-backlog-size: {value}"))?
             }
             "repl-backlog-max-bytes" => self.replica_backlog_max_bytes = parse_memory(value)? as usize,
+            "partial-resync-backlog" => self.partial_resync_backlog = parse_memory(value)? as usize,
             "repl-slow-disconnect-delay-ms" => {
                 self.replica_slow_disconnect_ms =
                     value.parse().map_err(|_| format!("invalid repl-slow-disconnect-delay-ms: {value}"))?
@@ -425,6 +464,7 @@ impl Config {
             "live-pace-ms" => {
                 self.live_pace_ms = value.parse().map_err(|_| format!("invalid live-pace-ms: {value}"))?
             }
+            "aclfile" => self.acl_file = Some(PathBuf::from(value)),
             other => {
                 tracing::warn!("ignoring unsupported config directive: {other}");
             }
@@ -466,6 +506,7 @@ mod tests {
             ("repl-backlog-size", "1024"),
             ("repl-backlog-max-bytes", "16mb"),
             ("repl-slow-disconnect-delay-ms", "1500"),
+            ("partial-resync-backlog", "4mb"),
         ]))
         .unwrap();
         assert_eq!(cfg.maxclients, 500);
@@ -475,6 +516,7 @@ mod tests {
         assert_eq!(cfg.replica_backlog_size, 1024);
         assert_eq!(cfg.replica_backlog_max_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.replica_slow_disconnect_ms, 1500);
+        assert_eq!(cfg.partial_resync_backlog, 4 * 1024 * 1024);
     }
 
     #[test]
@@ -509,6 +551,24 @@ mod tests {
         assert!(Config::from_args(args(&[("maxclients", "0")])).is_err());
         assert!(Config::from_args(args(&[("eviction-low-watermark", "0")])).is_err());
         assert!(Config::from_args(args(&[("eviction-low-watermark", "1.5")])).is_err());
+    }
+
+    #[test]
+    fn tls_directives_parse() {
+        let cfg = Config::from_args(args(&[
+            ("tls-port", "7378"),
+            ("tls-ca-cert-file", "/etc/ca.pem"),
+            ("tls-auth-clients", "yes"),
+            ("tls-replication", "yes"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.tls_port, 7378);
+        assert_eq!(cfg.tls_ca_cert_file, Some(PathBuf::from("/etc/ca.pem")));
+        assert!(cfg.tls_auth_clients);
+        assert!(cfg.tls_replication);
+
+        let cfg = Config::default();
+        assert!(!cfg.tls_auth_clients && !cfg.tls_replication && cfg.tls_ca_cert_file.is_none());
     }
 
     #[test]

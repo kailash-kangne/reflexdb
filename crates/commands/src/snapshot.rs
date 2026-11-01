@@ -16,10 +16,10 @@ use crate::dispatch::{
 };
 
 pub fn cmd_save(ctx: &ServerContext) -> Outcome {
-    let Some(path) = &ctx.rdb_path else {
+    let Some(path) = ctx.rdb_path() else {
         return err("ERR no RDB file configured (set `dir`/`dbfilename` or pass --dbfilename)");
     };
-    match persistence::rdb::save(path, &ctx.store) {
+    match persistence::rdb::save(&path, &ctx.store) {
         Ok(()) => {
             ctx.mark_saved();
             reply(Value::ok())
@@ -29,7 +29,7 @@ pub fn cmd_save(ctx: &ServerContext) -> Outcome {
 }
 
 pub fn cmd_bgsave(ctx: &ServerContext) -> Outcome {
-    let Some(path) = &ctx.rdb_path else {
+    let Some(path) = ctx.rdb_path() else {
         return err("ERR no RDB file configured (set `dir`/`dbfilename` or pass --dbfilename)");
     };
     // Unlike `SAVE`, `BGSAVE` must not block the caller for the write+rename
@@ -78,7 +78,8 @@ pub fn cmd_lastsave(ctx: &ServerContext) -> Outcome {
 /// replies as soon as the rewrite is queued, not once the file swap has
 /// actually happened on the writer thread.
 pub fn cmd_bgrewriteaof(ctx: &ServerContext) -> Outcome {
-    let (Some(writer), Some(path)) = (&ctx.aof, &ctx.aof_path) else {
+    let aof = ctx.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (Some(writer), Some(path)) = (&*aof, &ctx.aof_path) else {
         return err("ERR no append only file configured (set `appendonly yes`)");
     };
     if let Err(e) = writer.begin_rewrite() {

@@ -1,6 +1,7 @@
 mod replica_link;
 mod tls;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,33 @@ async fn main() -> std::io::Result<()> {
             eprintln!("reflexdb-server: {e}");
             std::process::exit(1);
         }
+    };
+
+    // TLS directives that can't be satisfied are a broken security
+    // configuration — fail startup rather than silently downgrade.
+    if cfg.tls_ca_cert_file.is_none() && (cfg.tls_auth_clients || cfg.tls_replication) {
+        eprintln!("reflexdb-server: tls-auth-clients and tls-replication both require tls-ca-cert-file");
+        std::process::exit(1);
+    }
+    if cfg.tls_auth_clients && cfg.tls_port == 0 {
+        eprintln!("reflexdb-server: tls-auth-clients set but tls-port is disabled");
+        std::process::exit(1);
+    }
+
+    let replica_tls = if cfg.tls_replication {
+        // `tls_ca_cert_file` presence was validated above.
+        let ca = cfg.tls_ca_cert_file.as_deref().expect("validated above");
+        // The replica's own tls-cert-file/tls-key-file double as its client
+        // certificate for primaries running tls-auth-clients.
+        match tls::build_connector(ca, cfg.tls_cert_file.as_deref(), cfg.tls_key_file.as_deref()) {
+            Ok(connector) => Some(connector),
+            Err(e) => {
+                eprintln!("reflexdb-server: tls-replication: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
     };
 
     if let Err(e) = std::fs::create_dir_all(&cfg.dir) {
@@ -62,7 +90,77 @@ async fn main() -> std::io::Result<()> {
             Duration::from_millis(cfg.replica_slow_disconnect_ms),
         )
         .with_min_replicas_to_write(cfg.min_replicas_to_write)
-        .with_live_pacing(cfg.live_sweep_ms, cfg.live_pace_chunk, cfg.live_pace_ms);
+        .with_partial_resync_backlog(cfg.partial_resync_backlog)
+        .with_live_pacing(cfg.live_sweep_ms, cfg.live_pace_chunk, cfg.live_pace_ms)
+        .with_acl_file(cfg.acl_file.clone())
+        .with_maxclients(cfg.maxclients)
+        // Always record where these would live so `CONFIG SET
+        // appendonly|history-enabled yes` can open them lazily.
+        .with_aof_config(cfg.aof_path(), cfg.appendfsync)
+        .with_history_config(cfg.history_dir_path(), cfg.history_max_versions_per_key)
+        // Startup-only directives `CONFIG GET *` reports read-only (the
+        // runtime-settable ones are emitted from their live state instead).
+        .with_config_display({
+            let yn = |b: bool| if b { "yes" } else { "no" }.to_string();
+            let opt = |o: Option<u64>| o.map(|n| n.to_string()).unwrap_or_default();
+            let path = |o: &Option<PathBuf>| o.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+            vec![
+                ("bind".into(), cfg.bind.clone()),
+                ("port".into(), cfg.port.to_string()),
+                ("proto-max-bulk-len".into(), cfg.proto_max_bulk_len.to_string()),
+                ("profile".into(), cfg.profile.clone().unwrap_or_default()),
+                ("tiered-storage".into(), yn(cfg.tiered_storage)),
+                ("tiered-memory-limit".into(), cfg.tiered_memory_limit.to_string()),
+                ("tiered-dir".into(), cfg.tiered_dir_path().display().to_string()),
+                ("tiered-disk-limit".into(), opt(cfg.tiered_disk_limit)),
+                ("tiered-overflow-policy".into(), cfg.tiered_overflow_policy.name().to_string()),
+                ("eviction-tick-ms".into(), cfg.eviction_tick_ms.to_string()),
+                ("eviction-low-watermark".into(), cfg.eviction_low_watermark.to_string()),
+                ("eviction-max-per-tick".into(), cfg.max_evictions_per_tick.to_string()),
+                ("singleflight-max-wait-ms".into(), cfg.singleflight_max_wait_ms.to_string()),
+                (
+                    "replicaof".into(),
+                    cfg.replicaof.as_ref().map(|(h, p)| format!("{h} {p}")).unwrap_or_default(),
+                ),
+                ("tls-port".into(), cfg.tls_port.to_string()),
+                ("tls-cert-file".into(), path(&cfg.tls_cert_file)),
+                ("tls-key-file".into(), path(&cfg.tls_key_file)),
+                ("tls-ca-cert-file".into(), path(&cfg.tls_ca_cert_file)),
+                ("tls-auth-clients".into(), yn(cfg.tls_auth_clients)),
+                ("tls-replication".into(), yn(cfg.tls_replication)),
+                ("history-dir".into(), cfg.history_dir_path().display().to_string()),
+                ("history-retention-ms".into(), cfg.history_retention_ms.to_string()),
+                ("history-max-versions-per-key".into(), cfg.history_max_versions_per_key.to_string()),
+                ("repl-backlog-size".into(), cfg.replica_backlog_size.to_string()),
+                ("repl-backlog-max-bytes".into(), cfg.replica_backlog_max_bytes.to_string()),
+                ("partial-resync-backlog".into(), cfg.partial_resync_backlog.to_string()),
+                ("repl-slow-disconnect-delay-ms".into(), cfg.replica_slow_disconnect_ms.to_string()),
+                ("live-sweep-ms".into(), cfg.live_sweep_ms.to_string()),
+                ("live-pace-chunk".into(), cfg.live_pace_chunk.to_string()),
+                ("live-pace-ms".into(), cfg.live_pace_ms.to_string()),
+            ]
+        });
+
+    // `aclfile`: a missing file just means "not saved yet" — the in-memory
+    // defaults (requirepass-derived `default` user) still apply and the
+    // first `ACL SAVE` creates it. A file that exists but won't parse is a
+    // broken security configuration: refuse to start rather than silently
+    // boot with different users than the operator asked for.
+    if let Some(path) = &cfg.acl_file {
+        if path.exists() {
+            match ctx.load_acl_users(path) {
+                Ok(count) => {
+                    tracing::info!(users = count, path = %path.display(), "loaded ACL file")
+                }
+                Err(e) => {
+                    eprintln!("reflexdb-server: {e}");
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            tracing::warn!(path = %path.display(), "aclfile does not exist; using in-memory users (ACL SAVE will create it)");
+        }
+    }
 
     if cfg.history_enabled {
         match persistence::history::HistoryWriter::open_with_limit(
@@ -238,7 +336,7 @@ async fn main() -> std::io::Result<()> {
     // but `dispatch()` (called synchronously from any connection) doesn't.
     {
         let ctx = ctx.clone();
-        tokio::spawn(replica_link::supervise(ctx));
+        tokio::spawn(replica_link::supervise(ctx, replica_tls));
     }
     if let Some((host, port)) = cfg.replicaof.clone() {
         let mut scratch = ClientState::with_id(0, false);
@@ -257,7 +355,11 @@ async fn main() -> std::io::Result<()> {
     let mut tls_listening = false;
     if cfg.tls_port != 0 {
         match (&cfg.tls_cert_file, &cfg.tls_key_file) {
-            (Some(cert), Some(key)) => match tls::build_acceptor(cert, key) {
+            (Some(cert), Some(key)) => match tls::build_acceptor(
+                cert,
+                key,
+                cfg.tls_auth_clients.then_some(cfg.tls_ca_cert_file.as_deref()).flatten(),
+            ) {
                 Ok(acceptor) => {
                     tls_listening = true;
                     let ctx = ctx.clone();
@@ -381,7 +483,7 @@ where
     let mut writer: Option<Arc<commands::ClientWriter>> = None;
     let _guard = ClientGuard { ctx: ctx.clone(), id };
 
-    let mut state = ClientState::with_id(id, ctx.requirepass.is_some());
+    let mut state = ClientState::with_id(id, ctx.auth_required());
     let mut out = BytesMut::new();
     let mut replica_pushes: Option<tokio::sync::mpsc::Receiver<commands::ReplicaMessage>> = None;
 
@@ -430,11 +532,13 @@ where
             replica_push = next_replica_push(&mut replica_pushes) => {
                 if let Some(push) = replica_push {
                     out.clear();
-                    encode_out(push.value.as_ref(), &state, &mut out);
+                    // Replication frames arrive pre-encoded (the stream is
+                    // always RESP2 regardless of this conn's negotiated wire).
+                    out.extend_from_slice(&push.data);
                     // Same batching: pull any already-queued replication
                     // frames into this one write.
                     while let Ok(next) = replica_pushes.as_mut().unwrap().try_recv() {
-                        encode_out(next.value.as_ref(), &state, &mut out);
+                        out.extend_from_slice(&next.data);
                     }
                     flush(&mut writer, &mut write_half, &out).await?;
                 } else {
@@ -674,7 +778,7 @@ pub(crate) async fn dispatch_offloaded(
     // While the owned state is on the blocking pool, this placeholder is
     // never observed by another task; the connection loop awaits completion.
     // Preserve protocol so a worker panic can still close cleanly.
-    let mut placeholder = ClientState::with_id(state.id, ctx.requirepass.is_some());
+    let mut placeholder = ClientState::with_id(state.id, ctx.auth_required());
     placeholder.protocol = state.protocol;
     let owned_state = std::mem::replace(state, placeholder);
     match tokio::task::spawn_blocking(move || {

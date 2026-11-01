@@ -17,6 +17,7 @@ mod live;
 mod pattern;
 mod pubsub;
 mod range;
+mod recovery;
 mod replication;
 mod scan;
 mod schedule;

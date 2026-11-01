@@ -134,17 +134,22 @@ hour passed — deletes don't reclaim file space until compaction. `INFO` report
 ## Replication & HA
 
 - `REPLICAOF <host> <port>` / `REPLICAOF NO ONE`; `replica-read-only yes` by default.
-- `PSYNC` always does a **full resync** (serializes an RDB snapshot, streams it, then streams
-  live writes) — no partial resync/backlog yet.
+- `PSYNC <replid> <offset>` does a **partial resync** when the offset is still covered by the
+  primary's resync backlog (`partial-resync-backlog`, default `1mb`, `0` disables): the replica
+  gets `+CONTINUE` plus just the commands it missed. Anything else — unknown replid, evicted or
+  future offset — falls back to `FULLRESYNC` (RDB snapshot, then live writes). A replica
+  promoted with `REPLICAOF NO ONE` always full-resyncs on re-attach. The offset is a logical
+  command count, not Redis's byte-stream offset. `INFO replication` reports `sync_full` /
+  `sync_partial_ok`.
 - Replication writes use a dedicated bounded per-replica queue (32,768 messages / 64 MiB); the
   pub/sub slow-client timeout does not apply. Queue overflow means the replica has missed writes
-  and it is disconnected after a five-second grace period, requiring a full resync.
+  and it is disconnected after a five-second grace period.
 - `WAIT`/`WAITAOF` — write-ack sync points, offset-compare based.
 - `reflexdb-sentinel` binary: monitors primaries, votes with peer Sentinels on failure, promotes
   a replica and re-points the others. Replicas/peers are listed explicitly in
   `sentinel.conf` (no auto-discovery yet); failover always picks "the first configured replica".
 - No cluster mode (hash-slot sharding) — not planned, see [ROADMAP.md](ROADMAP.md).
-- Not implemented: partial resync, diskless replication, chain replication,
+- Not implemented: diskless replication, chain replication,
   `min-replicas-to-write`/`-max-lag` write gating, sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE` —
   tied to cluster mode).
 
@@ -157,10 +162,17 @@ hour passed — deletes don't reclaim file space until compaction. `INFO` report
   `allcommands`/`nocommands` (Redis applies tokens left-to-right instead).
 - Rejected rather than silently accepted: `&pattern` pub/sub channel ACLs, `(...)` selectors,
   and unknown `+@category` names — rules that can't be enforced fail `SETUSER` loudly.
-- Not implemented: `ACL LOG`/`LOAD`/`SAVE`/`DRYRUN`, `aclfile` (users are in-memory only).
+- `aclfile <path>` persists users in Redis's aclfile format (`user <name> <rules>` per line):
+  loaded at startup (a missing file warns and continues with in-memory users; a malformed file
+  refuses to start), `ACL SAVE` writes the live table back atomically (0600), `ACL LOAD` swaps
+  the table from disk. A file without `user default` loads a disabled `default` — never fails
+  open. Without `aclfile`, users are in-memory only. Not implemented: `ACL LOG`/`DRYRUN`.
 - TLS (`rustls`) on the client listener. Set `port 0` for TLS-only operation — plaintext is
-  then never bound. Not implemented: mutual TLS (`tls-auth-clients`), CA config, TLS on the
-  replication link.
+  then never bound. `tls-auth-clients yes` + `tls-ca-cert-file` enable mTLS (clients must
+  present a CA-signed certificate). `tls-replication yes` wraps the replica→primary link in
+  TLS — the replica verifies the primary against `tls-ca-cert-file` and presents its own
+  `tls-cert-file`/`tls-key-file` as a client cert. Both directives fail startup loudly if
+  `tls-ca-cert-file` is missing.
 
 ## Scripting
 
@@ -172,7 +184,7 @@ hour passed — deletes don't reclaim file space until compaction. `INFO` report
 
 ## Time travel — `GETAT` / `HISTORY`
 
-Proof-of-concept, gated behind `history-enabled yes` (default `no`), strings only.
+Proof-of-concept, gated behind `history-enabled yes` (default `yes`), strings only.
 
 ```
 GETAT <key> <ms-epoch>   # value of a string key as of a timestamp
@@ -187,6 +199,32 @@ the write path (fire-and-forget to a batching writer thread). `history-retention
 window. A per-key cap does not limit the number of distinct keys, so total disk use can still grow
 when age retention is disabled. `OBJECTAT`, `RESTOREAT`, `LIVE ... SINCE`, and `EXPIREACTION` are
 designed but not built — see [ROADMAP.md](ROADMAP.md).
+
+## Workflow recovery — `RUN.*` / `IDEMPOTENT`
+
+Recovery primitives for workflow runners — not a workflow engine. All bookkeeping is ordinary
+keyspace data (`run:<id>` hash, `run:<id>~audit` list, `run:<id>~cp~<label>` checkpoint blobs,
+`run:<id>:<...>` for state covered by checkpoints), so it persists, replicates, and is
+inspectable with regular commands.
+
+```
+RUN BEGIN <id>                    # register a run (id must be free)
+RUN STEP <id> <name>              # record the resume point
+RUN CHECKPOINT <id> <label>       # snapshot all `run:<id>:*` keys → count
+RUN RESTORE <id> <label>          # wipe `run:<id>:*`, restore snapshot; resumes a closed run
+RUN END <id> [DONE|FAILED]        # close (default DONE)
+RUN STATUS <id>                   # status, timestamps, last_step, checkpoint labels
+RUN LIST                          # [[id, status], ...]
+RUN AUDIT <id> [LIMIT n]          # append-only "<ms> <event>" trail
+IDEMPOTENT <key> <ttl_ms> <cmd> <args...>
+```
+
+`IDEMPOTENT` claims `key` atomically, runs `cmd`, stores its reply under `key`, and answers
+retries with the stored reply — no re-execution. Errors release the claim instead of caching.
+Connection-state commands, blockers, and `RUN`/`IDEMPOTENT` itself can't be wrapped. On
+replicas only completed markers answer; the marker replicates as `SET`/`PSETEX`, so a failover
+keeps "execute once" semantics. `GETAT`/`HISTORY` on the `run:` keys give a second audit view
+when `history-enabled` is on.
 
 ## Cache correctness — single-flight
 

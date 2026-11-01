@@ -13,14 +13,22 @@
 //! Rejected rather than silently accepted: pub/sub channel patterns
 //! (`&pattern`), `(...)` selectors, and unknown `+@category` names — a
 //! configuration that can't be enforced must fail loudly.
-//! `ACL LOG`/`LOAD`/`SAVE`/`DRYRUN`/`HELP` aren't implemented.
+//! `ACL LOG`/`DRYRUN`/`HELP` aren't implemented.
+//!
+//! Persistence: the `aclfile` config directive names a file in Redis's
+//! aclfile format (`user <name> <rules>` per line — exactly what
+//! `describe_user` emits). It's loaded once at startup; `ACL SAVE` writes
+//! the live table back to it and `ACL LOAD` swaps the table with the
+//! file's contents. A file without a `default` user gets a disabled one —
+//! a missing `default` must never fail open.
 //!
 //! This is a subset of the ACL command surface, not "full ACL" — see
 //! `docs/SECURITY.md` for the honest scope.
 
 use std::collections::HashSet;
+use std::path::Path;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use rand::Rng;
 use resp::Value;
@@ -78,6 +86,11 @@ impl AclUser {
             return false;
         }
         if self.allowed_commands.contains(command) {
+            return true;
+        }
+        // The overwhelmingly common shape (`allcommands`, no denied
+        // categories) skips the category-table lookup entirely.
+        if self.allcommands && self.denied_categories == 0 {
             return true;
         }
         let cats = command_categories(command);
@@ -232,6 +245,7 @@ const COMMAND_CATEGORY_TABLE: &[(&str, u32)] = &[
     ("FLUSHDB", cat::KEYSPACE | cat::WRITE | cat::SLOW | cat::DANGEROUS),
     ("FLUSHALL", cat::KEYSPACE | cat::WRITE | cat::SLOW | cat::DANGEROUS),
     ("REPLICAOF", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
+    ("ROLE", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
     ("SLAVEOF", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
     ("REPLCONF", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
     ("PSYNC", cat::ADMIN | cat::SLOW | cat::DANGEROUS),
@@ -266,6 +280,9 @@ const COMMAND_CATEGORY_TABLE: &[(&str, u32)] = &[
     ("SORT_RO", cat::GENERIC | cat::READ | cat::SLOW),
     ("GETAT", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::SLOW),
     ("HISTORY", cat::KEYSPACE | cat::GENERIC | cat::READ | cat::SLOW),
+    // `RUN RESTORE` wipes a key prefix, so the whole family is dangerous.
+    ("RUN", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::SLOW | cat::DANGEROUS),
+    ("IDEMPOTENT", cat::KEYSPACE | cat::GENERIC | cat::WRITE | cat::SLOW),
     // strings
     ("GET", cat::STRING | cat::READ | cat::FAST),
     ("STRLEN", cat::STRING | cat::READ | cat::FAST),
@@ -276,7 +293,6 @@ const COMMAND_CATEGORY_TABLE: &[(&str, u32)] = &[
     ("MGET", cat::STRING | cat::READ | cat::SLOW),
     ("BITCOUNT", cat::STRING | cat::READ | cat::SLOW),
     ("BITPOS", cat::STRING | cat::READ | cat::SLOW),
-    ("SUBSTR", cat::STRING | cat::READ | cat::SLOW),
     ("SET", cat::STRING | cat::WRITE | cat::FAST),
     ("SETEX", cat::STRING | cat::WRITE | cat::FAST),
     ("PSETEX", cat::STRING | cat::WRITE | cat::FAST),
@@ -405,11 +421,17 @@ const COMMAND_CATEGORY_TABLE: &[(&str, u32)] = &[
     ("XREADGROUP", cat::STREAM | cat::WRITE | cat::BLOCKING | cat::SLOW),
 ];
 
+/// `COMMAND_CATEGORY_TABLE` as a map — `command_categories` runs on every
+/// command for users with real ACL rules, so the linear scan over ~250
+/// entries per call is wasted work.
+static COMMAND_CATEGORY_MAP: std::sync::LazyLock<std::collections::HashMap<&'static str, u32>> =
+    std::sync::LazyLock::new(|| COMMAND_CATEGORY_TABLE.iter().copied().collect());
+
 /// Category bits for `name`. Commands not in the table get `0`: categories
 /// neither grant nor deny them (unknown commands anyway, or reachable only
 /// via explicit `+cmd`/`allcommands`).
 pub fn command_categories(name: &str) -> u32 {
-    COMMAND_CATEGORY_TABLE.iter().find_map(|(n, bits)| (*n == name).then_some(*bits)).unwrap_or(0)
+    COMMAND_CATEGORY_MAP.get(name).copied().unwrap_or(0)
 }
 
 /// Commands whose key operand is in the first argument position. Multi-key
@@ -441,7 +463,6 @@ const KEY_COMMANDS: &[&str] = &[
     "SETNX",
     "PSETEX",
     "STRLEN",
-    "SUBSTR",
     "TOUCH",
     "UNLINK",
     "WATCH",
@@ -467,7 +488,6 @@ const KEY_COMMANDS: &[&str] = &[
     "ZSCORE",
     "BLPOP",
     "BRPOP",
-    "BRPOPLPUSH",
     "EXPIREAT",
     "HINCRBY",
     "HINCRBYFLOAT",
@@ -557,47 +577,55 @@ const KEY_COMMANDS: &[&str] = &[
     "ZRANGE",
     "ZRANGEBYSCORE",
     "ZSCAN",
+    "IDEMPOTENT",
 ];
+
+/// `KEY_COMMANDS` as a set — the `_ =>` fallback in `command_keys` checks
+/// membership for every restricted-ACL command.
+static KEY_COMMANDS_SET: std::sync::LazyLock<HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| KEY_COMMANDS.iter().copied().collect());
 
 /// Return every key operand understood by the ACL key-pattern checks.
 /// Commands whose key positions depend on a count are decoded from their
 /// own argument layout; option/value operands are never treated as keys.
-pub fn command_keys<'a>(name: &str, args: &'a [Bytes]) -> Vec<&'a [u8]> {
-    let all = |args: &'a [Bytes]| args.iter().map(Bytes::as_ref).collect();
+/// Owned `Bytes` (refcount clones) because `RUN`'s effective key is
+/// synthesized from the run id, not an argument.
+pub fn command_keys(name: &str, args: &[Bytes]) -> Vec<Bytes> {
+    let all = |args: &[Bytes]| args.to_vec();
     match name {
         "DEL" | "UNLINK" | "EXISTS" | "MGET" | "SDIFF" | "SINTER" | "SUNION" | "WATCH" | "TOUCH" => all(args),
         "SINTERCARD" => {
             let count =
                 args.first().and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
-            args.iter().skip(1).take(count).map(Bytes::as_ref).collect()
+            args.iter().skip(1).take(count).cloned().collect()
         }
-        "MSET" | "MSETNX" => args.iter().step_by(2).map(Bytes::as_ref).collect(),
-        "RENAME" | "RENAMENX" | "COPY" | "RPOPLPUSH" | "BRPOPLPUSH" | "LMOVE" | "BLMOVE" | "SMOVE" => {
-            args.iter().take(2).map(Bytes::as_ref).collect()
+        "MSET" | "MSETNX" => args.iter().step_by(2).cloned().collect(),
+        "RENAME" | "RENAMENX" | "COPY" | "RPOPLPUSH" | "LMOVE" | "BLMOVE" | "SMOVE" => {
+            args.iter().take(2).cloned().collect()
         }
-        "OBJECT" | "XGROUP" | "XINFO" => args.get(1).map(|b| vec![b.as_ref()]).unwrap_or_default(),
+        "OBJECT" | "XGROUP" | "XINFO" => args.get(1).cloned().into_iter().collect(),
         "MEMORY" if args.first().is_some_and(|b| b.eq_ignore_ascii_case(b"USAGE")) => {
-            args.get(1).map(|b| vec![b.as_ref()]).unwrap_or_default()
+            args.get(1).cloned().into_iter().collect()
         }
-        "BITOP" => args.iter().skip(1).map(Bytes::as_ref).collect(),
+        "BITOP" => args.iter().skip(1).cloned().collect(),
         "BLPOP" | "BRPOP" | "BZPOPMAX" | "BZPOPMIN" => {
-            args.iter().take(args.len().saturating_sub(1)).map(Bytes::as_ref).collect()
+            args.iter().take(args.len().saturating_sub(1)).cloned().collect()
         }
         "LMPOP" | "ZMPOP" => {
             let count =
                 args.first().and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
-            args.iter().skip(1).take(count).map(Bytes::as_ref).collect()
+            args.iter().skip(1).take(count).cloned().collect()
         }
         "BZMPOP" | "BLMPOP" => {
             let count =
                 args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
-            args.iter().skip(2).take(count).map(Bytes::as_ref).collect()
+            args.iter().skip(2).take(count).cloned().collect()
         }
         "SORT" | "SORT_RO" => {
-            let mut keys = args.first().map(|b| vec![b.as_ref()]).unwrap_or_default();
+            let mut keys: Vec<Bytes> = args.first().cloned().into_iter().collect();
             for pair in args.windows(2) {
                 if pair[0].eq_ignore_ascii_case(b"STORE") {
-                    keys.push(pair[1].as_ref());
+                    keys.push(pair[1].clone());
                 }
             }
             keys
@@ -606,17 +634,17 @@ pub fn command_keys<'a>(name: &str, args: &'a [Bytes]) -> Vec<&'a [u8]> {
         "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" => {
             let count =
                 args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
-            args.iter().skip(2).take(count).map(Bytes::as_ref).collect()
+            args.iter().skip(2).take(count).cloned().collect()
         }
         "ZINTER" | "ZUNION" | "ZDIFF" | "ZINTERCARD" => {
             let count =
                 args.first().and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
-            args.iter().skip(1).take(count).map(Bytes::as_ref).collect()
+            args.iter().skip(1).take(count).cloned().collect()
         }
         "ZINTERSTORE" | "ZUNIONSTORE" | "ZDIFFSTORE" => {
             let count =
                 args.get(1).and_then(|b| std::str::from_utf8(b).ok()?.parse::<usize>().ok()).unwrap_or(0);
-            args.iter().take(1).chain(args.iter().skip(2).take(count)).map(Bytes::as_ref).collect()
+            args.iter().take(1).chain(args.iter().skip(2).take(count)).cloned().collect()
         }
         "XREAD" | "XREADGROUP" => {
             let Some(streams) = args.iter().position(|b| b.eq_ignore_ascii_case(b"STREAMS")) else {
@@ -624,9 +652,23 @@ pub fn command_keys<'a>(name: &str, args: &'a [Bytes]) -> Vec<&'a [u8]> {
             };
             let tail = &args[streams + 1..];
             let count = tail.len() / 2;
-            tail.iter().take(count).map(Bytes::as_ref).collect()
+            tail.iter().take(count).cloned().collect()
         }
-        _ if KEY_COMMANDS.contains(&name) => args.first().map(|b| vec![b.as_ref()]).unwrap_or_default(),
+        // `RUN <sub> <id>` touches `run:<id>` plus its `~`/`:`-suffixed
+        // sys and state keys — all covered by a `~run:*` pattern check on
+        // the record itself. `RUN LIST` has no id; `run:` keeps the same
+        // gate. Wrapped keys of `IDEMPOTENT`'s inner command are checked
+        // by the inner dispatch.
+        "RUN" => match args.get(1) {
+            Some(id) => {
+                let mut k = BytesMut::with_capacity(4 + id.len());
+                k.extend_from_slice(b"run:");
+                k.extend_from_slice(id);
+                vec![k.freeze()]
+            }
+            None => vec![Bytes::from_static(b"run:")],
+        },
+        _ if KEY_COMMANDS_SET.contains(name) => args.first().cloned().into_iter().collect(),
         _ => Vec::new(),
     }
 }
@@ -641,8 +683,14 @@ pub fn authorize(user: &AclUser, name: &str, args: &[Bytes]) -> Result<(), Strin
             name.to_ascii_lowercase()
         ));
     }
+    // `allkeys` (the default user) can skip extracting key operands — the
+    // per-key check below would pass unconditionally anyway. Saves a Vec
+    // allocation plus the category lookup on every command.
+    if user.allkeys {
+        return Ok(());
+    }
     let write = command_categories(name) & cat::WRITE != 0;
-    if command_keys(name, args).into_iter().any(|key| !user.can_access_key(key, write)) {
+    if command_keys(name, args).into_iter().any(|key| !user.can_access_key(&key, write)) {
         return Err("NOPERM No permissions to access a key for this user".into());
     }
     Ok(())
@@ -654,9 +702,114 @@ fn new_acl_users(requirepass: Option<&str>) -> DashMap<String, AclUser> {
     users
 }
 
+/// Parse an aclfile into `(name, user)` pairs. Blank lines and `#`
+/// comments are skipped; anything else that isn't `user <name> <rules>`
+/// is an error — a security file that's half-understood must fail loudly.
+/// A file with no `default` user yields one with every flag off (disabled,
+/// no passwords, no keys, no commands).
+pub fn parse_acl_file(path: &Path) -> Result<Vec<(String, AclUser)>, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read ACL file {}: {e}", path.display()))?;
+    parse_acl_content(&content).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_acl_content(content: &str) -> Result<Vec<(String, AclUser)>, String> {
+    let mut users = Vec::new();
+    for (index, raw) in content.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        if tokens.next() != Some("user") {
+            return Err(format!("line {}: expected 'user <name> <rules>'", index + 1));
+        }
+        let Some(name) = tokens.next() else {
+            return Err(format!("line {}: missing user name", index + 1));
+        };
+        let mut user = AclUser::default();
+        let rest: Vec<Bytes> = tokens.map(|t| Bytes::copy_from_slice(t.as_bytes())).collect();
+        apply_setuser_tokens(&mut user, &rest).map_err(|e| format!("line {}: {e}", index + 1))?;
+        users.push((name.to_string(), user));
+    }
+    if !users.iter().any(|(name, _)| name == "default") {
+        users.push(("default".to_string(), AclUser::default()));
+    }
+    Ok(users)
+}
+
+/// Serialize the user table and swap it into `path` atomically (write a
+/// sibling temp file, then rename), so a crash mid-save can't leave a
+/// truncated aclfile behind. Lines are sorted for a stable, diffable file.
+fn write_acl_file(path: &Path, users: &DashMap<String, AclUser>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut lines: Vec<String> = users.iter().map(|e| describe_user(e.key(), e.value())).collect();
+    lines.sort();
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(lines.join("\n").as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 impl ServerContext {
     pub(crate) fn init_acl(requirepass: Option<&str>) -> DashMap<String, AclUser> {
         new_acl_users(requirepass)
+    }
+
+    /// Whether a brand-new connection must `AUTH` before running commands —
+    /// derived from the effective `default` user rather than `requirepass`
+    /// directly, so an aclfile that gives `default` a password (or disables
+    /// it) is enforced even when `requirepass` is unset. Fails closed if
+    /// `default` is somehow absent.
+    pub fn auth_required(&self) -> bool {
+        self.acl_users.get("default").map(|u| !(u.enabled && u.nopass)).unwrap_or(true)
+    }
+
+    /// Replace the whole user table with the aclfile at `path`; returns how
+    /// many users were loaded. Entries dropped by the file are removed
+    /// first so they lose access immediately — a client authenticated as a
+    /// deleted user gets `NOAUTH` on its next command via the per-command
+    /// `acl_users` lookup.
+    pub fn load_acl_users(&self, path: &Path) -> Result<usize, String> {
+        let users = parse_acl_file(path)?;
+        let count = users.len();
+        self.acl_users.retain(|name, _| users.iter().any(|(n, _)| n == name));
+        for (name, user) in users {
+            self.acl_users.insert(name, user);
+        }
+        Ok(count)
+    }
+
+    /// `ACL SAVE` — persist the live table to the configured `aclfile`.
+    pub fn save_acl_users(&self) -> Result<(), String> {
+        let guard = self.acl_file.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(path) = &*guard else {
+            return Err(
+                "ERR This server is not configured to use an ACL file (missing 'aclfile' directive)".into()
+            );
+        };
+        write_acl_file(path, &self.acl_users)
+            .map_err(|e| format!("ERR could not write ACL file {}: {e}", path.display()))
+    }
+
+    /// `ACL LOAD` — swap the live table for the configured `aclfile`'s.
+    pub fn reload_acl_users(&self) -> Result<(), String> {
+        let Some(path) = self.acl_file.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        else {
+            return Err(
+                "ERR This server is not configured to use an ACL file (missing 'aclfile' directive)".into()
+            );
+        };
+        self.load_acl_users(&path).map(|_| ())
     }
 }
 
@@ -726,6 +879,24 @@ pub fn cmd_acl(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outc
             }
             ctx.acl_users.insert(name, user);
             reply(Value::ok())
+        }
+        "SAVE" => {
+            if !rest.is_empty() {
+                return wrong_args("acl|save");
+            }
+            match ctx.save_acl_users() {
+                Ok(()) => reply(Value::ok()),
+                Err(e) => err(e),
+            }
+        }
+        "LOAD" => {
+            if !rest.is_empty() {
+                return wrong_args("acl|load");
+            }
+            match ctx.reload_acl_users() {
+                Ok(()) => reply(Value::ok()),
+                Err(e) => err(e),
+            }
         }
         other => err(format!(
             "ERR Unknown ACL subcommand or wrong number of arguments for '{}'",
@@ -853,11 +1024,22 @@ fn describe_user(name: &str, user: &AclUser) -> String {
     let pass = if user.nopass {
         "nopass".to_string()
     } else {
-        user.password_hashes.iter().map(|h| format!("#{h}")).collect::<Vec<_>>().join(" ")
+        let mut hashes: Vec<String> = user.password_hashes.iter().map(|h| format!("#{h}")).collect();
+        hashes.sort();
+        hashes.join(" ")
     };
     let keys = describe_keys(user);
     let commands = describe_commands(user);
-    format!("user {name} {status} {pass} {keys} {commands}")
+    // Skip empty sections (e.g. a password-less non-nopass user, or a
+    // resetkeys user) instead of emitting double spaces.
+    let mut line = format!("user {name} {status}");
+    for section in [pass, keys, commands] {
+        if !section.is_empty() {
+            line.push(' ');
+            line.push_str(&section);
+        }
+    }
+    line
 }
 
 fn describe_keys(user: &AclUser) -> String {
@@ -885,6 +1067,7 @@ fn describe_commands(user: &AclUser) -> String {
     if parts.is_empty() {
         "-@all".to_string()
     } else {
+        parts.sort();
         parts.join(" ")
     }
 }
@@ -907,4 +1090,123 @@ fn describe_user_map(user: &AclUser) -> Value {
         (Value::bulk("keys"), Value::bulk(describe_keys(user))),
         (Value::bulk("channels"), Value::bulk("")),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::{dispatch, ClientState, Outcome, ServerContext};
+
+    fn run(ctx: &ServerContext, state: &mut ClientState, words: &[&str]) -> Value {
+        let req: Vec<Bytes> = words.iter().map(|w| Bytes::from(w.to_string())).collect();
+        match dispatch(ctx, state, req) {
+            Outcome::Reply(v) => v,
+            _ => panic!("expected Outcome::Reply"),
+        }
+    }
+
+    fn temp_acl(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("reflexdb-acl-{name}-{}", std::process::id()))
+    }
+
+    /// The aclfile format `ACL SAVE` writes must parse back into an
+    /// equivalent table — exercise every token class `describe_user` emits.
+    #[test]
+    fn save_then_load_round_trips_the_user_table() {
+        let path = temp_acl("roundtrip.acl");
+        let ctx = ServerContext::new(1, None).with_acl_file(Some(path.clone()));
+        let mut st = ClientState::new(false);
+        assert_eq!(
+            run(
+                &ctx,
+                &mut st,
+                &[
+                    "ACL",
+                    "SETUSER",
+                    "alice",
+                    "on",
+                    ">pw1",
+                    ">pw2",
+                    "~cache:*",
+                    "%R~public:*",
+                    "%W~scratch",
+                    "+get",
+                    "+set",
+                    "+@read",
+                    "-@dangerous"
+                ]
+            ),
+            Value::ok()
+        );
+        assert_eq!(
+            run(
+                &ctx,
+                &mut st,
+                &["ACL", "SETUSER", "bob", "off", "nopass", "resetkeys", "nocommands", "+ping"]
+            ),
+            Value::ok()
+        );
+        assert_eq!(run(&ctx, &mut st, &["ACL", "SAVE"]), Value::ok());
+
+        // Mutate the table away, then reload: LOAD must fully restore it.
+        run(&ctx, &mut st, &["ACL", "DELUSER", "alice", "bob"]);
+        assert_eq!(run(&ctx, &mut st, &["ACL", "LOAD"]), Value::ok());
+
+        let mut lines: Vec<String> =
+            ctx.acl_users.iter().map(|e| describe_user(e.key(), e.value())).collect();
+        lines.sort();
+        let on_disk: Vec<String> =
+            std::fs::read_to_string(&path).unwrap().lines().map(str::to_string).collect();
+        assert_eq!(lines, on_disk);
+
+        // And the reloaded rules must actually enforce.
+        let mut alice = ClientState::new(false);
+        assert_eq!(run(&ctx, &mut alice, &["AUTH", "alice", "pw1"]), Value::ok());
+        assert_eq!(run(&ctx, &mut alice, &["SET", "cache:a", "1"]), Value::ok());
+        assert!(matches!(run(&ctx, &mut alice, &["GET", "other:b"]), Value::Error(_)));
+        assert!(matches!(run(&ctx, &mut alice, &["SHUTDOWN"]), Value::Error(_)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file with no `default` user must not authenticate new clients:
+    /// the loader inserts a disabled default, so `auth_required` stays on.
+    #[test]
+    fn aclfile_without_default_fails_closed() {
+        let path = temp_acl("nodefault.acl");
+        std::fs::write(&path, "user alice on nopass ~* +@all\n").unwrap();
+        let ctx = ServerContext::new(1, None).with_acl_file(Some(path.clone()));
+        ctx.load_acl_users(&path).unwrap();
+        assert!(ctx.auth_required());
+        assert!(ctx.acl_users.contains_key("default"));
+        assert!(!ctx.acl_users.get("default").unwrap().enabled);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn aclfile_rejects_malformed_lines() {
+        assert!(parse_acl_content("user alice on ~* +@all\nbogus line\n").is_err());
+        assert!(parse_acl_content("user\n").is_err());
+        assert!(parse_acl_content("user alice on +@nosuchcat\n").is_err());
+        assert!(parse_acl_content("user alice &chan\n").is_err());
+    }
+
+    /// `auth_required` tracks the *effective* default user: an aclfile that
+    /// gives it a password must force AUTH even with `requirepass` unset.
+    #[test]
+    fn auth_required_follows_the_default_user() {
+        let ctx = ServerContext::new(1, None);
+        assert!(!ctx.auth_required());
+        ctx.acl_users.get_mut("default").unwrap().nopass = false;
+        assert!(ctx.auth_required());
+        let ctx = ServerContext::new(1, Some("pw".into()));
+        assert!(ctx.auth_required());
+    }
+
+    #[test]
+    fn save_and_load_error_without_aclfile() {
+        let ctx = ServerContext::new(1, None);
+        let mut st = ClientState::new(false);
+        assert!(matches!(run(&ctx, &mut st, &["ACL", "SAVE"]), Value::Error(_)));
+        assert!(matches!(run(&ctx, &mut st, &["ACL", "LOAD"]), Value::Error(_)));
+    }
 }

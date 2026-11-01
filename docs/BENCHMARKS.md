@@ -153,14 +153,18 @@ working tree — lazy shared-writer fix, `live-sweep-ms`/pacing changes, and the
 durability hardening (per-command ACL enforcement, `MISCONF` AOF-failure gate,
 `min-replicas-to-write`, `tiered-overflow-policy` capacity check, `SHUTDOWN`/signal handling);
 a separate host-side A/B against the previous commit showed none of those per-command gates
-cost measurable latency. Medians of 3 runs:
+cost measurable latency, and the `native` rows — ReflexDB only, uncapped release build of the
+latest tree (partial-resync/`PSYNC` backlog, `ROLE`, command cuts; `live-fanout` measured
+7,986 writes/s there) — show the same. Medians of 3 runs:
 
 | Workload | CPUs | Pipeline 1: Redis / Dragonfly / ReflexDB | Pipeline 16: Redis / Dragonfly / ReflexDB |
 |---|---:|---:|---:|
 | small-mixed | 1 | 12,734 / 11,264 / **17,249** | 146,259 / 128,202 / **149,301** |
-| small-mixed | 4 | 14,699 / 14,388 / **16,200** | 143,632 / 134,293 / **152,083** |
+| small-mixed | 4 | 14,699 / 14,388 / **16,200** | 153,239 / 144,954 / **154,605** |
 | hot-key | 1 | 15,494 / 12,010 / **16,708** | 147,983 / 142,760 / **152,644** |
 | hot-key | 4 | 14,925 / 13,990 / **16,866** | 161,254 / 153,218 / **163,143** |
+| small-mixed | native | — / — / **24,025** | — / — / **208,158** |
+| hot-key | native | — / — / **24,124** | — / — / **219,935** |
 
 ReflexDB led all eight medians this pass, Dragonfly none — though all three sit inside a noisy
 ~14–17k ops/s P1 band, and the idle-host pass below shows placement can flip run to run; the
@@ -217,13 +221,13 @@ table does not — client count, pipeline depth, keyspace size, value size:
 |---|---:|---:|---:|
 | 64 clients, pipeline 1 | 15,244 | 16,485 | **18,314** |
 | 64 clients, pipeline 1, hot-key | 18,146 | 18,206 | **19,205** |
-| 16 clients, pipeline 64 | 242,802 | 254,343 | **271,644** |
+| 16 clients, pipeline 64 | 282,380 | 270,308 | **286,638** |
 | 100k-key keyspace, pipeline 16 | 140,996 | 147,472 | **149,601** |
-| 8 KiB values, pipeline 16 | 44,321 | 43,050 | **48,173** |
+| 8 KiB values, pipeline 16 | 48,356 | 46,633 | **50,688** |
 
 ReflexDB led all five medians. Deep pipelines scale best for every engine (P64 roughly triples the
 P16 baseline); the 100k-key run shows no keyspace-size penalty versus the 1k-key baseline; the
-8 KiB run is payload/alloc-bound — ~48k ops/s is ~380 MiB/s of stored payload on ReflexDB. The
+8 KiB run is payload/alloc-bound — ~51k ops/s is ~400 MiB/s of stored payload on ReflexDB. The
 last row uses the harness's new `--value-size` flag.
 
 ## RESP vs. RFX wire format
