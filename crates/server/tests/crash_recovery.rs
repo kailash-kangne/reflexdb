@@ -87,6 +87,19 @@ impl Client {
             other => panic!("unexpected RESP tag {other:?} in line {line:?}"),
         }
     }
+
+    /// Like `cmd`, but args may be arbitrary bytes (needed to send a large
+    /// non-UTF-8 payload).
+    fn cmd_bytes(&mut self, args: &[&[u8]]) -> Reply {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            out.extend_from_slice(arg);
+            out.extend_from_slice(b"\r\n");
+        }
+        self.writer.write_all(&out).unwrap();
+        self.read_reply()
+    }
 }
 
 fn bulk(s: &str) -> Reply {
@@ -108,6 +121,26 @@ fn spawn(port: u16, dir: &Path, extra: &[&str]) -> Child {
     Command::new(BIN)
         .args(["--port", &port.to_string(), "--dir", &dir.to_string_lossy()])
         .args(extra)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn reflexdb-server")
+}
+
+/// Spawn with a per-file size cap (`ulimit -f`, in 512-byte blocks) so
+/// writes past the cap fail like a full disk. `SIGXFSZ` is ignored first —
+/// otherwise the default disposition kills the process instead of
+/// returning EFBIG to the writer.
+#[cfg(unix)]
+fn spawn_capped_file_size(port: u16, dir: &Path, blocks_512: u32) -> Child {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "trap '' XFSZ; ulimit -f {blocks_512}; exec '{}' --port {port} --dir '{}' \
+             --appendonly yes --appendfsync always",
+            BIN,
+            dir.display()
+        ))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -318,6 +351,61 @@ fn second_server_on_same_dir_refuses() {
     let status = second.wait().expect("second server should have exited");
     assert!(!status.success(), "second server on a locked dir must fail");
 
+    assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A full disk: the AOF writer's write fails asynchronously, so the write
+/// that tripped it is still ACKed (fire-and-forget) but every write after
+/// must be refused with MISCONF — reads stay up. After `kill -9`, the
+/// torn bytes left by the failed write must not stop the next boot or
+/// corrupt the recovered prefix.
+#[cfg(unix)]
+#[test]
+fn full_disk_refuses_writes_and_recovers() {
+    let dir = temp_dir("full-disk");
+    let port = free_port();
+    // 512 KiB cap — enough for startup files, too small for the frame below.
+    let mut server = spawn_capped_file_size(port, &dir, 1024);
+    {
+        let mut c = Client::connect(port);
+        assert_eq!(c.cmd(&["SET", "small", "v"]), Reply::Simple("OK".into()));
+        // Incompressible payload: the compressed AOF frame still exceeds
+        // the cap, so this is the write whose logging fails.
+        let mut x = 0x9E3779B97F4A7C15u64;
+        let big: Vec<u8> = (0..1_500_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        assert_eq!(c.cmd_bytes(&[b"SET", b"rnd", &big]), Reply::Simple("OK".into()));
+
+        // The writer thread flags the failure asynchronously; wait for it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match c.cmd(&["SET", "s1", "v"]) {
+                Reply::Error(e) => {
+                    assert!(e.starts_with("MISCONF"), "{e}");
+                    break;
+                }
+                _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                other => panic!("writes never refused on full disk: {other:?}"),
+            }
+        }
+        // Refused writes must not be queued either — verify reads are fine.
+        assert_eq!(c.cmd(&["GET", "small"]), bulk("v"));
+        assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
+    }
+    sigkill(&mut server);
+
+    let mut server = spawn(port, &dir, &["--appendonly", "yes", "--appendfsync", "always"]);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&["GET", "small"]), bulk("v"));
+    assert_eq!(c.cmd(&["GET", "s1"]), Reply::Bulk(None));
     assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
     sigkill(&mut server);
     let _ = std::fs::remove_dir_all(&dir);
