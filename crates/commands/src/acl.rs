@@ -756,9 +756,11 @@ pub fn authorize(user: &AclUser, name: &str, args: &[Bytes]) -> Result<(), Strin
     // `allkeys`/`allchannels` (the default user) skip extracting operands —
     // the per-name checks below would pass unconditionally anyway. Saves a
     // Vec allocation plus the category lookup on every command.
-    let write = command_categories(name) & cat::WRITE != 0;
-    if !user.allkeys && command_keys(name, args).into_iter().any(|key| !user.can_access_key(&key, write)) {
-        return Err("NOPERM No permissions to access a key for this user".into());
+    if !user.allkeys {
+        let write = command_categories(name) & cat::WRITE != 0;
+        if command_keys(name, args).into_iter().any(|key| !user.can_access_key(&key, write)) {
+            return Err("NOPERM No permissions to access a key for this user".into());
+        }
     }
     if !user.allchannels && command_channels(name, args).into_iter().any(|ch| !user.can_access_channel(&ch)) {
         return Err("NOPERM No permissions to access a channel for this user".into());
