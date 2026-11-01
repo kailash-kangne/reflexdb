@@ -6,7 +6,11 @@ Both are single-machine observations, so re-measure before quoting numbers exter
 `benchmarks/run.py` provides a checked-in, standard-library-only RESP2 harness for repeatable runs
 against a running server; `benchmarks/run_rfx.py` is the same harness speaking RFX
 (`docs/RFX.md`). `benchmarks/compare.py` diffs a `--output` JSONL history across `--label`ed builds
-and exits non-zero on regressions past a threshold — see [OPERATIONS.md](OPERATIONS.md). `benchmarks/smoke.sh` is a redis-cli feature check that runs against any
+and exits non-zero on regressions past a threshold — see [OPERATIONS.md](OPERATIONS.md).
+`benchmarks/ab.sh` runs the comparison for you: it alternates the two binaries A,B,A,B… across
+rounds so machine drift hits both sides equally (sequential "all of A then all of B" runs show
+fake ±10–25% regressions on a loaded dev box). Always compare builds through `ab.sh`, never by
+eyeballing two `run.py` batches. `benchmarks/smoke.sh` is a redis-cli feature check that runs against any
 RESP-compatible server — the shared command suite passes on ReflexDB, Redis, and Dragonfly, with
 ReflexDB-only commands (`LIVE`, `SCHEDULE`, single-flight, `GETAT`) auto-detected and skipped on
 other engines.
@@ -142,8 +146,9 @@ Re-measure before treating these percentages as fixed; they have drifted between
 This was 129x faster than the original measurement. `ZSet` now keeps a
 `by_score: BTreeSet<(score, member)>` alongside the `HashMap`, kept in sync on each insert and
 remove. `sorted()` (backing `ZRANGE` and related commands) is O(n) instead of O(n log n). `SPOP`
-uses `indexmap::IndexSet` so selecting and removing a random member is O(1), rather than cloning
-all members into a temporary vector.
+selects and removes a random element in O(1) — `swap_remove` on the packed `Vec` under 128
+members, `indexmap::IndexSet::swap_remove_index` above it — rather than cloning all members
+into a temporary vector.
 
 ## Engine shootout: ReflexDB vs. Redis vs. Dragonfly
 

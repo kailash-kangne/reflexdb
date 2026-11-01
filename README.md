@@ -201,6 +201,7 @@ Full tables: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, concurrency model, commit order, internals |
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model, ACL semantics, known gaps — *read this before prod* |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Numbers above, reproduced |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running it for real — durability, backups, replication, failover, monitoring |
 | [docs/TIERED.md](docs/TIERED.md) | RAM→disk tiering and the overflow policies |
 | [docs/RFX.md](docs/RFX.md) | The binary wire format |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Product and engineering sequence |

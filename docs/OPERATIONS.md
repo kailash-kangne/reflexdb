@@ -154,7 +154,12 @@ memory estimate unless no memory limits are configured).
 python3 benchmarks/run.py --output bench_history.jsonl --label "$(git rev-parse --short HEAD)"
 python3 benchmarks/compare.py bench_history.jsonl            # newest label vs previous
 python3 benchmarks/compare.py bench_history.jsonl --base v1 --head v2
+
+# Comparing two builds: interleaved A/B rounds, drift cancels out.
+benchmarks/ab.sh ./old/reflexdb-server old ./new/reflexdb-server new /tmp/ab.jsonl 6
 ```
 
 `compare.py` exits non-zero when any workload regresses past `--threshold` (default ±10%),
-so it drops into CI or a pre-merge check as-is.
+so it drops into CI or a pre-merge check as-is. Compare builds with `ab.sh`, not two
+sequential `run.py` batches — sequential measurement drifts ±10–25% on a loaded machine
+and reads as fake regressions.

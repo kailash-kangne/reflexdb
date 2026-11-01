@@ -95,8 +95,9 @@ Raw knobs for non-profile setups:
   write/fsync ("group commit"). New AOF files use compressed batches; legacy RESP-only files
   remain readable and are upgraded by `BGREWRITEAOF`. A crash can lose the last few acked
   commands under `everysec`; `WAITAOF` is the call that explicitly blocks for a real fsync.
-  `BGREWRITEAOF` compacts to one command per live key (manual trigger only — no automatic
-  rewrite-on-growth yet).
+  `BGREWRITEAOF` compacts to one command per live key; it also fires automatically once the
+  AOF exceeds `auto-aof-rewrite-min-size` and has grown by `auto-aof-rewrite-percentage`
+  since the last rewrite (defaults 64mb / 100%).
 - **AOF failure handling**: because `append` is fire-and-forget, a batch the writer thread
   fails to write (disk full, I/O error) has already been acked to its client. Once that
   happens all subsequent writes are refused with `MISCONF Errors writing to the AOF file`

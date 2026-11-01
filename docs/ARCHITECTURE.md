@@ -79,7 +79,9 @@ victim; LRU/LFU/TTL policies preserve their ordering.
   concurrent callers into O(1) syscalls. `WAITAOF` is the one blocking exception
   (`AofWriter::flush_and_fsync`, waits for a real ack).
   New AOFs store independently compressed writer batches; the loader accepts legacy RESP-only
-  logs, which are upgraded when `BGREWRITEAOF` replaces them.
+  logs, which are upgraded when `BGREWRITEAOF` replaces them. The writer tracks live file
+  size / last-rewrite base / in-flight state; the maintenance tick triggers a rewrite when
+  `auto-aof-rewrite-percentage`/`auto-aof-rewrite-min-size` thresholds pass.
 - `GETAT`/`HISTORY` versions go through the same fire-and-forget-to-a-writer-thread shape, on
   `fjall` (`persistence::history::HistoryWriter`). Age retention defaults to 24 hours (`0`
   disables it); the writer maintains a configurable per-key cap (default 200). Changing the cap
