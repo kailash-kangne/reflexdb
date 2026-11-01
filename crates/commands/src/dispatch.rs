@@ -5792,4 +5792,151 @@ mod tests {
         assert_eq!(run(&ctx, &mut state, &["ZRANGESTORE", "zr", "za", "0", "-1"]), Value::Integer(2));
         assert_eq!(run(&ctx, &mut state, &["ZREMRANGEBYLEX", "za", "[a", "[a"]), Value::Integer(1));
     }
+
+    /// Deterministic random-command differential test: every reply is
+    /// checked against a plain in-memory model of Redis semantics. String
+    /// and list ops share a small keyspace so type confusion (WRONGTYPE)
+    /// and key churn are exercised constantly.
+    #[test]
+    fn random_ops_match_a_model() {
+        use std::collections::{HashMap, VecDeque};
+
+        enum M {
+            Str(Vec<u8>),
+            List(VecDeque<Vec<u8>>),
+        }
+
+        let (ctx, mut state) = fresh();
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut model: HashMap<String, M> = HashMap::new();
+
+        for i in 0..20_000u64 {
+            let key = format!("k{}", next() % 40);
+            let arg = format!("v{}", next() % 500);
+            let op = next() % 13;
+            let words: Vec<String>;
+            let expected: Value = match op {
+                0..=2 => {
+                    let val = match next() % 4 {
+                        0 => (next() % 1_000_000).to_string(),
+                        1 => i64::MAX.to_string(),
+                        _ => arg.clone(),
+                    };
+                    model.insert(key.clone(), M::Str(val.clone().into_bytes()));
+                    words = vec!["SET".into(), key.clone(), val];
+                    Value::Simple("OK".into())
+                }
+                3 => {
+                    words = vec!["GET".into(), key.clone()];
+                    match model.get(&key) {
+                        None => Value::NullBulk,
+                        Some(M::Str(s)) => Value::Bulk(s.clone().into()),
+                        Some(M::List(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                4 => {
+                    words = vec!["DEL".into(), key.clone()];
+                    Value::Integer(model.remove(&key).is_some() as i64)
+                }
+                5 => {
+                    words = vec!["APPEND".into(), key.clone(), arg.clone()];
+                    match model.get_mut(&key) {
+                        None => {
+                            model.insert(key.clone(), M::Str(arg.clone().into_bytes()));
+                            Value::Integer(arg.len() as i64)
+                        }
+                        Some(M::Str(s)) => {
+                            s.extend_from_slice(arg.as_bytes());
+                            Value::Integer(s.len() as i64)
+                        }
+                        Some(M::List(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                6 => {
+                    words = vec!["STRLEN".into(), key.clone()];
+                    match model.get(&key) {
+                        None => Value::Integer(0),
+                        Some(M::Str(s)) => Value::Integer(s.len() as i64),
+                        Some(M::List(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                7 => {
+                    words = vec!["INCR".into(), key.clone()];
+                    match model.get_mut(&key) {
+                        None => {
+                            model.insert(key.clone(), M::Str(b"1".to_vec()));
+                            Value::Integer(1)
+                        }
+                        Some(M::Str(s)) => {
+                            match std::str::from_utf8(s.as_slice()).unwrap_or("").parse::<i64>() {
+                                Ok(n) => match n.checked_add(1) {
+                                    Some(m) => {
+                                        *s = m.to_string().into_bytes();
+                                        Value::Integer(m)
+                                    }
+                                    None => Value::Error("would overflow".into()),
+                                },
+                                Err(_) => Value::Error("not an integer".into()),
+                            }
+                        }
+                        Some(M::List(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                8 | 9 => {
+                    let front = op == 8;
+                    words =
+                        vec![if front { "LPUSH".into() } else { "RPUSH".into() }, key.clone(), arg.clone()];
+                    match model.entry(key.clone()).or_insert_with(|| M::List(VecDeque::new())) {
+                        M::List(d) => {
+                            if front {
+                                d.push_front(arg.clone().into_bytes());
+                            } else {
+                                d.push_back(arg.clone().into_bytes());
+                            }
+                            Value::Integer(d.len() as i64)
+                        }
+                        M::Str(_) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                10 | 11 => {
+                    let front = op == 10;
+                    words = vec![if front { "LPOP".into() } else { "RPOP".into() }, key.clone()];
+                    match model.get_mut(&key) {
+                        Some(M::List(d)) => {
+                            let v = if front { d.pop_front() } else { d.pop_back() }.unwrap();
+                            if d.is_empty() {
+                                model.remove(&key);
+                            }
+                            Value::Bulk(v.into())
+                        }
+                        Some(M::Str(_)) => Value::Error("WRONGTYPE".into()),
+                        None => Value::NullBulk,
+                    }
+                }
+                _ => {
+                    words = vec!["LLEN".into(), key.clone()];
+                    match model.get(&key) {
+                        None => Value::Integer(0),
+                        Some(M::List(d)) => Value::Integer(d.len() as i64),
+                        Some(M::Str(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+            };
+            let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+            let got = run(&ctx, &mut state, &refs);
+            match (&got, &expected) {
+                (Value::Error(g), Value::Error(sub)) => assert!(
+                    g.contains(sub.as_str()),
+                    "op {i}: {refs:?} -> {got:?}, want error containing {sub:?}"
+                ),
+                _ => assert_eq!(got, expected, "op {i}: {refs:?}"),
+            }
+        }
+    }
 }

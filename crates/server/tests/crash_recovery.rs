@@ -664,3 +664,53 @@ fn non_loopback_ipv4s() -> Vec<std::net::IpAddr> {
     }
     Vec::new()
 }
+
+/// Mini soak: several client threads hammer mixed traffic for a bounded
+/// wall-clock window (default 2s; `REFLEXDB_SOAK_SECS` lengthens it for
+/// manual long runs). Per-thread `INCR` sequences must arrive gap-free —
+/// a lost update shows up as a wrong count — and under `appendfsync
+/// always` every acknowledged count must still be there after SIGKILL.
+#[cfg(unix)]
+#[test]
+fn soak_mixed_load_then_sigkill_recovers() {
+    let _serial = serial();
+    let dir = temp_dir("soak");
+    let port = free_port();
+    let mut server = spawn(port, &dir, &["--appendonly", "yes", "--appendfsync", "always"]);
+
+    let secs: u64 = std::env::var("REFLEXDB_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let mut joins = Vec::new();
+    for t in 0..4u64 {
+        joins.push(std::thread::spawn(move || {
+            let mut c = Client::connect(port);
+            let counter = format!("soak-{t}");
+            let scratch = format!("soak-scratch-{t}");
+            let mut n = 0i64;
+            while Instant::now() < deadline {
+                n += 1;
+                match c.cmd(&["INCR", &counter]) {
+                    Reply::Int(v) => assert_eq!(v, n, "lost update on {counter}"),
+                    other => panic!("INCR {counter} -> {other:?}"),
+                }
+                c.cmd(&["SET", &scratch, "x"]);
+                c.cmd(&["DEL", &scratch]);
+            }
+            n
+        }));
+    }
+    let counts: Vec<i64> = joins.into_iter().map(|j| j.join().unwrap()).collect();
+
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
+
+    sigkill(&mut server);
+    let mut server = spawn(port, &dir, &["--appendonly", "yes", "--appendfsync", "always"]);
+    let mut c = Client::connect(port);
+    for (t, n) in counts.iter().enumerate() {
+        assert_eq!(c.cmd(&["GET", &format!("soak-{t}")]), bulk(&n.to_string()));
+    }
+
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
