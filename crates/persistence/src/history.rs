@@ -30,6 +30,18 @@
 //!   so N concurrent `record()` callers cost O(1) batched commits instead
 //!   of O(N) individual ones.
 //!
+//! # Crash guarantee — weaker than the AOF, on purpose
+//!
+//! `record()` is fire-and-forget: a version is durable only once the
+//! writer thread's batch commits. A crash (or `kill -9`) can therefore
+//! lose up to ~one in-flight batch of the *newest* versions — never
+//! already-committed ones. `GETAT`/`HISTORY` may thus report the most
+//! recent ~milliseconds of history as missing after a crash; older
+//! versions are complete. `flush()` blocks until pending records have
+//! been through a commit and returns whether it landed; `io_failed()`
+//! reports whether the last commit failed (surfaced via `INFO`/
+//! `metrics-port` since `record()` itself can't return the error).
+//!
 //! # On-disk key layout
 //!
 //! Two index entries are written per recorded version, both inside the
@@ -53,6 +65,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -76,10 +89,11 @@ enum Job {
         ts_ms: u64,
         value: Option<Bytes>,
     },
-    /// Ack once every job sent before this one has been committed —
-    /// used by tests (and anything else that needs "has this landed yet")
-    /// to avoid sleeping/polling. Mirrors `aof::Job::Flush`.
-    Flush(mpsc::SyncSender<()>),
+    /// Ack once every job sent before this one has been through the
+    /// writer's batch commit — used by tests (and anything else that
+    /// needs "has this landed yet") to avoid sleeping/polling. `true` =
+    /// committed; `false` = the batch failed. Mirrors `aof::Job::Flush`.
+    Flush(mpsc::SyncSender<bool>),
 }
 
 pub struct HistoryWriter {
@@ -90,6 +104,12 @@ pub struct HistoryWriter {
     keyspace: Keyspace,
     max_versions_per_key: usize,
     write_lock: Arc<Mutex<()>>,
+    /// Set when the writer thread's last `commit` failed, cleared once a
+    /// batch lands cleanly. `record()` is fire-and-forget, so a version
+    /// dropped by a failed batch has already passed its write — like
+    /// `aof`'s `io_failed`, all we can do is report it (INFO/metrics)
+    /// rather than pretend it landed.
+    io_failed: Arc<AtomicBool>,
     // Keeps the writer thread alive for the program's lifetime.
     _worker: thread::JoinHandle<()>,
 }
@@ -117,10 +137,12 @@ impl HistoryWriter {
         let expected_marker = (max_versions_per_key as u64).to_be_bytes();
         let compact_on_start = limit_marker.as_deref() != Some(expected_marker.as_slice());
         let (tx, rx) = mpsc::sync_channel(4096);
+        let io_failed = Arc::new(AtomicBool::new(false));
         let worker_db = db.clone();
         let worker_keyspace = keyspace.clone();
         let write_lock = Arc::new(Mutex::new(()));
         let worker_write_lock = write_lock.clone();
+        let worker_io_failed = io_failed.clone();
         let worker = thread::Builder::new()
             .name("reflexdb-history-writer".into())
             .spawn(move || {
@@ -131,10 +153,19 @@ impl HistoryWriter {
                     max_versions_per_key,
                     compact_on_start,
                     worker_write_lock,
+                    worker_io_failed,
                 )
             })
             .map_err(|e| io::Error::other(format!("failed to spawn history writer thread: {e}")))?;
-        Ok(Self { tx: Mutex::new(tx), db, keyspace, max_versions_per_key, write_lock, _worker: worker })
+        Ok(Self {
+            tx: Mutex::new(tx),
+            db,
+            keyspace,
+            max_versions_per_key,
+            write_lock,
+            io_failed,
+            _worker: worker,
+        })
     }
 
     /// Queue one version of `key` for the history log. Fire-and-forget —
@@ -152,14 +183,26 @@ impl HistoryWriter {
     }
 
     /// Blocks until every `record()` call made before this one has been
-    /// committed to disk. Not used on any request path — only by tests
-    /// (and anything else that needs a deterministic "has this landed
-    /// yet" instead of sleeping/polling).
-    pub fn flush(&self) {
+    /// through the writer's batch commit; returns whether that batch
+    /// landed. Not used on any request path — only by tests (and anything
+    /// else that needs a deterministic "has this landed yet" instead of
+    /// sleeping/polling).
+    pub fn flush(&self) -> bool {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-        if self.tx.lock().unwrap().send(Job::Flush(ack_tx)).is_ok() {
-            let _ = ack_rx.recv();
-        }
+        self.tx.lock().unwrap().send(Job::Flush(ack_tx)).is_ok() && ack_rx.recv().unwrap_or(false)
+    }
+
+    /// `true` once the writer thread has reported a batch commit failure
+    /// — surfaced via `INFO persistence`/`metrics` since `record()` is
+    /// fire-and-forget and can't return the error itself.
+    pub fn io_failed(&self) -> bool {
+        self.io_failed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook: simulates the writer thread reporting a commit failure.
+    #[doc(hidden)]
+    pub fn force_io_failure(&self) {
+        self.io_failed.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The string value `key` held at or before `ts_ms` — the newest
@@ -261,6 +304,7 @@ fn writer_loop(
     max_versions_per_key: usize,
     compact_on_start: bool,
     write_lock: Arc<Mutex<()>>,
+    io_failed: Arc<AtomicBool>,
 ) {
     if compact_on_start {
         if let Err(error) = compact_history(&db, &keyspace, max_versions_per_key, &write_lock) {
@@ -303,8 +347,9 @@ fn writer_loop(
             batch.insert(&keyspace, by_count_key(db_index, &key), count.to_be_bytes());
             touched.push((db_index, key, count));
         }
-        match batch.commit() {
+        let committed = match batch.commit() {
             Ok(()) => {
+                io_failed.store(false, std::sync::atomic::Ordering::Relaxed);
                 for (db_index, key, count) in touched {
                     if let Err(error) =
                         trim_key_history(&db, &keyspace, db_index, &key, max_versions_per_key, count)
@@ -312,11 +357,16 @@ fn writer_loop(
                         tracing::warn!(%error, db_index, key = ?key, "failed to enforce per-key history limit");
                     }
                 }
+                true
             }
-            Err(error) => tracing::warn!(%error, "history writer thread failed to commit a batch"),
-        }
+            Err(error) => {
+                io_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(%error, "history writer thread failed to commit a batch");
+                false
+            }
+        };
         for ack in acks {
-            let _ = ack.send(());
+            let _ = ack.send(committed);
         }
     }
 }
@@ -548,6 +598,20 @@ mod tests {
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("reflexdb-history-test-{name}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn flush_reports_commit_result_and_io_failed_flag() {
+        let dir = temp_dir("flush-ack");
+        let writer = HistoryWriter::open(&dir).unwrap();
+
+        writer.record(0, Bytes::from("k"), 100, Some(Bytes::from("v")));
+        assert!(writer.flush(), "healthy writer must ack true");
+        assert!(!writer.io_failed());
+        writer.force_io_failure();
+        assert!(writer.io_failed());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

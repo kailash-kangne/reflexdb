@@ -206,7 +206,14 @@ the write path (fire-and-forget to a batching writer thread). `history-retention
 24h; `0` disables age-based expiry. `history-max-versions-per-key` defaults to 200 (range
 1–1,000,000); the writer trims older versions and `GETAT`/`HISTORY` observe only the capped
 window. A per-key cap does not limit the number of distinct keys, so total disk use can still grow
-when age retention is disabled. `OBJECTAT`, `RESTOREAT`, `LIVE ... SINCE`, and `EXPIREACTION` are
+when age retention is disabled.
+
+**Crash guarantee** — weaker than the AOF, deliberately: `record()` is fire-and-forget, so a
+crash can lose up to ~one in-flight batch of the *newest* versions (already-committed versions
+are never lost). `GETAT`/`HISTORY` may therefore miss the last ~milliseconds of history after a
+crash; older versions are complete. A failed batch commit sets `history_io_failed` in
+`INFO persistence` and the `metrics-port` exposition — history loss never gates keyspace writes.
+`OBJECTAT`, `RESTOREAT`, `LIVE ... SINCE`, and `EXPIREACTION` are
 designed but not built — see [ROADMAP.md](ROADMAP.md).
 
 ## Workflow recovery — `RUN.*` / `IDEMPOTENT`
