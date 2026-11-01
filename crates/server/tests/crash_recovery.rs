@@ -302,6 +302,27 @@ fn scheduled_commands_survive_sigkill() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two servers sharing one `--dir` would interleave AOF/RDB writes and
+/// corrupt both. The second must refuse to start (dir flock), and the
+/// first must be unaffected. Restart-after-SIGKILL is already exercised
+/// by every other test here — they all respawn on the same dir.
+#[cfg(unix)]
+#[test]
+fn second_server_on_same_dir_refuses() {
+    let dir = temp_dir("dir-lock");
+    let port = free_port();
+    let mut server = spawn(port, &dir, &[]);
+    let mut c = Client::connect(port);
+
+    let mut second = spawn(free_port(), &dir, &[]);
+    let status = second.wait().expect("second server should have exited");
+    assert!(!status.success(), "second server on a locked dir must fail");
+
+    assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Wire-level RESP compatibility spot-checks against a live server —
 /// complements `benchmarks/smoke.sh` (which is manual) with something CI runs.
 #[test]

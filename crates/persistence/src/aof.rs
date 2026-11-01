@@ -621,7 +621,8 @@ pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
             "AOF exceeds 4 GiB replay limit; rewrite or trim it",
         ));
     }
-    let data = if data.starts_with(AOF_MAGIC) {
+    let compressed = data.starts_with(AOF_MAGIC);
+    let data = if compressed {
         let mut decoded = Vec::new();
         let mut cursor = AOF_MAGIC.len();
         while cursor < data.len() {
@@ -632,17 +633,20 @@ pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
             }
             let len = u32::from_be_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
-            if len > MAX_COMPRESSED_BATCH + 1024 * 1024 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "AOF frame exceeds replay limit"));
-            }
-            if data.len() - cursor < len {
+            // A bad length, short tail or undecodable frame means corruption —
+            // truncate at the last good frame and boot with the complete
+            // prefix, same contract as the torn-tail path below.
+            if len > MAX_COMPRESSED_BATCH + 1024 * 1024 || data.len() - cursor < len {
                 OpenOptions::new().write(true).open(path)?.set_len(frame_start as u64)?;
                 break;
             }
-            let frame =
-                zstd::bulk::decompress(&data[cursor..cursor + len], MAX_COMPRESSED_BATCH).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("invalid compressed AOF frame: {e}"))
-                })?;
+            let frame = match zstd::bulk::decompress(&data[cursor..cursor + len], MAX_COMPRESSED_BATCH) {
+                Ok(frame) => frame,
+                Err(_) => {
+                    OpenOptions::new().write(true).open(path)?.set_len(frame_start as u64)?;
+                    break;
+                }
+            };
             decoded.extend_from_slice(&frame);
             cursor += len;
         }
@@ -661,13 +665,20 @@ pub fn replay(path: &Path) -> io::Result<Vec<Vec<Bytes>>> {
             // Keep the complete prefix and truncate the torn tail before the
             // writer reopens this file in append mode; otherwise future
             // commands would be appended inside the incomplete frame.
-            Ok(None) => {
-                let complete_len = data.len() - buf.len();
-                drop(buf);
-                OpenOptions::new().write(true).open(path)?.set_len(complete_len as u64)?;
+            // Mid-file corruption (bad RESP where a request should start)
+            // gets the same contract: keep the complete prefix, truncate the
+            // rest, boot anyway.
+            Ok(None) | Err(_) => {
+                if !compressed {
+                    // Decoded length only maps to file bytes for the plain
+                    // format; compressed files were already truncated at
+                    // frame granularity above.
+                    let complete_len = data.len() - buf.len();
+                    drop(buf);
+                    OpenOptions::new().write(true).open(path)?.set_len(complete_len as u64)?;
+                }
                 break;
             }
-            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())),
         }
     }
     Ok(requests)
@@ -725,13 +736,21 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Corruption mid-file must not block boot: replay keeps the complete
+    /// prefix and truncates the file at the last good request boundary, so
+    /// the writer can keep appending into a well-formed file.
     #[test]
-    fn replay_rejects_malformed_frames_without_panicking() {
+    fn replay_truncates_at_malformed_frames_and_keeps_prefix() {
         let path = std::env::temp_dir().join(format!("reflexdb-aof-malformed-{}.aof", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, b"*1\r\n$999999999999999999999\r\n").unwrap();
-        let error = replay(&path).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let good = encode(&[Bytes::from_static(b"PING")]);
+        let mut bytes = good.clone();
+        bytes.extend_from_slice(b"*1\r\n$999999999999999999999\r\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(replay(&path).unwrap(), vec![vec![Bytes::from_static(b"PING")]]);
+        assert_eq!(std::fs::read(&path).unwrap(), good);
         let _ = std::fs::remove_file(path);
     }
 

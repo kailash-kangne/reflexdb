@@ -57,6 +57,10 @@ async fn main() -> std::io::Result<()> {
         tracing::warn!(dir = %cfg.dir.display(), error = %e, "could not create data dir");
     }
 
+    // Held for the process lifetime; the OS releases the flock on any exit
+    // (including SIGKILL), so a crashed server can't leave the dir locked.
+    let _dir_lock = acquire_dir_lock(&cfg.dir);
+
     let store = if cfg.tiered_storage {
         match tiered::FjallTier::open(&cfg.tiered_dir_path()) {
             Ok(tier) => {
@@ -955,6 +959,34 @@ async fn resolve_wait(
             None => ctx.replica_ack_notify.notified().await,
         }
     }
+}
+
+/// Opens `<dir>/reflexdb.lock` and takes an exclusive non-blocking flock on
+/// it. A second server pointed at the same data dir gets a clear refusal
+/// instead of two writers corrupting the same AOF/RDB. Unix only — on other
+/// platforms the pid file is still written but no lock is taken.
+fn acquire_dir_lock(dir: &std::path::Path) -> std::fs::File {
+    use std::io::Write;
+    let path = dir.join("reflexdb.lock");
+    let file =
+        std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(&path).unwrap_or_else(|e| {
+            eprintln!("reflexdb-server: cannot open {}: {e}", path.display());
+            std::process::exit(1);
+        });
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            eprintln!(
+                "reflexdb-server: {} is locked by another reflexdb-server (or a stale mount); \
+                 refusing to share a data dir",
+                path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    let _ = (&file).write_all(std::process::id().to_string().as_bytes());
+    file
 }
 
 /// Small shim so we don't need to pull in `futures::StreamExt` just for `.next()`.
