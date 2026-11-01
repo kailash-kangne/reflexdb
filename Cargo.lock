@@ -105,6 +105,7 @@ dependencies = [
  "crc",
  "dashmap",
  "keyspace",
+ "libc",
  "mlua",
  "persistence",
  "rand",

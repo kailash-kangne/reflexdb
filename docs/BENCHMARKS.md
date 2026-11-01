@@ -5,7 +5,8 @@ below came from one Apple M5 machine; the Engine shootout was rerun on an arm64 
 Both are single-machine observations, so re-measure before quoting numbers externally.
 `benchmarks/run.py` provides a checked-in, standard-library-only RESP2 harness for repeatable runs
 against a running server; `benchmarks/run_rfx.py` is the same harness speaking RFX
-(`docs/RFX.md`). `benchmarks/smoke.sh` is a redis-cli feature check that runs against any
+(`docs/RFX.md`). `benchmarks/compare.py` diffs a `--output` JSONL history across `--label`ed builds
+and exits non-zero on regressions past a threshold — see [OPERATIONS.md](OPERATIONS.md). `benchmarks/smoke.sh` is a redis-cli feature check that runs against any
 RESP-compatible server — the shared command suite passes on ReflexDB, Redis, and Dragonfly, with
 ReflexDB-only commands (`LIVE`, `SCHEDULE`, single-flight, `GETAT`) auto-detected and skipped on
 other engines.

@@ -81,6 +81,7 @@ def summarize(name, run, pipeline, clients, elapsed, samples, ops, errors=0, **e
         "run": run,
         "pipeline": pipeline,
         "clients": clients,
+        "timestamp": int(time.time()),
         "operations": ops,
         "elapsed_seconds": round(elapsed, 6),
         "ops_per_second": round(ops / elapsed, 2) if elapsed else 0,
@@ -235,6 +236,8 @@ def main():
                         help="buffer watcher pushes in kernel sockets or drain them in a selector")
     parser.add_argument("--workloads", default="small-mixed,hot-key,live-fanout")
     parser.add_argument("--output", help="JSONL output path; stdout if omitted")
+    parser.add_argument("--label", default="",
+                        help="tag every emitted row (e.g. a git sha) so compare.py can diff builds")
     args = parser.parse_args()
     pipelines = [int(x) for x in args.pipeline.split(",")]
     workloads = [x.strip() for x in args.workloads.split(",")]
@@ -256,11 +259,13 @@ def main():
                     for pipeline in pipelines:
                         row = run_requests(args.host, args.port, workload, run, args.seconds,
                                            args.clients, pipeline, args.keys, args.value_size)
+                        row["label"] = args.label
                         line = json.dumps(row, sort_keys=True)
                         print(line, flush=True) if output is None else output.write(line + "\n")
                         if output:
                             output.flush()
                     continue
+                row["label"] = args.label
                 line = json.dumps(row, sort_keys=True)
                 print(line, flush=True) if output is None else output.write(line + "\n")
                 if output:

@@ -236,6 +236,57 @@ fn rdb_survives_sigkill_after_save() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Backup/restore: the persisted artifact (dump.rdb or appendonly.aof)
+/// must be self-contained — copied into a different server's `dir`, a
+/// fresh boot restores it exactly.
+#[test]
+fn backup_artifacts_restore_in_a_fresh_dir() {
+    let _serial = serial();
+    let port = free_port();
+
+    // RDB path: SAVE, copy dump.rdb to an empty dir, boot.
+    let src = temp_dir("backup-src-rdb");
+    let dst = temp_dir("backup-dst-rdb");
+    let mut server = spawn(port, &src, &[]);
+    {
+        let mut c = Client::connect(port);
+        assert_eq!(c.cmd(&["SET", "k1", "v1"]), Reply::Simple("OK".into()));
+        assert_eq!(c.cmd(&["HSET", "h", "f", "v"]), Reply::Int(1));
+        assert_eq!(c.cmd(&["SAVE"]), Reply::Simple("OK".into()));
+    }
+    sigkill(&mut server);
+    std::fs::copy(src.join("dump.rdb"), dst.join("dump.rdb")).unwrap();
+
+    let mut server = spawn(port, &dst, &[]);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&["GET", "k1"]), bulk("v1"));
+    assert_eq!(c.cmd(&["HGET", "h", "f"]), bulk("v"));
+    sigkill(&mut server);
+
+    // AOF path: appendonly, SIGKILL after writes, copy the AOF, boot.
+    let src = temp_dir("backup-src-aof");
+    let dst = temp_dir("backup-dst-aof");
+    let aof_args = ["--appendonly", "yes", "--appendfsync", "always"];
+    let mut server = spawn(port, &src, &aof_args);
+    {
+        let mut c = Client::connect(port);
+        assert_eq!(c.cmd(&["SET", "k1", "v1"]), Reply::Simple("OK".into()));
+        assert_eq!(c.cmd(&["INCR", "n"]), Reply::Int(1));
+    }
+    sigkill(&mut server);
+    std::fs::copy(src.join("appendonly.aof"), dst.join("appendonly.aof")).unwrap();
+
+    let mut server = spawn(port, &dst, &aof_args);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&["GET", "k1"]), bulk("v1"));
+    assert_eq!(c.cmd(&["GET", "n"]), bulk("1"));
+    sigkill(&mut server);
+
+    for d in [src, dst] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
 /// `appendfsync no` + a burst of writes killed mid-flight: the torn tail
 /// must not stop startup — replay keeps the complete prefix and carries on.
 #[test]
