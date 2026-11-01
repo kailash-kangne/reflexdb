@@ -23,6 +23,47 @@ use crate::{
     set, singleflight, snapshot, stream, string, txn, zset,
 };
 
+thread_local! {
+    /// When `Some`, `ServerContext::append_aof`/`replicate` divert their
+    /// request here instead of logging/sending it — `recovery`'s
+    /// `IDEMPOTENT`/`IDKAPPLY` use this to pack an inner command's effects
+    /// into one durable `IDKAPPLY` record (the atomic unit that makes the
+    /// wrapped command exactly-once across a crash) rather than letting
+    /// each effect commit on its own. Thread-local because `dispatch` —
+    /// including recursive inner dispatches — runs synchronously on one
+    /// thread.
+    static EFFECT_CAPTURE: RefCell<Option<Vec<Request>>> = const { RefCell::new(None) };
+}
+
+/// Start diverting this thread's effect records into a fresh buffer.
+pub(crate) fn effect_capture_begin() {
+    EFFECT_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop diverting and return everything captured since
+/// `effect_capture_begin` (empty when none was active).
+pub(crate) fn effect_capture_take() -> Vec<Request> {
+    EFFECT_CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+/// Push `req` into the active capture, returning whether one was.
+pub(crate) fn effect_capture_push(req: &[Bytes]) -> bool {
+    EFFECT_CAPTURE.with(|c| match &mut *c.borrow_mut() {
+        Some(buf) => {
+            buf.push(req.to_vec());
+            true
+        }
+        None => false,
+    })
+}
+
+/// Whether a capture is active on this thread — `replicate` uses this to
+/// stay silent while effects are being bundled (the `IDKAPPLY` record
+/// replicates in their place).
+pub(crate) fn effect_capture_active() -> bool {
+    EFFECT_CAPTURE.with(|c| c.borrow().is_some())
+}
+
 /// `maxmemory-policy` — which keys are candidates for eviction once
 /// `maxmemory` is exceeded. The `-lru`/`-lfu` variants rank candidates by
 /// `keyspace::Db::access_stats` (a plain "last access instant"/"access
@@ -432,6 +473,11 @@ pub struct ServerContext {
     pub max_evictions_per_tick: usize,
     /// `SCHEDULE AT`/`SCHEDULE IN` queue, drained by `run_due_scheduled`.
     pub(crate) scheduler: Scheduler,
+    /// Serializes the multi-key `RUN CHECKPOINT`/`RUN RESTORE` operations
+    /// per run id — two restores (or a checkpoint taken mid-restore) would
+    /// otherwise interleave their delete/rebuild halves and leave a merged
+    /// state matching no snapshot.
+    pub(crate) run_locks: DashMap<Bytes, std::sync::Arc<std::sync::Mutex<()>>>,
     /// Active `GET ... SINGLEFLIGHT` leases, keyed by (db, key).
     pub(crate) singleflight: DashMap<(usize, Bytes), std::sync::Arc<SingleFlightLease>>,
     /// Mirrors `singleflight.len()` — same rationale as `key_watchers_len`.
@@ -620,6 +666,7 @@ impl ServerContext {
             eviction_low_watermark: 0.5,
             max_evictions_per_tick: 10_000,
             scheduler: Scheduler::default(),
+            run_locks: DashMap::new(),
             singleflight: DashMap::new(),
             singleflight_len: AtomicUsize::new(0),
             singleflight_max_wait: Duration::from_secs(10),
@@ -854,6 +901,9 @@ impl ServerContext {
     }
 
     pub(crate) fn append_aof(&self, db_index: usize, req: &[Bytes]) {
+        if effect_capture_push(req) {
+            return;
+        }
         let aof = self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(writer) = &*aof {
             if let Err(e) = writer.append(db_index, req) {
@@ -2282,6 +2332,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
 
         "RUN" => recovery::cmd_run(ctx, state, args),
         "IDEMPOTENT" => recovery::cmd_idempotent(ctx, state, args),
+        "IDKAPPLY" => recovery::cmd_idkapply(ctx, state, args),
 
         "ROLE" => replication::cmd_role(ctx, args),
         "REPLICAOF" | "SLAVEOF" => replication::cmd_replicaof(ctx, args),
@@ -3044,6 +3095,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "ACL",
     "RUN",
     "IDEMPOTENT",
+    "IDKAPPLY",
 ];
 
 /// Commands that mutate the keyspace — used both by `EVAL_RO`/`EVALSHA_RO`
@@ -3139,10 +3191,11 @@ const WRITE_COMMAND_NAMES: &[&str] = &[
     "XCLAIM",
     "XAUTOCLAIM",
     // `IDEMPOTENT` is deliberately absent: logging the raw request would
-    // re-execute the inner command on replicas — it logs its result
-    // marker itself (see `recovery::cmd_idempotent`), same pattern as the
-    // blocking commands below.
+    // re-execute the inner command on replicas — it emits one fused
+    // `IDKAPPLY` record instead (see `recovery::cmd_idempotent`), same
+    // pattern as the blocking commands below.
     "RUN",
+    "IDKAPPLY",
 ];
 
 /// `KNOWN_COMMANDS` as a `HashSet` — the MULTI-queueing check runs this
@@ -3167,7 +3220,15 @@ pub fn request_may_write(req: &Request) -> bool {
         || (name == "SORT" && req[1..].iter().any(|arg| arg.eq_ignore_ascii_case(b"STORE")))
         || matches!(
             name.as_str(),
-            "BLPOP" | "BRPOP" | "BLMPOP" | "BLMOVE" | "BZPOPMIN" | "BZPOPMAX" | "BZMPOP" | "IDEMPOTENT"
+            "BLPOP"
+                | "BRPOP"
+                | "BLMPOP"
+                | "BLMOVE"
+                | "BZPOPMIN"
+                | "BZPOPMAX"
+                | "BZMPOP"
+                | "IDEMPOTENT"
+                | "SCHEDULE"
         )
 }
 
@@ -4054,6 +4115,30 @@ mod tests {
             other => panic!("expected an array, got {other:?}"),
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes applied through the replication link go through the same
+    /// `on_key_changed` → `drain_pending_history` path as client writes —
+    /// so a replica with `history-enabled yes` builds its own version log
+    /// as it applies the stream (timestamps are replica-local; history
+    /// predating the attach doesn't transfer).
+    #[test]
+    fn replication_link_writes_record_history() {
+        let (ctx, mut st, dir) = fresh_with_history();
+        let mut repl = ClientState::for_replication_link();
+        run(&ctx, &mut repl, &["SET", "rk", "v1"]);
+        // Versions are keyed by epoch-ms — land the second write in the
+        // next tick so it doesn't collapse into the first (same jitter
+        // guard `getat_and_history_track_string_versions` uses).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        run(&ctx, &mut repl, &["SET", "rk", "v2"]);
+        ctx.history_flush();
+
+        match run(&ctx, &mut st, &["HISTORY", "rk"]) {
+            Value::Array(versions) => assert_eq!(versions.len(), 2),
+            other => panic!("expected an array, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

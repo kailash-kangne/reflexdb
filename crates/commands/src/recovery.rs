@@ -23,12 +23,21 @@ use keyspace::Value as KVal;
 use resp::{Protocol, Value};
 
 use crate::dispatch::{
-    dispatch, err, on_key_changed, reply, saturating_deadline, wrong_args, wrong_type, ClientState, Outcome,
-    ServerContext,
+    dispatch, effect_capture_begin, effect_capture_take, err, on_key_changed, reply, saturating_deadline,
+    wrong_args, wrong_type, ClientState, Outcome, ServerContext,
 };
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Per-run mutex for the multi-key operations (CHECKPOINT snapshots many
+/// keys, RESTORE deletes+rebuilds them). Two of these running at once on
+/// the same id could interleave their halves and leave state matching no
+/// snapshot; unrelated single-key writes to `run:<id>:*` are *not* covered
+/// (same non-atomic point-in-time semantics `BGSAVE` has).
+fn run_lock(ctx: &ServerContext, id: &[u8]) -> std::sync::Arc<std::sync::Mutex<()>> {
+    ctx.run_locks.entry(Bytes::copy_from_slice(id)).or_default().clone()
 }
 
 fn run_key(id: &[u8]) -> Bytes {
@@ -201,6 +210,8 @@ fn run_checkpoint(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) 
         Some(Ok((status, _))) if status.as_ref() != b"running" => return err("ERR run is not running"),
         _ => {}
     }
+    let lock = run_lock(ctx, id);
+    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let prefix = user_prefix(id);
     let mut items: Vec<(Bytes, Vec<u8>, Option<u64>)> = Vec::new();
     for key in db.keys_snapshot() {
@@ -241,6 +252,8 @@ fn run_restore(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> 
         Some(Err(())) => return wrong_type(),
         _ => {}
     }
+    let lock = run_lock(ctx, id);
+    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let key = cp_key(id, label);
     let Some(payload) = db.with_value(&key, |v| v.string_bytes()).flatten() else {
         return err("ERR no such checkpoint");
@@ -411,11 +424,16 @@ fn run_audit(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Ou
 /// rejected up front.
 ///
 /// `IDEMPOTENT` is deliberately not in `WRITE_COMMANDS`: logging the raw
-/// request would re-execute the inner command on replicas (double-apply
-/// for `INCR` & friends). Instead the wrapped write logs itself through
-/// the inner dispatch (effects replication), and the stored result is
-/// logged here as a plain `SET`/`PSETEX` — a replica ends up byte-for-byte
-/// identical to the primary.
+/// request would re-execute the inner command on replay/replicas
+/// (double-apply for `INCR` & friends). Instead it emits **one** fused
+/// `IDKAPPLY` record holding the inner command's already-resolved effect
+/// commands *and* the stored reply — captured while the inner dispatch's
+/// own AOF/replication enqueues are diverted (see
+/// `dispatch::effect_capture_*`). One record is the atomic unit: effects
+/// and "done" marker land on disk and on replicas together or not at
+/// all, so a crash can never leave an applied-but-unmarked execution
+/// that a retry would re-run. This is what makes `IDEMPOTENT`
+/// exactly-once across `kill -9`, not just at-least-once.
 const IDK_PENDING: &[u8] = b"\x00idk";
 
 const IDK_FORBIDDEN: &[&str] = &[
@@ -445,6 +463,7 @@ const IDK_FORBIDDEN: &[&str] = &[
     "SAVE",
     "BGSAVE",
     "RUN",
+    "IDKAPPLY",
 ];
 
 enum Claim {
@@ -510,27 +529,40 @@ pub fn cmd_idempotent(ctx: &ServerContext, state: &mut ClientState, args: &[Byte
             _ => err("ERR corrupt idempotent result"),
         },
         Claim::Fresh => {
-            match dispatch(ctx, state, cmd.to_vec()) {
+            // Divert the inner command's effect records (its own
+            // AOF/replication enqueues, wherever they're emitted from)
+            // into the capture buffer — they get packed into the fused
+            // `IDKAPPLY` below instead of committing one by one.
+            effect_capture_begin();
+            let inner = dispatch(ctx, state, cmd.to_vec());
+            let effects = effect_capture_take();
+            match inner {
                 Outcome::Reply(v) if !matches!(v, Value::Error(_)) => {
                     let mut encoded = BytesMut::new();
                     v.encode(&mut encoded, Protocol::Resp2);
                     let encoded = encoded.freeze();
-                    db.set(key.clone(), KVal::String(encoded.clone()), deadline);
+                    let effects_blob =
+                        match bincode::DefaultOptions::new().with_fixint_encoding().serialize(&effects) {
+                            Ok(b) => Bytes::from(b),
+                            Err(e) => {
+                                db.del(std::slice::from_ref(key));
+                                return err(format!("ERR idempotent effect serialization failed: {e}"));
+                            }
+                        };
+                    let apply_req = vec![
+                        Bytes::from_static(b"IDKAPPLY"),
+                        key.clone(),
+                        Bytes::from(ttl_ms.to_string()),
+                        effects_blob,
+                        encoded.clone(),
+                    ];
+                    // The single durable record — under `appendfsync
+                    // always` this returns only after the fsync, so the
+                    // reply can never outrun the marker's durability.
+                    ctx.append_aof(state.db_index, &apply_req);
+                    ctx.replicate(state.db_index, &apply_req);
+                    db.set(key.clone(), KVal::String(encoded), deadline);
                     on_key_changed(ctx, state, state.db_index, key.clone(), None);
-                    // Log the *result marker*, not the raw request — the
-                    // inner command already logged its own effect.
-                    let marker_req: Vec<Bytes> = if ttl_ms > 0 {
-                        vec![
-                            Bytes::from_static(b"PSETEX"),
-                            key.clone(),
-                            Bytes::from(ttl_ms.to_string()),
-                            encoded,
-                        ]
-                    } else {
-                        vec![Bytes::from_static(b"SET"), key.clone(), encoded]
-                    };
-                    ctx.append_aof(state.db_index, &marker_req);
-                    ctx.replicate(state.db_index, &marker_req);
                     reply(v)
                 }
                 // Errors and non-reply outcomes (blocking waits, pub/sub
@@ -547,6 +579,43 @@ pub fn cmd_idempotent(ctx: &ServerContext, state: &mut ClientState, args: &[Byte
             }
         }
     }
+}
+
+/// `IDKAPPLY <key> <ttl_ms> <effects_blob> <reply_blob>` — the fused
+/// durable record `IDEMPOTENT` emits: replay the inner command's
+/// resolved effects, then write the result marker. Internal only — it
+/// exists on the replication link and in AOF replay, never accepted from
+/// a client connection (rejected like an unknown command).
+pub fn cmd_idkapply(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Outcome {
+    if !state.is_replication_link {
+        return err("ERR unknown command 'IDKAPPLY'");
+    }
+    let [key, ttl_ms, effects_blob, reply_blob] = args else { return wrong_args("idkapply") };
+    let ttl_ms: u64 = match std::str::from_utf8(ttl_ms).ok().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => return err("ERR ttl_ms is not an integer or out of range"),
+    };
+    let Ok(effects) = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(effects_blob.len() as u64)
+        .deserialize::<Vec<Vec<Bytes>>>(effects_blob)
+    else {
+        return err("ERR corrupt idempotent effects");
+    };
+    // Suppress each effect's own log/replicate enqueue: this IDKAPPLY is
+    // already their durable record (it re-logs/re-replicates itself as a
+    // write command), so emitting the effects again would double-apply
+    // downstream.
+    effect_capture_begin();
+    for req in effects {
+        dispatch(ctx, state, req);
+    }
+    effect_capture_take();
+    let deadline = (ttl_ms > 0).then(|| saturating_deadline(Duration::from_millis(ttl_ms)));
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+    db.set(key.clone(), KVal::String(reply_blob.clone()), deadline);
+    on_key_changed(ctx, state, state.db_index, key.clone(), None);
+    reply(Value::ok())
 }
 
 /// Strict RESP2 reply decoder — only used to re-read replies this same
@@ -688,6 +757,45 @@ mod tests {
             Value::Error(e) => assert!(e.contains("cannot wrap")),
             v => panic!("expected error, got {v:?}"),
         }
+    }
+
+    /// `IDKAPPLY` is the fused record `IDEMPOTENT` logs: replaying it must
+    /// land the inner effects *and* the result marker, and a later
+    /// `IDEMPOTENT` retry must answer the stored reply without running
+    /// anything again. Clients can never issue it themselves.
+    #[test]
+    fn idkapply_replays_effects_and_marker_atomically() {
+        let (ctx, mut st) = fresh();
+        let mut repl = ClientState::for_replication_link();
+
+        // Clients can't emit the internal record.
+        match run(&ctx, &mut st, &["IDKAPPLY", "k", "0", "x", "y"]) {
+            Value::Error(e) => assert!(e.contains("unknown command")),
+            v => panic!("expected error, got {v:?}"),
+        }
+
+        // Build the same record cmd_idempotent would emit for
+        // `IDEMPOTENT idk 0 INCR n`: one INCR effect + the stored `:1`.
+        let effects: Vec<Vec<Bytes>> = vec![vec![Bytes::from_static(b"INCR"), Bytes::from_static(b"idk:n")]];
+        let effects_blob =
+            Bytes::from(bincode::DefaultOptions::new().with_fixint_encoding().serialize(&effects).unwrap());
+        let reply_blob = enc(&Value::Integer(1));
+        let req = vec![
+            Bytes::from_static(b"IDKAPPLY"),
+            Bytes::from_static(b"idk"),
+            Bytes::from_static(b"0"),
+            effects_blob,
+            reply_blob,
+        ];
+        match dispatch(&ctx, &mut repl, req) {
+            Outcome::Reply(v) => assert_eq!(v, Value::ok()),
+            _ => panic!("unexpected non-reply outcome"),
+        }
+
+        assert_eq!(run(&ctx, &mut st, &["GET", "idk:n"]), Value::bulk(&b"1"[..]));
+        // Retry on the same key: stored reply, no re-execution (n stays 1).
+        assert_eq!(run(&ctx, &mut st, &["IDEMPOTENT", "idk", "0", "INCR", "idk:n"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut st, &["GET", "idk:n"]), Value::bulk(&b"1"[..]));
     }
 
     #[test]

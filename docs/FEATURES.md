@@ -30,8 +30,12 @@ its full representation. Geo and HyperLogLog are not implemented (see
   read).
 - Eviction policies under `maxmemory`: `noeviction` (default), `allkeys-lru/lfu/random`,
   `volatile-lru/lfu/random/ttl`. LFU is a plain access counter, not a decayed approximation.
-- `SCHEDULE AT/IN <command>`, `SCHEDULE LIST`, `SCHEDULE CANCEL` — delayed command execution,
-  in-memory only (`scheduled-commands-max`, default 100000). Doesn't survive a restart yet.
+- `SCHEDULE AT/IN <command>`, `SCHEDULE LIST`, `SCHEDULE CANCEL` — delayed command execution.
+  Registration writes a `~sched:<id>` marker key, so tasks persist via AOF/RDB, replicate, and
+  re-arm on restart and on replica promotion (cap: `scheduled-commands-max`, default 100000).
+  Markers are user-visible bookkeeping keys — a manual `DEL ~sched:<id>` cancels the task.
+  Firing deletes the marker *after* the command runs: a crash in between re-fires it once —
+  at-least-once, never silently lost.
 
 ## Reactivity — `LIVE` / `UNLIVE`
 
@@ -192,7 +196,9 @@ HISTORY <key> [LIMIT n]  # versions: (timestamp, command, summary), newest-first
 ```
 
 Versions are written to a disk-backed side-car store (`fjall`, same engine as the tier), not
-reconstructed from the AOF, and not replicated. Recording a version costs one channel push on
+reconstructed from the AOF. Replicas with `history-enabled yes` record their own versions for
+every write they apply (timestamps are replica-local; history predating the attach doesn't
+transfer, and an RDB/full-resync load records nothing). Recording a version costs one channel push on
 the write path (fire-and-forget to a batching writer thread). `history-retention-ms` defaults to
 24h; `0` disables age-based expiry. `history-max-versions-per-key` defaults to 200 (range
 1–1,000,000); the writer trims older versions and `GETAT`/`HISTORY` observe only the capped
@@ -221,9 +227,15 @@ IDEMPOTENT <key> <ttl_ms> <cmd> <args...>
 
 `IDEMPOTENT` claims `key` atomically, runs `cmd`, stores its reply under `key`, and answers
 retries with the stored reply — no re-execution. Errors release the claim instead of caching.
-Connection-state commands, blockers, and `RUN`/`IDEMPOTENT` itself can't be wrapped. On
-replicas only completed markers answer; the marker replicates as `SET`/`PSETEX`, so a failover
-keeps "execute once" semantics. `GETAT`/`HISTORY` on the `run:` keys give a second audit view
+Connection-state commands, blockers, and `RUN`/`IDEMPOTENT` itself can't be wrapped.
+The durable record is a single internal `IDKAPPLY` command packing the inner command's resolved
+effects plus the stored reply — effects and marker land on disk and on replicas together or not
+at all, so a crash (or failover) mid-execution can't leave an applied-but-unmarked run that a
+retry would double-execute: exactly-once, not just at-least-once. `IDKAPPLY` itself only exists
+on the replication link and in AOF replay; clients can't issue it.
+`CHECKPOINT`/`RESTORE` serialize against each other per run id (a checkpoint can't capture a
+half-restored state); like `BGSAVE`, they aren't atomic against unrelated concurrent writes to
+`run:<id>:*` keys. `GETAT`/`HISTORY` on the `run:` keys give a second audit view
 when `history-enabled` is on.
 
 ## Cache correctness — single-flight

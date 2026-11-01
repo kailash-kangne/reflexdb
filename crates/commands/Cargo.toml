@@ -14,6 +14,7 @@ mlua = { version = "0.9", features = ["lua51", "vendored"] }
 sha1 = "0.10"
 sha2 = "0.10"
 bincode.workspace = true
+serde.workspace = true
 rand = { workspace = true }
 tracing.workspace = true
 resp = { path = "../resp" }

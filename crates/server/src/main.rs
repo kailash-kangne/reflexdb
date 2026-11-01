@@ -205,6 +205,13 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    // Re-arm `SCHEDULE` timers from the `~sched:*` markers persistence
+    // just restored — runs again on replica promotion (replica_link).
+    let rearmed = ctx.load_scheduled();
+    if rearmed > 0 {
+        tracing::info!(rearmed, "restored scheduled commands");
+    }
+
     if let Some(profile) = &cfg.profile {
         tracing::info!(%profile, appendonly = cfg.appendonly, appendfsync = ?cfg.appendfsync,
             min_replicas_to_write = cfg.min_replicas_to_write, "durability profile applied");

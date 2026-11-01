@@ -68,6 +68,13 @@ pub async fn supervise(ctx: Arc<ServerContext>, tls: Option<TlsConnector>) {
             None => {
                 cursor = None;
                 tracing::info!("REPLICAOF NO ONE: promoted back to primary");
+                // A promoted replica's armed timers were never firing —
+                // re-arm (idempotently) from `~sched:*` markers now that
+                // this node owns them.
+                let armed = ctx.load_scheduled();
+                if armed > 0 {
+                    tracing::info!(armed, "re-armed scheduled commands after promotion");
+                }
             }
         }
     }

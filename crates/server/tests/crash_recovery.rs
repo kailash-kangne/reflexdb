@@ -200,6 +200,108 @@ fn torn_aof_tail_still_boots() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `RUN.*` bookkeeping and `IDEMPOTENT` markers are ordinary keyspace
+/// data: under `appendfsync always` they must come back after `kill -9`
+/// like any other write — that's the whole "durable workflow recovery"
+/// contract.
+#[test]
+fn workflow_primitives_survive_sigkill() {
+    let dir = temp_dir("run-recovery");
+    let port = free_port();
+    let aof = ["--appendonly", "yes", "--appendfsync", "always"];
+    let mut server = spawn(port, &dir, &aof);
+    {
+        let mut c = Client::connect(port);
+        assert_eq!(c.cmd(&["RUN", "BEGIN", "job1"]), Reply::Simple("OK".into()));
+        assert_eq!(c.cmd(&["SET", "run:job1:counter", "5"]), Reply::Simple("OK".into()));
+        assert_eq!(c.cmd(&["RUN", "STEP", "job1", "phase-a"]), Reply::Simple("OK".into()));
+        assert_eq!(c.cmd(&["RUN", "CHECKPOINT", "job1", "v1"]), Reply::Int(1));
+        assert_eq!(c.cmd(&["IDEMPOTENT", "idk1", "60000", "INCR", "run:job1:n"]), Reply::Int(1));
+    }
+    sigkill(&mut server);
+
+    let mut server = spawn(port, &dir, &aof);
+    let mut c = Client::connect(port);
+
+    // Run record, last_step and checkpoint label all survived.
+    fn collect_bulks(r: &Reply, out: &mut Vec<String>) {
+        match r {
+            Reply::Bulk(Some(b)) => out.push(String::from_utf8_lossy(b).into_owned()),
+            Reply::Array(items) => items.iter().for_each(|i| collect_bulks(i, out)),
+            _ => {}
+        }
+    }
+    match c.cmd(&["RUN", "STATUS", "job1"]) {
+        Reply::Array(fields) => {
+            let mut flat = Vec::new();
+            collect_bulks(&Reply::Array(fields), &mut flat);
+            for want in ["running", "phase-a", "v1"] {
+                assert!(flat.iter().any(|s| s == want), "status missing {want}: {flat:?}");
+            }
+        }
+        other => panic!("expected RUN STATUS array, got {other:?}"),
+    }
+    // The audit trail survived too.
+    match c.cmd(&["RUN", "AUDIT", "job1"]) {
+        Reply::Array(entries) => assert!(entries.len() >= 3, "audit lost entries: {entries:?}"),
+        other => panic!("expected RUN AUDIT array, got {other:?}"),
+    }
+    // The IDKAPPLY record landed marker *and* effect atomically — a retry
+    // replays the stored reply, it must NOT re-run the INCR.
+    assert_eq!(c.cmd(&["IDEMPOTENT", "idk1", "60000", "INCR", "run:job1:n"]), Reply::Int(1));
+    assert_eq!(c.cmd(&["GET", "run:job1:n"]), bulk("1"));
+    // And a checkpoint restore still works post-crash.
+    assert_eq!(c.cmd(&["SET", "run:job1:counter", "99"]), Reply::Simple("OK".into()));
+    assert_eq!(c.cmd(&["RUN", "RESTORE", "job1", "v1"]), Reply::Simple("OK".into()));
+    assert_eq!(c.cmd(&["GET", "run:job1:counter"]), bulk("5"));
+
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `SCHEDULE` persists through its `~sched:<id>` marker key: a command
+/// whose fire time passed while the server was down fires on the first
+/// tick after boot, and a future one stays listed (at-least-once).
+#[test]
+fn scheduled_commands_survive_sigkill() {
+    let dir = temp_dir("schedule");
+    let port = free_port();
+    let aof = ["--appendonly", "yes", "--appendfsync", "always"];
+    let now_ms =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+
+    let mut server = spawn(port, &dir, &aof);
+    {
+        let mut c = Client::connect(port);
+        // Due during the downtime — must fire right after the restart.
+        let past = (now_ms + 500).to_string();
+        assert!(matches!(c.cmd(&["SCHEDULE", "AT", &past, "SET", "sched:fired", "yes"]), Reply::Int(_)));
+        // Far future — must still be armed afterwards.
+        let future = (now_ms + 3_600_000).to_string();
+        assert!(matches!(c.cmd(&["SCHEDULE", "AT", &future, "SET", "sched:future", "yes"]), Reply::Int(_)));
+    }
+    sigkill(&mut server);
+
+    let mut server = spawn(port, &dir, &aof);
+    let mut c = Client::connect(port);
+
+    // Past-due marker fires on a maintenance tick (~100ms); give it room.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while c.cmd(&["GET", "sched:fired"]) != bulk("yes") {
+        assert!(Instant::now() < deadline, "sched:fired never executed after restart");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The future one is still armed, and its marker still exists.
+    match c.cmd(&["SCHEDULE", "LIST"]) {
+        Reply::Array(items) => assert_eq!(items.len(), 1, "expected exactly the future task: {items:?}"),
+        other => panic!("expected SCHEDULE LIST array, got {other:?}"),
+    }
+    assert_eq!(c.cmd(&["GET", "sched:future"]), Reply::Bulk(None));
+
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Wire-level RESP compatibility spot-checks against a live server —
 /// complements `benchmarks/smoke.sh` (which is manual) with something CI runs.
 #[test]
