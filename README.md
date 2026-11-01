@@ -59,7 +59,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 **2️⃣ Build & run:**
 
 ```sh
-git clone <this-repo> && cd reflexdb
+git clone https://github.com/kailash-kangne/reflexdb.git && cd reflexdb
 cargo build --release
 ./target/release/reflexdb-server reflexdb.conf
 ```
