@@ -107,7 +107,17 @@ fn bulk(s: &str) -> Reply {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    // Atomic counter, not bind-and-release: bind(:0) releases the port
+    // before the server claims it, so two parallel tests could probe the
+    // same free port and race for it — the loser exits and the winner's
+    // client gets a connection reset from the wrong server.
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(23_000);
+    loop {
+        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -154,10 +164,20 @@ fn sigkill(child: &mut Child) {
     child.wait().unwrap();
 }
 
+/// These tests spawn real server processes and poll timing-sensitive
+/// async behavior (eviction ticks, flag propagation, marker cleanup) —
+/// run in parallel they starve each other of CPU and flake. Serialize
+/// the file; each test is only a couple of seconds.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// `appendfsync always` — the `profile durable` contract: every write the
 /// client saw acknowledged must survive `kill -9`.
 #[test]
 fn sigkill_loses_nothing_under_appendfsync_always() {
+    let _serial = serial();
     let dir = temp_dir("aof-always");
     let port = free_port();
     let mut server = spawn(port, &dir, &["--appendonly", "yes", "--appendfsync", "always"]);
@@ -185,6 +205,7 @@ fn sigkill_loses_nothing_under_appendfsync_always() {
 /// No AOF: a `SAVE`d snapshot is what restart must recover from.
 #[test]
 fn rdb_survives_sigkill_after_save() {
+    let _serial = serial();
     let dir = temp_dir("rdb");
     let port = free_port();
     let mut server = spawn(port, &dir, &[]);
@@ -209,6 +230,7 @@ fn rdb_survives_sigkill_after_save() {
 /// must not stop startup — replay keeps the complete prefix and carries on.
 #[test]
 fn torn_aof_tail_still_boots() {
+    let _serial = serial();
     let dir = temp_dir("aof-torn");
     let port = free_port();
     let mut server = spawn(port, &dir, &["--appendonly", "yes", "--appendfsync", "no"]);
@@ -239,6 +261,7 @@ fn torn_aof_tail_still_boots() {
 /// contract.
 #[test]
 fn workflow_primitives_survive_sigkill() {
+    let _serial = serial();
     let dir = temp_dir("run-recovery");
     let port = free_port();
     let aof = ["--appendonly", "yes", "--appendfsync", "always"];
@@ -297,6 +320,7 @@ fn workflow_primitives_survive_sigkill() {
 /// tick after boot, and a future one stays listed (at-least-once).
 #[test]
 fn scheduled_commands_survive_sigkill() {
+    let _serial = serial();
     let dir = temp_dir("schedule");
     let port = free_port();
     let aof = ["--appendonly", "yes", "--appendfsync", "always"];
@@ -324,10 +348,16 @@ fn scheduled_commands_survive_sigkill() {
         assert!(Instant::now() < deadline, "sched:fired never executed after restart");
         std::thread::sleep(Duration::from_millis(50));
     }
-    // The future one is still armed, and its marker still exists.
-    match c.cmd(&["SCHEDULE", "LIST"]) {
-        Reply::Array(items) => assert_eq!(items.len(), 1, "expected exactly the future task: {items:?}"),
-        other => panic!("expected SCHEDULE LIST array, got {other:?}"),
+    // If the kill landed between the firing and the marker's `DEL` (the
+    // documented at-least-once window), replay restores the marker and
+    // the task re-arms — it drains on the next tick once the marker's
+    // gone, so poll until LIST settles to just the future task.
+    loop {
+        match c.cmd(&["SCHEDULE", "LIST"]) {
+            Reply::Array(items) if items.len() == 1 => break,
+            _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            other => panic!("SCHEDULE LIST never settled to just the future task: {other:?}"),
+        }
     }
     assert_eq!(c.cmd(&["GET", "sched:future"]), Reply::Bulk(None));
 
@@ -342,6 +372,7 @@ fn scheduled_commands_survive_sigkill() {
 #[cfg(unix)]
 #[test]
 fn second_server_on_same_dir_refuses() {
+    let _serial = serial();
     let dir = temp_dir("dir-lock");
     let port = free_port();
     let mut server = spawn(port, &dir, &[]);
@@ -364,6 +395,7 @@ fn second_server_on_same_dir_refuses() {
 #[cfg(unix)]
 #[test]
 fn full_disk_refuses_writes_and_recovers() {
+    let _serial = serial();
     let dir = temp_dir("full-disk");
     let port = free_port();
     // 512 KiB cap — enough for startup files, too small for the frame below.
@@ -411,10 +443,102 @@ fn full_disk_refuses_writes_and_recovers() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `--tiered-storage`: a key spilled to the disk tier is fsync'd before
+/// the eviction completes (TIERED.md), so `kill -9` after the spill must
+/// not lose it — restart, and the tier must still serve every key even
+/// though RAM started empty (no AOF in this config).
+#[test]
+fn tiered_keys_survive_sigkill() {
+    let _serial = serial();
+    let dir = temp_dir("tiered");
+    let port = free_port();
+    let flags = ["--tiered-storage", "yes", "--tiered-memory-limit", "1", "--eviction-tick-ms", "25"];
+    let mut server = spawn(port, &dir, &flags);
+    {
+        let mut c = Client::connect(port);
+        for i in 0..10 {
+            let k = format!("t{i}");
+            let v = format!("v{i}");
+            assert_eq!(c.cmd(&["SET", &k, &v]), Reply::Simple("OK".into()));
+        }
+        // Wait for the maintenance tick to actually spill all keys.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match c.cmd(&["INFO"]) {
+                Reply::Bulk(Some(body))
+                    if String::from_utf8_lossy(&body).lines().any(|l| l == "tiered_evictions:10") =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            assert!(Instant::now() < deadline, "keys never spilled to the tier");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    sigkill(&mut server);
+
+    let mut server = spawn(port, &dir, &flags);
+    let mut c = Client::connect(port);
+    for i in 0..10 {
+        assert_eq!(c.cmd(&["GET", &format!("t{i}")]), bulk(&format!("v{i}")));
+    }
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reading a tiered key fetches it into RAM as a read cache — the tier
+/// keeps its fsync'd copy, so a `kill -9` before the next eviction tick
+/// must still recover the key. This test uses a long eviction tick so
+/// the fetched copy is never re-spilled before the crash.
+#[test]
+fn promoted_tiered_key_survives_sigkill() {
+    let _serial = serial();
+    let dir = temp_dir("tiered-promote");
+    let port = free_port();
+    let fast_tick = ["--tiered-storage", "yes", "--tiered-memory-limit", "1", "--eviction-tick-ms", "25"];
+    let slow_tick = ["--tiered-storage", "yes", "--tiered-memory-limit", "1", "--eviction-tick-ms", "60000"];
+
+    let mut server = spawn(port, &dir, &fast_tick);
+    {
+        let mut c = Client::connect(port);
+        assert_eq!(c.cmd(&["SET", "t0", "v0"]), Reply::Simple("OK".into()));
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match c.cmd(&["INFO"]) {
+                Reply::Bulk(Some(body))
+                    if String::from_utf8_lossy(&body).lines().any(|l| l == "tiered_evictions:1") =>
+                {
+                    break;
+                }
+                _ => {}
+            }
+            assert!(Instant::now() < deadline, "key never spilled to the tier");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    sigkill(&mut server);
+
+    // Long tick: after the GET promotes t0 into RAM, nothing re-spills it.
+    let mut server = spawn(port, &dir, &slow_tick);
+    {
+        let mut c = Client::connect(port);
+        assert_eq!(c.cmd(&["GET", "t0"]), bulk("v0"));
+    }
+    sigkill(&mut server);
+
+    let mut server = spawn(port, &dir, &slow_tick);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&["GET", "t0"]), bulk("v0"), "promoted key was lost to the crash");
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Wire-level RESP compatibility spot-checks against a live server —
 /// complements `benchmarks/smoke.sh` (which is manual) with something CI runs.
 #[test]
 fn resp_command_compat() {
+    let _serial = serial();
     let dir = temp_dir("compat");
     let port = free_port();
     let mut server = spawn(port, &dir, &[]);

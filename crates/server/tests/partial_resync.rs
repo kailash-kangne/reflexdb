@@ -83,7 +83,17 @@ impl Client {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    // Atomic counter, not bind-and-release: bind(:0) releases the port
+    // before the server claims it, so two parallel tests could probe the
+    // same free port and race for it — the loser exits and the winner's
+    // client gets a connection reset from the wrong server.
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(33_000);
+    loop {
+        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -199,6 +209,49 @@ fn replica_falls_back_to_full_resync_when_backlog_disabled() {
     wait_replicated(&mut rc, "after", &bulk("2"));
 
     wait_info_field(&mut pc, "sync_full", "2");
+    assert_eq!(info_field(&mut pc, "sync_partial_ok"), "0");
+
+    sigkill(&mut primary);
+    sigkill(&mut replica);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// `kill -9` on the primary while a replica is attached: the link drops,
+/// the replica must refuse writes (still read-only), then reconnect on
+/// its own once the primary is back — with a new replid the resync is a
+/// FULLRESYNC, whose snapshot must also wipe keys the replica replicated
+/// from the pre-crash primary but that no longer exist.
+#[test]
+fn primary_sigkill_recovers_and_replica_converges() {
+    let dir_a = temp_dir("crash-primary");
+    let dir_b = temp_dir("crash-replica");
+    let (port_a, port_b) = (free_port(), free_port());
+    // No persistence: the restarted primary comes back EMPTY — the
+    // strongest test of whether the replica converges instead of keeping
+    // stale replicated data.
+    let mut primary = spawn(port_a, &dir_a, &[]);
+    let mut replica = spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}")]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["SET", "seed", "1"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "seed", &bulk("1"));
+    sigkill(&mut primary);
+
+    // While the primary is down the replica must stay read-only — a write
+    // here would diverge permanently once the empty primary resyncs.
+    assert!(matches!(rc.cmd(&["SET", "local", "x"]), Reply::Error(_)));
+
+    let mut primary = spawn(port_a, &dir_a, &[]);
+    let mut pc = Client::connect(port_a);
+    assert_eq!(pc.cmd(&["SET", "after", "2"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "after", &bulk("2"));
+
+    // New replid -> full resync -> replica flushed -> stale "seed" gone.
+    // The restarted primary counts from zero, so this is its first sync.
+    assert_eq!(rc.cmd(&["GET", "seed"]), Reply::Bulk(None));
+    wait_info_field(&mut pc, "sync_full", "1");
     assert_eq!(info_field(&mut pc, "sync_partial_ok"), "0");
 
     sigkill(&mut primary);

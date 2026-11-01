@@ -5317,8 +5317,8 @@ mod tests {
             self.disk.insert(key.clone(), (value.clone(), ttl, seq));
             Ok(())
         }
-        fn promote(&self, key: &[u8]) -> Option<(keyspace::Value, Option<Duration>)> {
-            self.disk.remove(key).map(|(_, (v, ttl, _))| (v, ttl))
+        fn fetch(&self, key: &[u8]) -> Option<(keyspace::Value, Option<Duration>)> {
+            self.disk.get(key).map(|e| (e.value().0.clone(), e.value().1))
         }
         fn contains(&self, key: &[u8]) -> bool {
             self.disk.contains_key(key)
@@ -5347,6 +5347,12 @@ mod tests {
         }
     }
 
+    /// `DbScopedTier` stores keys as 4-byte db index + raw key — every
+    /// test below uses db 0, so this reproduces its encoding.
+    fn scoped(key: &[u8]) -> Vec<u8> {
+        [0u32.to_be_bytes().as_slice(), key].concat()
+    }
+
     #[test]
     fn tiered_storage_moves_keys_to_disk_and_promotes_on_read() {
         let tier = std::sync::Arc::new(MockTier::default());
@@ -5366,8 +5372,9 @@ mod tests {
 
         // EXISTS must stay truthful for a tiered key without reading it off
         // disk, and GET must transparently promote it back into RAM.
+        // `DbScopedTier` prefixes stored keys with the 4-byte db index.
         let tiered_key = tier.disk.iter().next().unwrap().key().clone();
-        let tiered_key_str = String::from_utf8(tiered_key.to_vec()).unwrap();
+        let tiered_key_str = String::from_utf8(tiered_key[4..].to_vec()).unwrap();
         assert_eq!(run(&ctx, &mut st, &["EXISTS", &tiered_key_str]), Value::Integer(1));
         assert_eq!(
             run(&ctx, &mut st, &["GET", &tiered_key_str]),
@@ -5391,8 +5398,8 @@ mod tests {
 
             let used = ctx.refresh_memory_usage() as u64;
             assert_eq!(ctx.drain_to_tier(used.saturating_sub(1)), 1);
-            assert!(tier.disk.contains_key(b"cold".as_slice()), "{policy:?} should tier cold first");
-            assert!(!tier.disk.contains_key(b"hot".as_slice()), "{policy:?} should keep hot in RAM");
+            assert!(tier.disk.contains_key(&scoped(b"cold")[..]), "{policy:?} should tier cold first");
+            assert!(!tier.disk.contains_key(&scoped(b"hot")[..]), "{policy:?} should keep hot in RAM");
         }
     }
 
@@ -5494,15 +5501,16 @@ mod tests {
         };
         assert!(e.starts_with("ERR TIERED_STORAGE_FULL"), "got {e}");
         assert_eq!(ctx.tiered_full_rejections.load(Ordering::Relaxed), rejections_before + 1);
-        assert!(!tier.disk.contains_key(b"brand-new".as_slice()));
+        assert!(!tier.disk.contains_key(&scoped(b"brand-new")[..]));
 
-        // Overwrites and deletes of existing keys stay allowed — and
-        // overwriting a *tiered* key pulls it into RAM, shrinking disk.
-        let tiered_key = String::from_utf8(tier.disk.iter().next().unwrap().key().to_vec()).unwrap();
+        // Overwrites and deletes of existing keys stay allowed. An
+        // overwrite keeps the tier copy — it's the last durable record;
+        // DEL is what drops it.
+        let tiered_key = String::from_utf8(tier.disk.iter().next().unwrap().key()[4..].to_vec()).unwrap();
         assert_eq!(run(&ctx, &mut st, &["SET", &tiered_key, "v2"]), Value::ok());
-        assert_eq!(tier.disk.len(), 2);
         assert_eq!(run(&ctx, &mut st, &["GET", &tiered_key]), Value::bulk(&b"v2"[..]));
         assert_eq!(run(&ctx, &mut st, &["DEL", &tiered_key]), Value::Integer(1));
+        assert_eq!(tier.disk.len(), 2);
     }
 
     #[test]

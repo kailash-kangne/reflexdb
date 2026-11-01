@@ -1,9 +1,15 @@
 # Tiered Storage — Operations Guide
 
 The disk tier is **durable overflow storage with explicit capacity guarantees**: keys that no
-longer fit in `tiered-memory-limit` are written to a local LSM store (fjall) and promoted back
-on first read. Every tiered write is fsync'd before `evict` returns, so an acknowledged key
-survives a process crash.
+longer fit in `tiered-memory-limit` are written to a local LSM store (fjall) and fetched back
+into RAM on first read. Every tiered write is fsync'd before `evict` returns, so an
+acknowledged key survives a process crash.
+
+Reads **copy**, not move: after a fetch the key lives in RAM *and* on disk — RAM is a read
+cache over the tier's durable record, so a crash always recovers the last tiered state.
+Writes to a coexisting key update RAM only (volatile until the next eviction re-spills it);
+key-removal paths (`DEL`, `RENAME`, expiry, `FLUSH*`) clear the tier copy too, so the older
+value can't resurrect.
 
 It is **not** marketed as general persistence yet: crash-consistency is tested per-key
 (acknowledged writes survive abrupt exit), but full-dataset backup/restore and replica
@@ -15,7 +21,7 @@ consistency guarantees are not established. Treat it as capacity relief, not a d
 
 | Policy | Behavior on full disk tier | Data loss? |
 |---|---|---|
-| `reject-writes` (default) | New-key writes fail `ERR TIERED_STORAGE_FULL` once RAM *and* disk are both over their limits. Deletes, TTL ops, and single-key overwrites still work — overwriting a tiered key pulls it back to RAM and frees disk. | No |
+| `reject-writes` (default) | New-key writes fail `ERR TIERED_STORAGE_FULL` once RAM *and* disk are both over their limits. Deletes, TTL ops, and single-key overwrites still work — deletes free disk; overwrites keep the tier copy as the durable record. | No |
 | `evict-oldest` | Oldest tiered entries are dropped down to ~50% of the limit (`eviction-low-watermark`). | Yes — cache semantics |
 | `no-limit` | Limit ignored entirely. | No enforcement |
 
@@ -47,7 +53,7 @@ tiered_disk_drops             keys lost to evict-oldest capacity drops
 tiered_rejected_writes        client writes refused under reject-writes
 tiered_spill_failures         spills that hit a full tier (key stayed in RAM)
 tiered_expired_dropped        GC sweep removals of expired tiered entries
-tiered_entries_removed        total tombstones (deletes + promotes + GC)
+tiered_entries_removed        total tombstones (deletes + GC)
 tiered_compactions / tiered_compacting   compaction history / in-flight
 ```
 
