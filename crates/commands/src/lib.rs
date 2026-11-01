@@ -35,5 +35,6 @@ pub use dispatch::{
     dispatch, request_may_write, ClientPush, ClientState, ClientWriter, MaxMemoryPolicy, NotifyFlags,
     Outcome, ServerContext, TieredOverflowPolicy,
 };
+pub use info::render_metrics;
 pub use replication::ReplicaMessage;
 pub use singleflight::SingleFlightLease;

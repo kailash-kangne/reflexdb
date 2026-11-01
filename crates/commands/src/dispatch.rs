@@ -397,6 +397,13 @@ pub struct ServerContext {
     /// `appendfsync` the writer runs (or would run) under; `CONFIG SET
     /// appendfsync` swaps the writer when one's active.
     pub(crate) aof_fsync: std::sync::RwLock<persistence::aof::Fsync>,
+    /// `auto-aof-rewrite-percentage` — trigger a background rewrite once
+    /// the AOF grew by this much over its post-rewrite base size.
+    /// `None` (`auto-aof-rewrite-percentage 0`) disables the trigger.
+    pub auto_aof_rewrite_pct: Option<u64>,
+    /// `auto-aof-rewrite-min-size` — growth alone never rewrites a file
+    /// smaller than this floor.
+    pub auto_aof_rewrite_min_size: u64,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
     /// `proto-max-bulk-len`: largest value a single `String` command
@@ -536,6 +543,8 @@ pub struct ServerContext {
     /// Resync counters for `INFO replication` (`sync_full`/`sync_partial_ok`).
     pub full_resyncs: AtomicU64,
     pub partial_resyncs: AtomicU64,
+    /// Commands dispatched since boot — `INFO`/`metrics` ops-rate source.
+    pub commands_processed: AtomicU64,
     /// Random id handed to replicas in `FULLRESYNC`, generated once at
     /// startup (not persisted — a restart gets a fresh identity, same as a
     /// real primary after a hard crash with `repl-id` not preserved).
@@ -651,6 +660,8 @@ impl ServerContext {
             aof: std::sync::RwLock::new(None),
             aof_path: None,
             aof_fsync: std::sync::RwLock::new(persistence::aof::Fsync::No),
+            auto_aof_rewrite_pct: Some(100),
+            auto_aof_rewrite_min_size: 64 * 1024 * 1024,
             maxmemory: None,
             maxmemory_policy: MaxMemoryPolicy::NoEviction,
             proto_max_bulk_len: 64 * 1024 * 1024,
@@ -685,6 +696,7 @@ impl ServerContext {
             backlog_active: std::sync::atomic::AtomicBool::new(false),
             full_resyncs: AtomicU64::new(0),
             partial_resyncs: AtomicU64::new(0),
+            commands_processed: AtomicU64::new(0),
             replid: generate_replid(),
             replica_of: std::sync::Mutex::new(None),
             replication_epoch: AtomicU64::new(0),
@@ -886,6 +898,13 @@ impl ServerContext {
         self
     }
 
+    /// `auto-aof-rewrite-percentage`/`auto-aof-rewrite-min-size`.
+    pub fn with_auto_aof_rewrite(mut self, pct: Option<u64>, min_size: u64) -> Self {
+        self.auto_aof_rewrite_pct = pct;
+        self.auto_aof_rewrite_min_size = min_size;
+        self
+    }
+
     /// `history-enabled yes` — turns on `GETAT`/`HISTORY`, backed by
     /// `writer` (see `ServerContext::history`'s docs for scope).
     pub fn with_history(self, writer: persistence::history::HistoryWriter) -> Self {
@@ -985,6 +1004,45 @@ impl ServerContext {
         self.history.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
     }
 
+    /// Queues an AOF rewrite — `BGREWRITEAOF`'s shared core. `begin_rewrite`
+    /// is sent *before* walking the keyspace so writes landing mid-snapshot
+    /// are mirrored into the side buffer (see `persistence::aof` docs).
+    /// Fire-and-forget: returns once both jobs are queued.
+    pub fn start_aof_rewrite(&self) -> std::io::Result<()> {
+        let aof = self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (Some(writer), Some(path)) = (&*aof, &self.aof_path) else {
+            return Err(std::io::Error::other("no append only file configured"));
+        };
+        writer.begin_rewrite()?;
+        let base = persistence::aof::build_rewrite_base(&self.store);
+        writer.finish_rewrite(base, path.clone())
+    }
+
+    /// The `auto-aof-rewrite-*` check — a periodic maintenance tick calls
+    /// this: rewrite once the file is past `min_size` AND grew by `pct`%
+    /// over its post-rewrite base, unless one is already in flight.
+    pub fn maybe_rewrite_aof(&self) {
+        let Some(pct) = self.auto_aof_rewrite_pct else { return };
+        let (cur, base, busy, failed) = {
+            let aof = self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(writer) = &*aof else { return };
+            (
+                writer.current_size(),
+                writer.rewrite_base_size().max(1),
+                writer.rewrite_in_progress(),
+                writer.io_failed(),
+            )
+        };
+        if busy || failed || cur <= self.auto_aof_rewrite_min_size {
+            return;
+        }
+        if cur.saturating_sub(base).saturating_mul(100) >= base.saturating_mul(pct) {
+            if let Err(e) = self.start_aof_rewrite() {
+                tracing::warn!(error = %e, "auto AOF rewrite failed to start");
+            }
+        }
+    }
+
     /// Blocks until every `GETAT`/`HISTORY` version recorded so far has
     /// actually landed on disk. Not used on any request path (recording is
     /// fire-and-forget by design, see `persistence::history`'s docs) —
@@ -1044,6 +1102,19 @@ impl ServerContext {
             Some(limit) => self.approx_memory.load(Ordering::Relaxed) as u64 > limit,
             None => false,
         }
+    }
+
+    /// Memory estimate for introspection: the tick-cached value while
+    /// memory limits keep it fresh, one on-demand scan otherwise — so a
+    /// metrics scrape pays O(n) per scrape, not per tick.
+    pub fn approx_memory_for_reporting(&self) -> usize {
+        if self.tiered_disk_limit.is_none()
+            && self.tiered_limit.is_none()
+            && self.effective_maxmemory().is_none()
+        {
+            return self.refresh_memory_usage();
+        }
+        self.approx_memory.load(Ordering::Relaxed)
     }
 
     pub(crate) fn effective_maxmemory(&self) -> Option<u64> {
@@ -1963,6 +2034,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     if req.is_empty() {
         return err("ERR empty command");
     }
+    ctx.commands_processed.fetch_add(1, Ordering::Relaxed);
     // Uppercase the command name on the stack — every real command is
     // short ASCII, so the heap `String` only materializes for weird
     // (non-ASCII / oversized) names. Saves one allocation per command.

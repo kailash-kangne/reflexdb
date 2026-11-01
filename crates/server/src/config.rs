@@ -13,6 +13,12 @@ pub struct Config {
     pub port: u16,
     pub databases: usize,
     pub requirepass: Option<String>,
+    /// `auto-aof-rewrite-percentage` — rewrite the AOF once it grows by
+    /// this much over its post-rewrite base size; `0` disables (None).
+    pub auto_aof_rewrite_percentage: Option<u64>,
+    /// `auto-aof-rewrite-min-size` — never auto-rewrite a file smaller
+    /// than this floor. Default 64MB, same as Redis.
+    pub auto_aof_rewrite_min_size: u64,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
     /// `maxclients`: hard ceiling on simultaneously open connections — once
@@ -209,6 +215,11 @@ pub struct Config {
     /// re-reads it. Resolved as given (cwd-relative or absolute), not
     /// relative to `dir`.
     pub acl_file: Option<PathBuf>,
+    /// `metrics-port`: 0 (default) disables. When set, a second listener
+    /// on `bind:metrics-port` answers `GET /metrics` with Prometheus
+    /// text exposition — read-only, no auth (scrape over loopback or
+    /// put it behind your network boundary).
+    pub metrics_port: u16,
 }
 
 impl Default for Config {
@@ -218,6 +229,8 @@ impl Default for Config {
             port: 7379,
             databases: 16,
             requirepass: None,
+            auto_aof_rewrite_percentage: Some(100),
+            auto_aof_rewrite_min_size: 64 * 1024 * 1024,
             maxmemory: None,
             maxmemory_policy: MaxMemoryPolicy::NoEviction,
             maxclients: 10_000,
@@ -262,6 +275,7 @@ impl Default for Config {
             live_pace_chunk: 64,
             live_pace_ms: 1,
             acl_file: None,
+            metrics_port: 0,
         }
     }
 }
@@ -336,10 +350,23 @@ impl Config {
         match directive.to_ascii_lowercase().as_str() {
             "bind" => self.bind = value.split_whitespace().next().unwrap_or("127.0.0.1").to_string(),
             "port" => self.port = value.parse().map_err(|_| format!("invalid port: {value}"))?,
+            "metrics-port" => {
+                self.metrics_port =
+                    value.parse().map_err(|_| format!("invalid metrics-port: {value}"))?
+            }
             "databases" => {
                 self.databases = value.parse().map_err(|_| format!("invalid databases: {value}"))?
             }
             "requirepass" => self.requirepass = if value.is_empty() { None } else { Some(value.to_string()) },
+            "auto-aof-rewrite-percentage" => {
+                let pct: u64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid auto-aof-rewrite-percentage: {value}"))?;
+                self.auto_aof_rewrite_percentage = (pct > 0).then_some(pct);
+            }
+            "auto-aof-rewrite-min-size" => {
+                self.auto_aof_rewrite_min_size = parse_memory(value)?
+            }
             "maxmemory" => self.maxmemory = Some(parse_memory(value)?),
             "maxmemory-policy" => {
                 self.maxmemory_policy = MaxMemoryPolicy::parse(value)
@@ -549,6 +576,13 @@ mod tests {
         .unwrap();
         assert!(!cfg.protected_mode);
         assert_eq!(cfg.masterauth.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn metrics_port_parses() {
+        assert_eq!(Config::from_args(args(&[])).unwrap().metrics_port, 0);
+        assert_eq!(Config::from_args(args(&[("metrics-port", "9121")])).unwrap().metrics_port, 9121);
+        assert!(Config::from_args(args(&[("metrics-port", "abc")])).is_err());
     }
 
     #[test]

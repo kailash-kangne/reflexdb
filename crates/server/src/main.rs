@@ -102,6 +102,7 @@ async fn main() -> std::io::Result<()> {
         // Always record where these would live so `CONFIG SET
         // appendonly|history-enabled yes` can open them lazily.
         .with_aof_config(cfg.aof_path(), cfg.appendfsync)
+        .with_auto_aof_rewrite(cfg.auto_aof_rewrite_percentage, cfg.auto_aof_rewrite_min_size)
         .with_history_config(cfg.history_dir_path(), cfg.history_max_versions_per_key)
         // Startup-only directives `CONFIG GET *` reports read-only (the
         // runtime-settable ones are emitted from their live state instead).
@@ -246,6 +247,7 @@ async fn main() -> std::io::Result<()> {
                     maintenance_ctx.store.active_expire_cycle(20);
                     maintenance_ctx.run_eviction_tick();
                     maintenance_ctx.run_due_scheduled();
+                    maintenance_ctx.maybe_rewrite_aof();
                 })
                 .await
                 {
@@ -408,6 +410,17 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    if cfg.metrics_port != 0 {
+        let ctx = ctx.clone();
+        let bind = cfg.bind.clone();
+        let port = cfg.metrics_port;
+        tokio::spawn(async move {
+            if let Err(e) = run_metrics_listener(ctx, &bind, port).await {
+                tracing::error!(error = %e, "metrics listener failed");
+            }
+        });
+    }
+
     // `port 0` disables the plaintext listener (TLS-only mode).
     if cfg.port == 0 {
         if tls_listening {
@@ -474,6 +487,49 @@ async fn deny_protected(socket: &mut tokio::net::TcpStream, peer: &std::net::Soc
     })
     .await;
     tracing::warn!(%peer, "protected-mode: refused non-loopback connection");
+}
+
+/// `metrics-port` listener: minimal HTTP/1.0 — read one request (any
+/// path answers the same exposition, so `GET /` and `GET /metrics` both
+/// work), respond, close. No keep-alive, no auth — loopback-bound or
+/// network-guarded by the operator.
+async fn run_metrics_listener(ctx: Arc<ServerContext>, bind: &str, port: u16) -> std::io::Result<()> {
+    let listener = TcpListener::bind(format!("{bind}:{port}")).await?;
+    tracing::info!(bind, port, "metrics endpoint listening (Prometheus /metrics)");
+    loop {
+        let (mut socket, _peer) = listener.accept().await?;
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            // Bound the request read — a scrape is one small request;
+            // anything larger is not a scraper.
+            let mut req = [0u8; 4096];
+            let mut filled = 0;
+            let headers_done = loop {
+                match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut req[filled..])).await {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return,
+                    Ok(Ok(n)) => {
+                        filled += n;
+                        if req[..filled].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break true;
+                        }
+                        if filled == req.len() {
+                            break false;
+                        }
+                    }
+                }
+            };
+            if !headers_done {
+                return;
+            }
+            let body = commands::render_metrics(&ctx);
+            let resp = format!(
+                "HTTP/1.0 200 OK\r\ncontent-type: text/plain; version=0.0.4\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+    }
 }
 
 async fn run_tls_listener(

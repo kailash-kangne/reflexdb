@@ -285,3 +285,44 @@ fn human_bytes(bytes: u64) -> String {
     }
     format!("{value:.2}{}", UNITS[unit])
 }
+
+/// Prometheus text exposition served by `metrics-port` over plain HTTP.
+pub fn render_metrics(ctx: &ServerContext) -> String {
+    use std::fmt::Write;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    fn g(m: &mut String, name: &str, v: impl std::fmt::Display) {
+        let _ = writeln!(m, "reflexdb_{name} {v}");
+    }
+
+    let mut m = String::with_capacity(4096);
+    g(&mut m, "up", 1);
+    g(&mut m, "uptime_seconds", ctx.start_time.elapsed().as_secs());
+    g(&mut m, "connected_clients", ctx.connected_clients());
+    g(&mut m, "blocked_clients", ctx.singleflight_waiters());
+    g(&mut m, "used_memory_bytes", ctx.approx_memory_for_reporting());
+    if let Some(peak) = peak_rss() {
+        g(&mut m, "used_memory_peak_bytes", peak);
+    }
+    g(&mut m, "maxmemory_bytes", ctx.effective_maxmemory().unwrap_or(0));
+    g(&mut m, "commands_processed_total", ctx.commands_processed.load(Relaxed));
+    g(&mut m, "role_master", ctx.replica_of_addr().is_none() as u8);
+    g(&mut m, "connected_replicas", ctx.connected_replicas());
+    g(&mut m, "master_repl_offset", ctx.master_repl_offset());
+    g(&mut m, "resync_full_total", ctx.full_resyncs.load(Relaxed));
+    g(&mut m, "resync_partial_total", ctx.partial_resyncs.load(Relaxed));
+    g(&mut m, "aof_enabled", ctx.aof_enabled() as u8);
+    if let Some(aof) = &*ctx.aof.read().unwrap() {
+        g(&mut m, "aof_size_bytes", aof.current_size());
+        g(&mut m, "aof_rewrite_in_progress", aof.rewrite_in_progress() as u8);
+    }
+    for i in 0..ctx.store.len() {
+        if let Some(db) = ctx.store.db(i) {
+            let size = db.dbsize();
+            if size > 0 {
+                let _ = writeln!(m, "reflexdb_keys{{db=\"{i}\"}} {size}");
+            }
+        }
+    }
+    m
+}

@@ -49,9 +49,9 @@
 //! trip to the writer thread, not just checking whether AOF is turned on.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -145,6 +145,22 @@ pub struct AofWriter {
     /// acked — like Redis's `MISCONF`, all we can do is refuse *subsequent*
     /// writes instead of acknowledging more data that can't persist.
     io_failed: Arc<AtomicBool>,
+    /// Counters the writer thread maintains; drive auto-rewrite policy.
+    track: SizeTrack,
+}
+
+/// Shared size/progress counters between `AofWriter` and its thread.
+/// `size`: bytes currently in the file, refreshed after each batch and
+/// reset on every completed rewrite — the growth signal
+/// `auto-aof-rewrite-*` policies key off. `rewrite_base`: file size right
+/// after the last completed rewrite (the growth baseline). `rewriting`:
+/// a rewrite is between `BeginRewrite` and its file swap — the auto
+/// trigger must not pile on.
+#[derive(Clone)]
+struct SizeTrack {
+    size: Arc<AtomicU64>,
+    rewrite_base: Arc<AtomicU64>,
+    rewriting: Arc<AtomicBool>,
 }
 
 impl AofWriter {
@@ -161,14 +177,21 @@ impl AofWriter {
             file.seek(SeekFrom::End(0))?;
             n == magic.len() && &magic == AOF_MAGIC
         };
+        let file_size = file.stream_position().unwrap_or(0);
         let (tx, rx) = mpsc::sync_channel(4096);
         let io_failed = Arc::new(AtomicBool::new(false));
+        let track = SizeTrack {
+            size: Arc::new(AtomicU64::new(file_size)),
+            rewrite_base: Arc::new(AtomicU64::new(file_size)),
+            rewriting: Arc::new(AtomicBool::new(false)),
+        };
         let thread_flag = io_failed.clone();
+        let t_track = track.clone();
         let worker = thread::Builder::new()
             .name("reflexdb-aof-writer".into())
-            .spawn(move || writer_loop(file, rx, fsync, compressed, thread_flag))
+            .spawn(move || writer_loop(file, rx, fsync, compressed, thread_flag, t_track))
             .map_err(|e| io::Error::other(format!("failed to spawn AOF writer thread: {e}")))?;
-        Ok(Self { tx: Mutex::new(tx), fsync, _worker: worker, io_failed })
+        Ok(Self { tx: Mutex::new(tx), fsync, _worker: worker, io_failed, track })
     }
 
     /// The `appendfsync` policy this writer was opened with.
@@ -204,6 +227,21 @@ impl AofWriter {
     /// refusal so acknowledged writes can't silently outpace the log.
     pub fn io_failed(&self) -> bool {
         self.io_failed.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently in the file — see `SizeTrack`'s docs.
+    pub fn current_size(&self) -> u64 {
+        self.track.size.load(Ordering::Relaxed)
+    }
+
+    /// File size right after the last completed rewrite.
+    pub fn rewrite_base_size(&self) -> u64 {
+        self.track.rewrite_base.load(Ordering::Relaxed)
+    }
+
+    /// A rewrite is queued/in-flight — don't queue another.
+    pub fn rewrite_in_progress(&self) -> bool {
+        self.track.rewriting.load(Ordering::Relaxed)
     }
 
     /// Test hook: simulates the writer thread reporting a disk failure.
@@ -396,7 +434,9 @@ fn writer_loop(
     fsync_policy: Fsync,
     mut compressed: bool,
     io_failed: Arc<AtomicBool>,
+    track: SizeTrack,
 ) {
+    let SizeTrack { size, rewrite_base, rewriting } = track;
     const MAX_REWRITE_MIRROR_BYTES: usize = 256 * 1024 * 1024;
     const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
     let mut last_db: Option<usize> = None;
@@ -464,6 +504,7 @@ fn writer_loop(
                     if rewrite.is_some() {
                         tracing::warn!("AOF rewrite already in progress; ignoring duplicate BGREWRITEAOF");
                     } else {
+                        rewriting.store(true, Ordering::Relaxed);
                         rewrite = Some(RewriteState { buffer: Vec::new(), last_db: None });
                     }
                 }
@@ -497,6 +538,9 @@ fn writer_loop(
         // A clean batch clears the flag — a transient failure (full disk
         // that got freed, e.g.) self-heals once writes land again.
         io_failed.store(write_result.is_err() || fsync_result.is_err(), Ordering::Relaxed);
+        if write_result.is_ok() && !buf.is_empty() {
+            size.store(file.stream_position().unwrap_or(0), Ordering::Relaxed);
+        }
 
         // Swap the whole file over to `base` + whatever the side buffer
         // captured, only after this batch's normal write/fsync above has
@@ -511,9 +555,12 @@ fn writer_loop(
                     file = new_file;
                     compressed = true;
                     last_db = rw.last_db;
+                    size.store(base.len() as u64, Ordering::Relaxed);
+                    rewrite_base.store(base.len() as u64, Ordering::Relaxed);
                 }
                 Err(e) => tracing::warn!(error = %e, "AOF rewrite failed to swap in the new file"),
             }
+            rewriting.store(false, Ordering::Relaxed);
         }
 
         for ack in flush_acks {

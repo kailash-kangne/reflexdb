@@ -252,6 +252,10 @@ MVCC snapshot reads (`SNAPSHOT BEGIN`/`END`) and dependency-tracked invalidation
 
 - `INFO` sectioned metrics, `SLOWLOG`, `LATENCY` histograms, `MEMORY USAGE` (hand-counted, not
   allocator-reported).
+- `metrics-port` — Prometheus text exposition over plain HTTP (`GET /metrics`); see
+  [OPERATIONS.md](OPERATIONS.md).
+- `auto-aof-rewrite-percentage`/`auto-aof-rewrite-min-size` — automatic AOF compaction on
+  growth (defaults 100 / 64mb), plus manual `BGREWRITEAOF`.
 - `CONFIG GET/SET/REWRITE`.
 - Multi-threaded: one Tokio task per connection, sharded keyspace locking (see
   [ARCHITECTURE.md](ARCHITECTURE.md)).
