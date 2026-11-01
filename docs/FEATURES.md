@@ -12,9 +12,9 @@ See [ROADMAP.md](ROADMAP.md) for what's designed but not built yet, and
 | Type | Notes |
 |------|-------|
 | String (incl. Bitmap) | `int`/`raw` representation; `INCR` is O(1) |
-| List | `VecDeque<Bytes>` |
-| Hash | `HashMap<Bytes, Bytes>` |
-| Set | `IndexSet<Bytes>` — insertion-ordered, enables O(1) `SPOP` via `swap_remove_index` |
+| List | packed `Vec<Bytes>` under 128 elements, `VecDeque<Bytes>` beyond (one-way promotion) |
+| Hash | packed `Vec<(Bytes, Bytes)>` under 128 fields, `IndexMap` beyond |
+| Set | packed `Vec<Bytes>` under 128 members, `IndexSet` beyond — insertion-ordered, enables O(1) `SPOP` via `swap_remove_index` |
 | Sorted Set (ZSET) | `HashMap<Bytes, f64>` + a `BTreeSet<(score, member)>` index — O(log n) `ZPOPMIN`/`ZPOPMAX`, O(n) range scans |
 | Stream | `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/`XGROUP`/`XREADGROUP`/`XACK`/`XPENDING`/`XREAD`/`XCLAIM`/`XAUTOCLAIM`. Not implemented: `XINFO`, `BLOCK`ing reads, `MINID` trimming, exclusive range bounds |
 

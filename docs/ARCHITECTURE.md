@@ -42,9 +42,11 @@ struct Entry {
 }
 ```
 
-`Value` is a tagged enum of owned collections (`VecDeque<Bytes>`, `HashMap<Bytes,Bytes>`,
-`IndexSet<Bytes>`, `ZSet`) — always the "full" representation, no small-collection compact
-encodings. `Stream` (by far the largest variant — consumer groups, PELs, ...) is boxed
+`Value` is a tagged enum of owned collections (`List`, `Hash`, `Set`, `ZSet`). `List`/`Hash`/`Set`
+are packed small representations (`crates/keyspace/src/collections.rs`): a linear-scanned `Vec`
+below 128 elements — no per-element index/hash overhead — promoting one-way to `VecDeque`/
+`IndexMap`/`IndexSet` on growth, mirroring Redis's listpack→table conversion. `Stream` (by far the
+largest variant — consumer groups, PELs, ...) is boxed
 (`Box<Stream>`) so its size doesn't get paid by every `String`/`List`/`Hash`/`Set`/`ZSet` stored;
 serde treats `Box<T>` like `T` on the wire, so this doesn't touch the RDB/tiered-storage format.
 `Db::get` deep-clones the value (O(1) for `String` via `Bytes`' refcount, O(n) for

@@ -1,28 +1,21 @@
 //! In-memory keyspace: sharded-by-DB storage with TTL semantics.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use indexmap::IndexSet;
 use papaya::HashMap as PapayaMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
+mod collections;
 mod stream;
 mod zset;
+/// Packed-under-128-elements representations — see `collections`.
+pub use collections::{Hash, List, Set};
 pub use stream::{parse_for_add, ConsumerGroup, IdSpec, PendingEntry, Stream, StreamId, XaddError};
 pub use zset::ZSet;
-
-pub type List = VecDeque<Bytes>;
-pub type Hash = HashMap<Bytes, Bytes>;
-/// Insertion-order-preserving set, not a plain `HashSet`: `SPOP` needs O(1)
-/// "pick a random element and remove it" (pick a random index, then
-/// `swap_remove_index`), which a `HashSet` can't do without an O(n) scan —
-/// see `commands::set::cmd_spop`.
-pub type Set = IndexSet<Bytes>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -109,9 +102,9 @@ impl Value {
         match self {
             Value::String(s) => s.len(),
             Value::Int(_) => 8,
-            Value::List(l) => l.iter().map(|b| b.len() + 16).sum(),
-            Value::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 32).sum(),
-            Value::Set(s) => s.iter().map(|b| b.len() + 16).sum(),
+            Value::List(l) => l.approx_bytes(),
+            Value::Hash(h) => h.approx_bytes(),
+            Value::Set(s) => s.approx_bytes(),
             Value::ZSet(z) => z.approx_bytes(),
             Value::Stream(s) => s.approx_bytes(),
         }

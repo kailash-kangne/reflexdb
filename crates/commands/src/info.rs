@@ -38,6 +38,10 @@ pub fn cmd_info(ctx: &ServerContext, _args: &[Bytes]) -> Outcome {
     let used = ctx.store.approx_bytes();
     out.push_str(&format!("used_memory:{used}\r\n"));
     out.push_str(&format!("used_memory_human:{}\r\n", human_bytes(used as u64)));
+    if let Some(peak) = peak_rss() {
+        out.push_str(&format!("used_memory_peak:{peak}\r\n"));
+        out.push_str(&format!("used_memory_peak_human:{}\r\n", human_bytes(peak)));
+    }
     match ctx.effective_maxmemory() {
         Some(limit) => {
             out.push_str(&format!("maxmemory:{limit}\r\n"));
@@ -241,6 +245,34 @@ pub fn cmd_memory(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> O
         }
         other => err(format!("ERR Unknown MEMORY subcommand '{}'", other.to_ascii_lowercase())),
     }
+}
+
+/// Peak resident memory (`getrusage`'s `ru_maxrss`) — Redis's
+/// `used_memory_peak` field. `used_memory` is the payload estimate; this
+/// is the real allocator footprint (fragmentation, buffers, code).
+/// NB: `ru_maxrss` is bytes on macOS/BSD, kilobytes on Linux.
+#[cfg(unix)]
+fn peak_rss() -> Option<u64> {
+    // SAFETY: rusage is a plain out-struct, no pointers retained.
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(libc::RUSAGE_SELF, &mut ru) != 0 {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Some(ru.ru_maxrss as u64)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(ru.ru_maxrss as u64 * 1024)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn peak_rss() -> Option<u64> {
+    None
 }
 
 fn human_bytes(bytes: u64) -> String {

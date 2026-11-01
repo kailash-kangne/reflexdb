@@ -14,12 +14,11 @@
 //!   `~` bookkeeping keys deliberately don't match the `:` prefix, so
 //!   they're never part of a snapshot.
 
-use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bincode::Options;
 use bytes::{Bytes, BytesMut};
-use keyspace::Value as KVal;
+use keyspace::{List, Value as KVal};
 use resp::{Protocol, Value};
 
 use crate::dispatch::{
@@ -119,7 +118,7 @@ fn audit(db: &keyspace::Db, id: &[u8], event: &str) {
     let entry = Bytes::from(format!("{} {event}", now_ms()));
     db.with_entry_mut(
         audit_key(id),
-        || KVal::List(VecDeque::new()),
+        || KVal::List(List::new()),
         |v| {
             if let KVal::List(l) = v {
                 l.push_back(entry.clone());

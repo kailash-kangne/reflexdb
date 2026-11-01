@@ -16,6 +16,7 @@ sha2 = "0.10"
 bincode.workspace = true
 serde.workspace = true
 rand = { workspace = true }
+libc.workspace = true
 tracing.workspace = true
 resp = { path = "../resp" }
 keyspace = { path = "../keyspace" }
