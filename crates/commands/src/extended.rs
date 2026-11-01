@@ -31,13 +31,10 @@ pub fn cmd_config(ctx: &ServerContext, args: &[Bytes]) -> Outcome {
     match subcommand.to_ascii_uppercase().as_slice() {
         b"GET" if args.len() == 2 => {
             let pattern = String::from_utf8_lossy(&args[1]).to_ascii_lowercase();
-            let maxmemory = ctx.effective_maxmemory().unwrap_or(0).to_string();
-            let policy = policy_name(ctx.effective_maxmemory_policy()).to_string();
-            let values = [("maxmemory", maxmemory), ("maxmemory-policy", policy)];
             let mut out = Vec::new();
-            for (key, value) in values {
+            for (key, value) in config_values(ctx) {
                 if glob_matches(&pattern, key) {
-                    out.push(Value::bulk(key));
+                    out.push(Value::bulk(key.to_string()));
                     out.push(Value::bulk(value));
                 }
             }
@@ -46,25 +43,199 @@ pub fn cmd_config(ctx: &ServerContext, args: &[Bytes]) -> Outcome {
         b"SET" if args.len() == 3 => {
             let key = String::from_utf8_lossy(&args[1]).to_ascii_lowercase();
             let value = String::from_utf8_lossy(&args[2]).into_owned();
-            match key.as_str() {
-                "maxmemory" => match parse_memory(&value) {
-                    Some(n) => {
-                        ctx.config_overrides.insert(key, n.to_string());
-                        reply(Value::ok())
-                    }
-                    None => err("ERR value is not an integer or out of range"),
-                },
-                "maxmemory-policy" => match crate::dispatch::MaxMemoryPolicy::parse(&value) {
-                    Some(_) => {
-                        ctx.config_overrides.insert(key, value.to_ascii_lowercase());
-                        reply(Value::ok())
-                    }
-                    None => err("ERR Invalid argument 'maxmemory-policy' for CONFIG SET"),
-                },
-                _ => err("ERR Unsupported CONFIG parameter"),
-            }
+            config_set(ctx, &key, &value)
         }
         _ => err("ERR Unknown subcommand or wrong number of arguments for CONFIG"),
+    }
+}
+
+fn lock_read<'a, T>(lock: &'a std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn lock_write<'a, T>(lock: &'a std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'a, T> {
+    lock.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Every parameter `CONFIG GET` reports. Read-only ones (`databases`,
+/// `maxclients`, `appendfilename`) are still listed — clients enumerate
+/// `CONFIG GET *` and expect to see them — but `CONFIG SET` rejects them.
+fn config_values(ctx: &ServerContext) -> Vec<(&str, String)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let appendfilename = ctx
+        .aof_path
+        .as_ref()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
+    let fsync = match *lock_read(&ctx.aof_fsync) {
+        persistence::aof::Fsync::Always => "always",
+        persistence::aof::Fsync::EverySec => "everysec",
+        persistence::aof::Fsync::No => "no",
+    };
+    let notify = ctx.config_overrides.get("notify-keyspace-events").map(|v| v.clone()).unwrap_or_default();
+    let mut out = vec![
+        ("maxmemory", ctx.effective_maxmemory().unwrap_or(0).to_string()),
+        ("maxmemory-policy", policy_name(ctx.effective_maxmemory_policy()).to_string()),
+        ("appendonly", if ctx.aof_enabled() { "yes" } else { "no" }.to_string()),
+        ("appendfsync", fsync.to_string()),
+        ("appendfilename", appendfilename),
+        ("history-enabled", if ctx.history_enabled() { "yes" } else { "no" }.to_string()),
+        ("slowlog-log-slower-than", ctx.slowlog_threshold_us.load(Relaxed).to_string()),
+        ("slowlog-max-len", ctx.slowlog_max_len.load(Relaxed).to_string()),
+        ("notify-keyspace-events", notify),
+        ("min-replicas-to-write", ctx.min_replicas_to_write.load(Relaxed).to_string()),
+        ("requirepass", lock_read(&ctx.requirepass).clone().unwrap_or_default()),
+        ("aclfile", lock_read(&ctx.acl_file).as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
+        ("dir", lock_read(&ctx.rdb_dir).as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
+        ("dbfilename", lock_read(&ctx.rdb_name).clone()),
+        ("databases", ctx.store.len().to_string()),
+        ("maxclients", ctx.maxclients.to_string()),
+    ];
+    // Startup-only directives — reported so `CONFIG GET *` enumerates the
+    // whole conf; `config_set` still rejects them below.
+    for (k, v) in &ctx.config_display {
+        if !out.iter().any(|(name, _)| name == k) {
+            out.push((k.as_str(), v.clone()));
+        }
+    }
+    out
+}
+
+fn config_set(ctx: &ServerContext, key: &str, value: &str) -> Outcome {
+    use std::sync::atomic::Ordering::Relaxed;
+    match key {
+        "maxmemory" => match parse_memory(value) {
+            Some(n) => {
+                ctx.config_overrides.insert(key.into(), n.to_string());
+                reply(Value::ok())
+            }
+            None => err("ERR value is not an integer or out of range"),
+        },
+        "maxmemory-policy" => match crate::dispatch::MaxMemoryPolicy::parse(value) {
+            Some(_) => {
+                ctx.config_overrides.insert(key.into(), value.to_ascii_lowercase());
+                reply(Value::ok())
+            }
+            None => err("ERR Invalid argument 'maxmemory-policy' for CONFIG SET"),
+        },
+        "appendonly" => match value.to_ascii_lowercase().as_str() {
+            "yes" => {
+                let mut guard = lock_write(&ctx.aof);
+                if guard.is_none() {
+                    let Some(path) = &ctx.aof_path else {
+                        return err("ERR appendonly can't be enabled: no dir/appendfilename configured");
+                    };
+                    let fsync = *lock_read(&ctx.aof_fsync);
+                    match persistence::aof::AofWriter::open(path, fsync) {
+                        Ok(w) => *guard = Some(w),
+                        Err(e) => return err(format!("ERR could not open AOF: {e}")),
+                    }
+                }
+                reply(Value::ok())
+            }
+            "no" => {
+                *lock_write(&ctx.aof) = None;
+                reply(Value::ok())
+            }
+            _ => err("ERR Invalid argument 'appendonly' for CONFIG SET"),
+        },
+        "appendfsync" => {
+            let fsync = match value.to_ascii_lowercase().as_str() {
+                "always" => persistence::aof::Fsync::Always,
+                "everysec" => persistence::aof::Fsync::EverySec,
+                "no" => persistence::aof::Fsync::No,
+                _ => return err("ERR Invalid argument 'appendfsync' for CONFIG SET"),
+            };
+            *lock_write(&ctx.aof_fsync) = fsync;
+            let mut guard = lock_write(&ctx.aof);
+            if guard.is_some() {
+                // The running worker baked its policy in at open — reopen
+                // under the new one. Open-then-swap keeps the old writer
+                // (which drains on drop) if the reopen fails.
+                if let Some(path) = &ctx.aof_path {
+                    match persistence::aof::AofWriter::open(path, fsync) {
+                        Ok(w) => *guard = Some(w),
+                        Err(e) => return err(format!("ERR could not reopen AOF: {e}")),
+                    }
+                }
+            }
+            reply(Value::ok())
+        }
+        "history-enabled" => match value.to_ascii_lowercase().as_str() {
+            "yes" => {
+                let mut guard = lock_write(&ctx.history);
+                if guard.is_none() {
+                    let Some(dir) = &ctx.history_dir else {
+                        return err("ERR history can't be enabled: no history-dir configured");
+                    };
+                    match persistence::history::HistoryWriter::open_with_limit(dir, ctx.history_max_versions)
+                    {
+                        Ok(w) => *guard = Some(w),
+                        Err(e) => return err(format!("ERR could not open history store: {e}")),
+                    }
+                }
+                reply(Value::ok())
+            }
+            "no" => {
+                *lock_write(&ctx.history) = None;
+                reply(Value::ok())
+            }
+            _ => err("ERR Invalid argument 'history-enabled' for CONFIG SET"),
+        },
+        "slowlog-log-slower-than" => match value.parse::<i64>() {
+            Ok(n) => {
+                ctx.slowlog_threshold_us.store(n, Relaxed);
+                reply(Value::ok())
+            }
+            Err(_) => err("ERR value is not an integer or out of range"),
+        },
+        "slowlog-max-len" => match value.parse::<usize>() {
+            Ok(n) => {
+                ctx.slowlog_max_len.store(n, Relaxed);
+                reply(Value::ok())
+            }
+            Err(_) => err("ERR value is not an integer or out of range"),
+        },
+        "notify-keyspace-events" => {
+            *lock_write(&ctx.notify_keyspace_events) = crate::dispatch::NotifyFlags::parse(value);
+            ctx.config_overrides.insert(key.into(), value.to_string());
+            reply(Value::ok())
+        }
+        "min-replicas-to-write" => match value.parse::<usize>() {
+            Ok(n) => {
+                ctx.min_replicas_to_write.store(n, Relaxed);
+                reply(Value::ok())
+            }
+            Err(_) => err("ERR value is not an integer or out of range"),
+        },
+        "requirepass" => {
+            *lock_write(&ctx.requirepass) = (!value.is_empty()).then_some(value.to_string());
+            if let Some(mut user) = ctx.acl_users.get_mut("default") {
+                user.nopass = value.is_empty();
+                user.password_hashes = if value.is_empty() {
+                    Default::default()
+                } else {
+                    [crate::acl::sha256_hex(value.as_bytes())].into_iter().collect()
+                };
+            }
+            reply(Value::ok())
+        }
+        "aclfile" => {
+            *lock_write(&ctx.acl_file) = (!value.is_empty()).then_some(std::path::PathBuf::from(value));
+            reply(Value::ok())
+        }
+        "dir" => {
+            *lock_write(&ctx.rdb_dir) = Some(std::path::PathBuf::from(value));
+            reply(Value::ok())
+        }
+        "dbfilename" => {
+            if value.is_empty() {
+                return err("ERR dbfilename can't be empty");
+            }
+            *lock_write(&ctx.rdb_name) = value.to_string();
+            reply(Value::ok())
+        }
+        _ => err("ERR Unsupported CONFIG parameter"),
     }
 }
 

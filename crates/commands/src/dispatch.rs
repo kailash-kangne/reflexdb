@@ -19,8 +19,8 @@ use crate::schedule::Scheduler;
 use crate::set_opts::{self, ParseError};
 use crate::singleflight::SingleFlightLease;
 use crate::{
-    client, extended, hash, history, info, keys, list, live, pubsub, replication, schedule, script, set,
-    singleflight, snapshot, stream, string, txn, zset,
+    client, extended, hash, history, info, keys, list, live, pubsub, recovery, replication, schedule, script,
+    set, singleflight, snapshot, stream, string, txn, zset,
 };
 
 /// `maxmemory-policy` — which keys are candidates for eviction once
@@ -248,11 +248,19 @@ impl NotifyFlags {
 /// RDB/AOF persistence + `maxmemory` eviction state (Phase 5).
 pub struct ServerContext {
     pub store: Store,
-    pub requirepass: Option<String>,
+    /// `requirepass` — mirrored onto the `default` ACL user; `CONFIG SET`
+    /// can change it live. Lock only because of that runtime write.
+    pub requirepass: std::sync::RwLock<Option<String>>,
+    /// `maxclients` — informational (`CONFIG GET`); the connection gate
+    /// itself lives in the server's accept loop semaphore.
+    pub maxclients: usize,
     /// ACL user table; always has at least `default`, which mirrors plain
     /// `requirepass` behavior until `ACL SETUSER` touches it or other users
     /// are added. See `crate::acl`.
     pub(crate) acl_users: DashMap<String, crate::acl::AclUser>,
+    /// `aclfile` config directive — the file `ACL SAVE` writes and
+    /// `ACL LOAD`/startup reads. `None` disables both subcommands.
+    pub(crate) acl_file: std::sync::RwLock<Option<std::path::PathBuf>>,
     pub start_time: Instant,
 
     next_client_id: AtomicU64,
@@ -332,16 +340,22 @@ pub struct ServerContext {
     /// usually `0` and lets `on_key_changed` skip it entirely.
     pub(crate) tracking_table_len: AtomicUsize,
 
-    /// Where `SAVE`/`BGSAVE` write their RDB-style snapshot. `None` means
-    /// those commands are unavailable (no `dir`/`dbfilename` configured).
-    pub(crate) rdb_path: Option<PathBuf>,
+    /// `dir`/`dbfilename` — where `SAVE`/`BGSAVE`/shutdown dumps land.
+    /// `None` dir means those commands are unavailable. `CONFIG SET dir`/
+    /// `dbfilename` retarget them at runtime, so both sit behind locks.
+    pub(crate) rdb_dir: std::sync::RwLock<Option<PathBuf>>,
+    pub(crate) rdb_name: std::sync::RwLock<String>,
     last_save: AtomicU64,
-    /// Append-only command log, present only when `appendonly yes`.
-    pub(crate) aof: Option<persistence::aof::AofWriter>,
-    /// Where `aof` is writing to — needed by `BGREWRITEAOF` to know what
-    /// file to atomically swap the rewritten one in over. `None` exactly
-    /// when `aof` is `None`.
+    /// Append-only command log, present only while `appendonly yes`.
+    /// Behind a lock so `CONFIG SET appendonly` can open/drop it live —
+    /// dropping the writer drains its queue before the worker exits.
+    pub(crate) aof: std::sync::RwLock<Option<persistence::aof::AofWriter>>,
+    /// Where `aof` writes/would write — `None` only when `dir`/
+    /// `appendfilename` were never configured.
     pub(crate) aof_path: Option<PathBuf>,
+    /// `appendfsync` the writer runs (or would run) under; `CONFIG SET
+    /// appendfsync` swaps the writer when one's active.
+    pub(crate) aof_fsync: std::sync::RwLock<persistence::aof::Fsync>,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
     /// `proto-max-bulk-len`: largest value a single `String` command
@@ -357,6 +371,12 @@ pub struct ServerContext {
     /// Runtime overrides exposed by CONFIG. The startup configuration remains
     /// immutable; only explicitly supported live settings are stored here.
     pub(crate) config_overrides: DashMap<String, String>,
+    /// Startup values for directives `CONFIG GET` reports but `CONFIG SET`
+    /// can't change at runtime (`port`, `tiered-*`, `repl-*`, `live-*`,
+    /// `history-dir`, …) — populated once by the server from its `Config`;
+    /// empty in tests. Runtime-settable params aren't here — their
+    /// *effective* values are what `config_values` emits.
+    pub(crate) config_display: Vec<(String, String)>,
     /// Updated periodically (not on every write) by a background tick —
     /// see `ServerContext::run_eviction_tick`.
     approx_memory: AtomicUsize,
@@ -450,13 +470,26 @@ pub struct ServerContext {
     /// `min-replicas-to-write`: write commands fail with `NOREPLICAS` when
     /// fewer than this many connected replicas are healthy (not flagged
     /// slow). 0 = off (default). Same semantics as Redis's directive.
-    pub min_replicas_to_write: usize,
+    pub min_replicas_to_write: AtomicUsize,
     /// Connected replicas (clients that sent `PSYNC`), keyed by client id.
     pub(crate) replicas: DashMap<u64, ReplicaState>,
     /// Logical replication offset: incremented once per replicated write
     /// (a command count, not a byte offset like real Redis — see
     /// `docs/06-ha-replication-cluster.md`'s implementation notes).
     pub(crate) master_repl_offset: AtomicU64,
+    /// `partial-resync-backlog`: bytes of the replicated stream kept for
+    /// `PSYNC <replid> <offset>` catch-up after a replica reconnects.
+    /// Default `1 MiB`; `0` disables partial resync (every reconnect is a
+    /// full resync).
+    pub partial_resync_backlog: usize,
+    /// Replication stream tail — see `crate::replication::ReplStream`.
+    pub(crate) repl_stream: std::sync::Mutex<crate::replication::ReplStream>,
+    /// Lock-free mirror of `repl_stream.active` so `replicate()` can skip
+    /// the stream lock entirely until the first replica attaches.
+    pub(crate) backlog_active: std::sync::atomic::AtomicBool,
+    /// Resync counters for `INFO replication` (`sync_full`/`sync_partial_ok`).
+    pub full_resyncs: AtomicU64,
+    pub partial_resyncs: AtomicU64,
     /// Random id handed to replicas in `FULLRESYNC`, generated once at
     /// startup (not persisted — a restart gets a fresh identity, same as a
     /// real primary after a hard crash with `repl-id` not preserved).
@@ -469,6 +502,12 @@ pub struct ServerContext {
     /// synchronous `dispatch()` can't hold) watches this to know when to
     /// drop its current link and reconnect elsewhere.
     pub(crate) replication_epoch: AtomicU64,
+    /// Bumped on `REPLICAOF NO ONE` only: the resume cursor a replica
+    /// link keeps is tagged with this generation, and promotion
+    /// invalidates it — a promoted replica's data may have diverged, so
+    /// re-attaching must never partial-resync from a pre-promotion
+    /// offset.
+    pub(crate) replica_generation: AtomicU64,
     /// Woken on every `REPLCONF ACK`, so `WAIT` doesn't have to poll on a
     /// tight timer.
     pub replica_ack_notify: tokio::sync::Notify,
@@ -480,18 +519,17 @@ pub struct ServerContext {
     /// it a wasted re-check of the keys it's actually interested in.
     pub blocking_notify: tokio::sync::Notify,
 
-    /// `notify-keyspace-events` — parsed once at startup, immutable after
-    /// that (matches how `maxmemory_policy` is handled).
-    pub notify_keyspace_events: NotifyFlags,
+    /// `notify-keyspace-events` — `CONFIG SET` can rewrite it at runtime.
+    pub notify_keyspace_events: std::sync::RwLock<NotifyFlags>,
 
     /// `SLOWLOG` ring buffer, newest first.
     pub(crate) slowlog: std::sync::Mutex<std::collections::VecDeque<crate::info::SlowLogEntry>>,
     slowlog_next_id: AtomicU64,
     /// `slowlog-log-slower-than`: microseconds a command must take to be
     /// logged; `-1` disables logging, `0` logs everything.
-    pub slowlog_threshold_us: i64,
+    pub slowlog_threshold_us: std::sync::atomic::AtomicI64,
     /// `slowlog-max-len`: oldest entries drop once the log exceeds this.
-    pub slowlog_max_len: usize,
+    pub slowlog_max_len: AtomicUsize,
 
     /// Disk-backed version log backing `GETAT`/`HISTORY` (see
     /// `persistence::history`'s module docs). `None` means `history-enabled
@@ -505,8 +543,14 @@ pub struct ServerContext {
     /// runs at all when `history-enabled yes`. Does not decide Bet 1
     /// (`docs/15-strategic-bets.md`): this is a side-car on top of the
     /// existing mutable keyspace, not "current value is just a query over
-    /// the log."
-    pub(crate) history: Option<persistence::history::HistoryWriter>,
+    /// the log." Behind a lock so `CONFIG SET history-enabled` can
+    /// open/drop the store live (drop drains the queue before exit).
+    pub(crate) history: std::sync::RwLock<Option<persistence::history::HistoryWriter>>,
+    /// `history-dir`/`history-max-versions-per-key` — needed to lazily
+    /// open the store on `CONFIG SET history-enabled yes`; `None` when
+    /// never configured.
+    pub(crate) history_dir: Option<PathBuf>,
+    pub(crate) history_max_versions: usize,
 }
 
 impl ServerContext {
@@ -522,7 +566,9 @@ impl ServerContext {
         Self {
             store,
             acl_users: ServerContext::init_acl(requirepass.as_deref()),
-            requirepass,
+            acl_file: std::sync::RwLock::new(None),
+            requirepass: std::sync::RwLock::new(requirepass),
+            maxclients: 10_000,
             start_time: Instant::now(),
             next_client_id: AtomicU64::new(1),
             clients: DashMap::new(),
@@ -549,14 +595,17 @@ impl ServerContext {
             client_names: DashMap::new(),
             tracking_table: DashMap::new(),
             tracking_table_len: AtomicUsize::new(0),
-            rdb_path: None,
+            rdb_dir: std::sync::RwLock::new(None),
+            rdb_name: std::sync::RwLock::new("dump.rdb".to_string()),
             last_save: AtomicU64::new(0),
-            aof: None,
+            aof: std::sync::RwLock::new(None),
             aof_path: None,
+            aof_fsync: std::sync::RwLock::new(persistence::aof::Fsync::No),
             maxmemory: None,
             maxmemory_policy: MaxMemoryPolicy::NoEviction,
             proto_max_bulk_len: 64 * 1024 * 1024,
             config_overrides: DashMap::new(),
+            config_display: Vec::new(),
             approx_memory: AtomicUsize::new(0),
             tiered_limit: None,
             tiered_disk_limit: None,
@@ -577,20 +626,28 @@ impl ServerContext {
             replica_queue_capacity: 32_768,
             replica_queue_max_bytes: 64 * 1024 * 1024,
             replica_slow_disconnect_delay: Duration::from_secs(5),
-            min_replicas_to_write: 0,
+            min_replicas_to_write: AtomicUsize::new(0),
             replicas: DashMap::new(),
             master_repl_offset: AtomicU64::new(0),
+            partial_resync_backlog: 1024 * 1024,
+            repl_stream: std::sync::Mutex::new(crate::replication::ReplStream::default()),
+            backlog_active: std::sync::atomic::AtomicBool::new(false),
+            full_resyncs: AtomicU64::new(0),
+            partial_resyncs: AtomicU64::new(0),
             replid: generate_replid(),
             replica_of: std::sync::Mutex::new(None),
             replication_epoch: AtomicU64::new(0),
+            replica_generation: AtomicU64::new(0),
             replica_ack_notify: tokio::sync::Notify::new(),
             blocking_notify: tokio::sync::Notify::new(),
-            notify_keyspace_events: NotifyFlags::default(),
+            notify_keyspace_events: std::sync::RwLock::new(NotifyFlags::default()),
             slowlog: std::sync::Mutex::new(std::collections::VecDeque::new()),
             slowlog_next_id: AtomicU64::new(0),
-            slowlog_threshold_us: 10_000,
-            slowlog_max_len: 128,
-            history: None,
+            slowlog_threshold_us: std::sync::atomic::AtomicI64::new(10_000),
+            slowlog_max_len: AtomicUsize::new(128),
+            history: std::sync::RwLock::new(None),
+            history_dir: None,
+            history_max_versions: persistence::history::DEFAULT_MAX_VERSIONS_PER_KEY,
         }
     }
 
@@ -598,11 +655,12 @@ impl ServerContext {
     /// over `slowlog_threshold_us`. `req` is only cloned when actually
     /// logging, so this is cheap on the (overwhelmingly common) fast path.
     pub(crate) fn record_command_timing(&self, req: &[Bytes], duration: Duration) {
-        if self.slowlog_threshold_us < 0 {
+        let threshold = self.slowlog_threshold_us.load(Ordering::Relaxed);
+        if threshold < 0 {
             return;
         }
         let micros = duration.as_micros() as u64;
-        if micros < self.slowlog_threshold_us as u64 {
+        if micros < threshold as u64 {
             return;
         }
         let entry = crate::info::SlowLogEntry {
@@ -613,7 +671,7 @@ impl ServerContext {
         };
         let mut log = self.slowlog.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         log.push_front(entry);
-        while log.len() > self.slowlog_max_len {
+        while log.len() > self.slowlog_max_len.load(Ordering::Relaxed) {
             log.pop_back();
         }
     }
@@ -625,6 +683,25 @@ impl ServerContext {
 
     pub fn with_proto_max_bulk_len(mut self, limit: usize) -> Self {
         self.proto_max_bulk_len = limit;
+        self
+    }
+
+    /// `aclfile` — see `ServerContext::acl_file`.
+    pub fn with_acl_file(self, path: Option<std::path::PathBuf>) -> Self {
+        *self.acl_file.write().unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+        self
+    }
+
+    /// `maxclients` — informational only (see the field's doc).
+    pub fn with_maxclients(mut self, n: usize) -> Self {
+        self.maxclients = n;
+        self
+    }
+
+    /// Startup-directive snapshot `CONFIG GET` reports read-only — see the
+    /// `config_display` field's doc.
+    pub fn with_config_display(mut self, values: Vec<(String, String)>) -> Self {
+        self.config_display = values;
         self
     }
 
@@ -647,18 +724,35 @@ impl ServerContext {
     }
 
     pub fn with_min_replicas_to_write(mut self, n: usize) -> Self {
-        self.min_replicas_to_write = n;
+        self.min_replicas_to_write = AtomicUsize::new(n);
         self
     }
 
-    pub fn with_notify_keyspace_events(mut self, flags: NotifyFlags) -> Self {
-        self.notify_keyspace_events = flags;
+    pub fn with_partial_resync_backlog(mut self, bytes: usize) -> Self {
+        self.partial_resync_backlog = bytes;
         self
     }
 
-    pub fn with_rdb_path(mut self, path: PathBuf) -> Self {
-        self.rdb_path = Some(path);
+    pub fn with_notify_keyspace_events(self, flags: NotifyFlags) -> Self {
+        *self.notify_keyspace_events.write().unwrap_or_else(std::sync::PoisonError::into_inner) = flags;
         self
+    }
+
+    pub fn with_rdb_path(self, path: PathBuf) -> Self {
+        *self.rdb_name.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "dump.rdb".into());
+        *self.rdb_dir.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            path.parent().map(std::path::Path::to_path_buf).or(Some(PathBuf::from(".")));
+        self
+    }
+
+    /// `dir`/`dbfilename` joined — `None` when `dir` was never configured.
+    pub fn rdb_path(&self) -> Option<PathBuf> {
+        self.rdb_dir
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|d| d.join(&*self.rdb_name.read().unwrap_or_else(std::sync::PoisonError::into_inner)))
     }
 
     pub fn with_tiered_limit(mut self, limit: Option<u64>) -> Self {
@@ -699,8 +793,8 @@ impl ServerContext {
     }
 
     pub fn with_slowlog(mut self, threshold_us: i64, max_len: usize) -> Self {
-        self.slowlog_threshold_us = threshold_us;
-        self.slowlog_max_len = max_len;
+        self.slowlog_threshold_us = std::sync::atomic::AtomicI64::new(threshold_us);
+        self.slowlog_max_len = AtomicUsize::new(max_len);
         self
     }
 
@@ -713,8 +807,18 @@ impl ServerContext {
     }
 
     pub fn with_aof(mut self, writer: persistence::aof::AofWriter, path: PathBuf) -> Self {
-        self.aof = Some(writer);
+        *self.aof_fsync.write().unwrap_or_else(std::sync::PoisonError::into_inner) = writer.fsync_policy();
+        *self.aof.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer);
         self.aof_path = Some(path);
+        self
+    }
+
+    /// `appendfilename`/`appendfsync` as configured — needed so `CONFIG SET
+    /// appendonly yes` can open the writer lazily when the server booted
+    /// with `appendonly no`.
+    pub fn with_aof_config(mut self, path: PathBuf, fsync: persistence::aof::Fsync) -> Self {
+        self.aof_path = Some(path);
+        *self.aof_fsync.write().unwrap_or_else(std::sync::PoisonError::into_inner) = fsync;
         self
     }
 
@@ -726,8 +830,17 @@ impl ServerContext {
 
     /// `history-enabled yes` — turns on `GETAT`/`HISTORY`, backed by
     /// `writer` (see `ServerContext::history`'s docs for scope).
-    pub fn with_history(mut self, writer: persistence::history::HistoryWriter) -> Self {
-        self.history = Some(writer);
+    pub fn with_history(self, writer: persistence::history::HistoryWriter) -> Self {
+        *self.history.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer);
+        self
+    }
+
+    /// `history-dir`/`history-max-versions-per-key` — needed so `CONFIG SET
+    /// history-enabled yes` can open the store lazily when the server
+    /// booted with `history-enabled no`.
+    pub fn with_history_config(mut self, dir: PathBuf, max_versions: usize) -> Self {
+        self.history_dir = Some(dir);
+        self.history_max_versions = max_versions;
         self
     }
 
@@ -741,16 +854,30 @@ impl ServerContext {
     }
 
     pub(crate) fn append_aof(&self, db_index: usize, req: &[Bytes]) {
-        if let Some(writer) = &self.aof {
+        let aof = self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(writer) = &*aof {
             if let Err(e) = writer.append(db_index, req) {
                 tracing::warn!(error = %e, "failed to append to AOF");
+            }
+            // `appendfsync always` promises the acknowledged write is
+            // already fsync'd — without this wait the reply outruns the
+            // writer thread and a `kill -9` in that gap loses an
+            // acknowledged write. Write commands with an AOF attached
+            // dispatch on `spawn_blocking`, so this wait doesn't park a
+            // Tokio worker. A failed flush sets `io_failed`, and the next
+            // write is refused with `MISCONF` as usual.
+            if writer.fsync_policy() == persistence::aof::Fsync::Always {
+                if let Err(e) = writer.flush_and_fsync() {
+                    tracing::warn!(error = %e, "appendfsync always: fsync failed");
+                }
             }
         }
     }
 
     /// Flush the AOF to disk, for the `appendfsync everysec` background tick.
     pub fn aof_fsync(&self) {
-        if let Some(writer) = &self.aof {
+        let aof = self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(writer) = &*aof {
             if let Err(e) = writer.fsync() {
                 tracing::warn!(error = %e, "failed to fsync AOF");
             }
@@ -763,11 +890,15 @@ impl ServerContext {
     /// for why that distinction matters now that `append`/`fsync` are
     /// fire-and-forget). `None` if AOF isn't enabled at all.
     pub(crate) fn flush_aof(&self) -> Option<std::io::Result<()>> {
-        self.aof.as_ref().map(|writer| writer.flush_and_fsync())
+        self.aof
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|writer| writer.flush_and_fsync())
     }
 
     pub fn aof_enabled(&self) -> bool {
-        self.aof.is_some()
+        self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
     }
 
     /// `SHUTDOWN`/signal-handler ritual: block until every queued write is
@@ -780,8 +911,8 @@ impl ServerContext {
             tracing::warn!(error = %e, "shutdown: final AOF fsync failed");
         }
         if save_rdb {
-            if let Some(path) = &self.rdb_path {
-                match persistence::rdb::save(path, &self.store) {
+            if let Some(path) = self.rdb_path() {
+                match persistence::rdb::save(&path, &self.store) {
                     Ok(()) => self.mark_saved(),
                     Err(e) => tracing::warn!(error = %e, "shutdown: final RDB save failed"),
                 }
@@ -790,7 +921,7 @@ impl ServerContext {
     }
 
     pub fn history_enabled(&self) -> bool {
-        self.history.is_some()
+        self.history.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
     }
 
     /// Blocks until every `GETAT`/`HISTORY` version recorded so far has
@@ -800,7 +931,7 @@ impl ServerContext {
     /// instead of sleeping/polling. No-op if history isn't enabled.
     #[cfg(test)]
     pub(crate) fn history_flush(&self) {
-        if let Some(writer) = &self.history {
+        if let Some(writer) = &*self.history.read().unwrap_or_else(std::sync::PoisonError::into_inner) {
             writer.flush();
         }
     }
@@ -812,7 +943,12 @@ impl ServerContext {
     /// size, replacing the old in-RAM design's per-key version cap. No-op
     /// (returns `0`) if history isn't enabled.
     pub fn history_sweep(&self, cutoff_ms: u64) -> usize {
-        self.history.as_ref().map(|writer| writer.sweep_older_than(cutoff_ms)).unwrap_or(0)
+        self.history
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|writer| writer.sweep_older_than(cutoff_ms))
+            .unwrap_or(0)
     }
 
     pub fn connected_clients(&self) -> usize {
@@ -1486,7 +1622,7 @@ pub(crate) fn wrong_type() -> Outcome {
 /// protect unsaved data: when AOF is off and a dump path exists.
 fn cmd_shutdown(ctx: &ServerContext, args: &[Bytes]) -> Outcome {
     let save = match args {
-        [] => ctx.aof.is_none() && ctx.rdb_path.is_some(),
+        [] => !ctx.aof_enabled() && ctx.rdb_path().is_some(),
         [flag] if flag.eq_ignore_ascii_case(b"SAVE") => true,
         [flag] if flag.eq_ignore_ascii_case(b"NOSAVE") => false,
         _ => return err("ERR syntax error"),
@@ -1583,7 +1719,7 @@ fn on_key_changed_impl(
     key: Bytes,
     snap: Option<Bytes>,
 ) {
-    if ctx.history.is_some() {
+    if ctx.history_enabled() {
         pending.push((db_index, key.clone(), snap));
     }
     // LIVE wakes go through the deduplicating fan-out queue when the ctx is
@@ -1642,7 +1778,8 @@ fn drain_pending_history(ctx: &ServerContext, pending: &mut PendingHistory) {
 /// `HistoryWriter::record` itself is fire-and-forget (see its module
 /// docs), so this doesn't block the write path on any disk I/O.
 fn record_history(ctx: &ServerContext, db_index: usize, key: &Bytes, snap: Option<Bytes>) {
-    let Some(writer) = &ctx.history else { return };
+    let history = ctx.history.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(writer) = &*history else { return };
     let snapshot = match snap {
         snap @ Some(_) => snap,
         None => {
@@ -1674,7 +1811,7 @@ pub(crate) fn notify_keyspace_event(
     event: &str,
     key: &[u8],
 ) {
-    let flags = &ctx.notify_keyspace_events;
+    let flags = ctx.notify_keyspace_events.read().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !flags.enabled(class) {
         return;
     }
@@ -1760,11 +1897,24 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     if req.is_empty() {
         return err("ERR empty command");
     }
-    let name = String::from_utf8_lossy(&req[0]).to_ascii_uppercase();
+    // Uppercase the command name on the stack — every real command is
+    // short ASCII, so the heap `String` only materializes for weird
+    // (non-ASCII / oversized) names. Saves one allocation per command.
+    const NAME_BUF: usize = 24;
+    let mut name_buf = [0u8; NAME_BUF];
+    let heap_name;
+    let name: &str = if req[0].len() <= NAME_BUF && req[0].is_ascii() {
+        name_buf[..req[0].len()].copy_from_slice(&req[0]);
+        name_buf[..req[0].len()].make_ascii_uppercase();
+        std::str::from_utf8(&name_buf[..req[0].len()]).expect("ascii bytes are valid utf8")
+    } else {
+        heap_name = String::from_utf8_lossy(&req[0]).to_ascii_uppercase();
+        heap_name.as_str()
+    };
     let args = &req[1..];
 
     // Only a small allowlist works before AUTH succeeds, matching requirepass behavior.
-    if !state.authenticated && !matches!(name.as_str(), "AUTH" | "HELLO" | "QUIT" | "RESET") {
+    if !state.authenticated && !matches!(name, "AUTH" | "HELLO" | "QUIT" | "RESET") {
         return err("NOAUTH Authentication required.");
     }
 
@@ -1775,12 +1925,12 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     // operator's ACL).
     if state.authenticated
         && !state.is_replication_link
-        && !matches!(name.as_str(), "AUTH" | "HELLO" | "QUIT" | "RESET")
+        && !matches!(name, "AUTH" | "HELLO" | "QUIT" | "RESET")
     {
         let Some(user) = ctx.acl_users.get(&state.acl_user) else {
             return err("NOAUTH Authentication required.");
         };
-        if let Err(message) = crate::acl::authorize(user.value(), &name, args) {
+        if let Err(message) = crate::acl::authorize(user.value(), name, args) {
             return err(message);
         }
     }
@@ -1790,7 +1940,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     if state.protocol == Protocol::Resp2
         && state.subscriptions > 0
         && !matches!(
-            name.as_str(),
+            name,
             "SUBSCRIBE"
                 | "UNSUBSCRIBE"
                 | "PSUBSCRIBE"
@@ -1810,11 +1960,11 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
 
     // Inside MULTI, every command except the ones that manage the
     // transaction itself gets queued instead of executed.
-    if state.in_multi && !matches!(name.as_str(), "EXEC" | "DISCARD" | "MULTI" | "RESET" | "QUIT") {
+    if state.in_multi && !matches!(name, "EXEC" | "DISCARD" | "MULTI" | "RESET" | "QUIT") {
         if name == "WATCH" {
             return err("ERR WATCH inside MULTI is not allowed");
         }
-        if !KNOWN_COMMANDS.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+        if !KNOWN_COMMANDS_SET.contains(name) {
             state.multi_error = true;
             return err(format!("ERR unknown command '{name}'"));
         }
@@ -1822,7 +1972,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         return reply(Value::Simple("QUEUED".into()));
     }
 
-    let is_write = WRITE_COMMANDS.contains(name.as_str())
+    let is_write = WRITE_COMMANDS.contains(name)
         || (name == "SORT" && args.iter().any(|arg| arg.eq_ignore_ascii_case(b"STORE")));
     if is_write && ctx.is_replica() && !state.is_replication_link {
         return err("READONLY You can't write against a read only replica.");
@@ -1830,11 +1980,11 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     // `min-replicas-to-write`: refuse writes unless enough connected replicas
     // are healthy. The replication-apply path is exempt — a replica must keep
     // applying its primary's stream regardless of its own downstream links.
+    let min_replicas = ctx.min_replicas_to_write.load(Ordering::Relaxed);
     if is_write
-        && ctx.min_replicas_to_write > 0
+        && min_replicas > 0
         && !state.is_replication_link
-        && ctx.replicas.iter().filter(|r| !ctx.slow_replicas.contains_key(r.key())).count()
-            < ctx.min_replicas_to_write
+        && ctx.replicas.iter().filter(|r| !ctx.slow_replicas.contains_key(r.key())).count() < min_replicas
     {
         return err("NOREPLICAS Not enough good replicas to write.");
     }
@@ -1843,7 +1993,15 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     // refuse further writes (same `MISCONF` contract Redis uses) rather
     // than ack more data that can't persist. Auto-clears on the next
     // successful batch; the replication-apply path stays exempt.
-    if is_write && !state.is_replication_link && ctx.aof.as_ref().is_some_and(|w| w.io_failed()) {
+    if is_write
+        && !state.is_replication_link
+        && ctx
+            .aof
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|w| w.io_failed())
+    {
         return err("MISCONF Errors writing to the AOF file");
     }
     if is_write && ctx.maxmemory_exceeded() && ctx.effective_maxmemory_policy() == MaxMemoryPolicy::NoEviction
@@ -1858,8 +2016,9 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     // of existing keys stay allowed — they can't grow (and can shrink) the
     // tier.
     if is_write
+        && ctx.tiered_limit.is_some()
         && ctx.tiered_full_for(args.iter().map(|a| a.len() as u64 + 64).sum())
-        && !tier_full_safe(ctx, state.db_index, name.as_str(), args)
+        && !tier_full_safe(ctx, state.db_index, name, args)
     {
         ctx.tiered_full_rejections.fetch_add(1, Ordering::Relaxed);
         return err(
@@ -1871,7 +2030,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     // bumps and a pointer-vec copy, not a deep data copy.
     let aof_req = if is_write { Some(req.clone()) } else { None };
 
-    let outcome = match name.as_str() {
+    let outcome = match name {
         "PING" => match args.len() {
             0 => reply(Value::Simple("PONG".into())),
             1 => reply(Value::bulk(args[0].clone())),
@@ -1888,7 +2047,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "RESET" => {
             state.db_index = 0;
             state.protocol = Protocol::Resp2;
-            state.authenticated = ctx.requirepass.is_none();
+            state.authenticated = !ctx.auth_required();
             state.in_multi = false;
             state.multi_error = false;
             state.queued.clear();
@@ -1997,6 +2156,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
         "LPOP" => list::cmd_lpop(ctx, state, args),
         "RPOP" => list::cmd_rpop(ctx, state, args),
         "LLEN" => list::cmd_llen(ctx, state, args),
+        "LINDEX" => list::cmd_lindex(ctx, state, args),
         "LPOS" => list::cmd_lpos(ctx, state, args),
         "LRANGE" => list::cmd_lrange(ctx, state, args),
         "LTRIM" => list::cmd_ltrim(ctx, state, args),
@@ -2035,6 +2195,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
 
         "SADD" => set::cmd_sadd(ctx, state, args),
         "SREM" => set::cmd_srem(ctx, state, args),
+        "SMOVE" => set::cmd_smove(ctx, state, args),
         "SMEMBERS" => set::cmd_smembers(ctx, state, args),
         "SISMEMBER" => set::cmd_sismember(ctx, state, args),
         "SMISMEMBER" => set::cmd_smismember(ctx, state, args),
@@ -2119,6 +2280,10 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
 
         "SCHEDULE" => schedule::cmd_schedule(ctx, state, args),
 
+        "RUN" => recovery::cmd_run(ctx, state, args),
+        "IDEMPOTENT" => recovery::cmd_idempotent(ctx, state, args),
+
+        "ROLE" => replication::cmd_role(ctx, args),
         "REPLICAOF" | "SLAVEOF" => replication::cmd_replicaof(ctx, args),
         "PSYNC" => replication::cmd_psync(ctx, state, args),
         "REPLCONF" => replication::cmd_replconf(ctx, state, args),
@@ -2264,12 +2429,28 @@ fn cmd_set(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome 
         return reply(Value::NullBulk);
     }
 
+    // `GET`: grab the old value before overwriting; a non-string old value
+    // aborts the whole SET with WRONGTYPE, matching Redis.
+    let old = if opts.get {
+        match db.with_value(&key, |v| v.string_bytes().ok_or(())) {
+            Some(Ok(bytes)) => Some(Some(bytes)),
+            Some(Err(())) => return wrong_type(),
+            None => Some(None),
+        }
+    } else {
+        None
+    };
+
     let expires_at = if opts.keep_ttl { db.current_expiry(&key).flatten() } else { opts.expires_at };
 
     db.set(key.clone(), KVal::String(value.clone()), expires_at);
     on_key_changed(ctx, state, state.db_index, key.clone(), Some(value));
     notify_keyspace_event(ctx, state.db_index, '$', "set", &key);
-    reply(Value::ok())
+    match old {
+        Some(Some(bytes)) => reply(Value::bulk(bytes)),
+        Some(None) => reply(Value::NullBulk),
+        None => reply(Value::ok()),
+    }
 }
 
 /// Plain `GET key` (no `SINGLEFLIGHT` modifier) — also used by
@@ -2362,11 +2543,74 @@ fn cmd_expiretime(ctx: &ServerContext, state: &ClientState, args: &[Bytes], mill
     reply(Value::Integer(value))
 }
 
+/// Conditional flag for the `EXPIRE`-family commands (Redis 7.0+):
+/// `NX` = apply only when the key has no expiry, `XX` = only when it has
+/// one, `GT`/`LT` = only when the new expiry is greater/less than the
+/// current one (a persistent key counts as infinite).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpireCond {
+    None,
+    Nx,
+    Xx,
+    Gt,
+    Lt,
+}
+
+/// Parse trailing `SLIDING`/`NX`/`XX`/`GT`/`LT` options for the
+/// `EXPIRE`/`EXPIREAT` family. `SLIDING` (the reflexdb extension) may
+/// combine with one conditional flag; the conditional flags themselves
+/// are mutually exclusive, same as Redis.
+fn parse_expire_flags(rest: &[Bytes], name: &str) -> Result<(bool, ExpireCond), Outcome> {
+    let mut sliding = false;
+    let mut cond = ExpireCond::None;
+    for arg in rest {
+        if arg.eq_ignore_ascii_case(b"SLIDING") {
+            if sliding {
+                return Err(err("ERR syntax error"));
+            }
+            sliding = true;
+            continue;
+        }
+        let flag = if arg.eq_ignore_ascii_case(b"NX") {
+            ExpireCond::Nx
+        } else if arg.eq_ignore_ascii_case(b"XX") {
+            ExpireCond::Xx
+        } else if arg.eq_ignore_ascii_case(b"GT") {
+            ExpireCond::Gt
+        } else if arg.eq_ignore_ascii_case(b"LT") {
+            ExpireCond::Lt
+        } else {
+            return Err(wrong_args(name));
+        };
+        if cond != ExpireCond::None {
+            return Err(err("ERR NX and XX, GT or LT options are mutually exclusive"));
+        }
+        cond = flag;
+    }
+    Ok((sliding, cond))
+}
+
+/// Whether `cond` allows applying a new expiry of `new_dur`, given the
+/// key's current `Ttl`. Persistent counts as infinite for GT/LT; a
+/// missing key fails every conditional (the command returns 0 anyway).
+fn expire_cond_ok(ttl: Ttl, cond: ExpireCond, new_dur: Duration) -> bool {
+    match (cond, ttl) {
+        (ExpireCond::None, _) => true,
+        (ExpireCond::Nx, Ttl::Persistent) => true,
+        (ExpireCond::Xx, Ttl::Expires(_)) => true,
+        (ExpireCond::Gt, Ttl::Expires(rem)) => new_dur > rem,
+        (ExpireCond::Lt, Ttl::Expires(rem)) => new_dur < rem,
+        (ExpireCond::Lt, Ttl::Persistent) => true,
+        _ => false,
+    }
+}
+
 fn cmd_expire(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: bool) -> Outcome {
-    let (key, amount, sliding) = match args {
-        [key, amount] => (key, amount, false),
-        [key, amount, flag] if flag.eq_ignore_ascii_case(b"SLIDING") => (key, amount, true),
-        _ => return wrong_args(if millis { "pexpire" } else { "expire" }),
+    let name = if millis { "pexpire" } else { "expire" };
+    let [key, amount, rest @ ..] = args else { return wrong_args(name) };
+    let (sliding, cond) = match parse_expire_flags(rest, name) {
+        Ok(parsed) => parsed,
+        Err(e) => return e,
     };
     let n: i64 = match std::str::from_utf8(amount).ok().and_then(|s| s.parse().ok()) {
         Some(n) => n,
@@ -2375,6 +2619,11 @@ fn cmd_expire(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: 
     let db = ctx.store.db(state.db_index).expect("valid db index");
     let dur =
         if millis { Duration::from_millis(n.max(0) as u64) } else { Duration::from_secs(n.max(0) as u64) };
+    // Condition flags are checked before the non-positive-TTL delete path,
+    // so e.g. `EXPIRE k 0 NX` leaves a key that already has a TTL alone.
+    if cond != ExpireCond::None && !expire_cond_ok(db.ttl(key), cond, dur) {
+        return reply(Value::Integer(0));
+    }
     if n <= 0 {
         // Non-positive TTL deletes the key immediately, matching Redis.
         let deleted = db.del(std::slice::from_ref(key));
@@ -2398,7 +2647,12 @@ fn cmd_expire(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: 
 /// of a relative duration. A timestamp in the past deletes the key
 /// immediately, matching Redis.
 fn cmd_expireat(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: bool) -> Outcome {
-    let [key, timestamp] = args else { return wrong_args(if millis { "pexpireat" } else { "expireat" }) };
+    let name = if millis { "pexpireat" } else { "expireat" };
+    let [key, timestamp, rest @ ..] = args else { return wrong_args(name) };
+    let (sliding, cond) = match parse_expire_flags(rest, name) {
+        Ok(parsed) => parsed,
+        Err(e) => return e,
+    };
     let ts: i64 = match std::str::from_utf8(timestamp).ok().and_then(|s| s.parse().ok()) {
         Some(n) => n,
         None => return err("ERR value is not an integer or out of range"),
@@ -2420,7 +2674,11 @@ fn cmd_expireat(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis
         return reply(Value::Integer(if deleted > 0 { 1 } else { 0 }));
     }
     let dur = target.expect("checked above").duration_since(now).unwrap_or_default();
-    let changed = db.expire(key, Some(saturating_deadline(dur)));
+    if cond != ExpireCond::None && !expire_cond_ok(db.ttl(key), cond, dur) {
+        return reply(Value::Integer(0));
+    }
+    let changed =
+        if sliding { db.expire_sliding(key, dur) } else { db.expire(key, Some(saturating_deadline(dur))) };
     if changed {
         on_key_changed(ctx, state, state.db_index, key.clone(), None);
         notify_keyspace_event(ctx, state.db_index, 'g', "expire", key);
@@ -2652,6 +2910,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "LPOP",
     "RPOP",
     "LLEN",
+    "LINDEX",
     "LPOS",
     "LRANGE",
     "LTRIM",
@@ -2686,6 +2945,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "SMEMBERS",
     "SISMEMBER",
     "SMISMEMBER",
+    "SMOVE",
     "SCARD",
     "SINTERCARD",
     "SPOP",
@@ -2698,6 +2958,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "SDIFFSTORE",
     "SSCAN",
     "ZADD",
+    "ZINCRBY",
     "ZSCORE",
     "ZMSCORE",
     "ZRANDMEMBER",
@@ -2769,6 +3030,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "DUMP",
     "RESTORE",
     "SCHEDULE",
+    "ROLE",
     "REPLICAOF",
     "SLAVEOF",
     "PSYNC",
@@ -2780,6 +3042,8 @@ const KNOWN_COMMANDS: &[&str] = &[
     "LATENCY",
     "MEMORY",
     "ACL",
+    "RUN",
+    "IDEMPOTENT",
 ];
 
 /// Commands that mutate the keyspace — used both by `EVAL_RO`/`EVALSHA_RO`
@@ -2851,6 +3115,7 @@ const WRITE_COMMAND_NAMES: &[&str] = &[
     "SINTERSTORE",
     "SDIFFSTORE",
     "SREM",
+    "SMOVE",
     "SPOP",
     "ZADD",
     "ZINCRBY",
@@ -2873,7 +3138,17 @@ const WRITE_COMMAND_NAMES: &[&str] = &[
     "XACK",
     "XCLAIM",
     "XAUTOCLAIM",
+    // `IDEMPOTENT` is deliberately absent: logging the raw request would
+    // re-execute the inner command on replicas — it logs its result
+    // marker itself (see `recovery::cmd_idempotent`), same pattern as the
+    // blocking commands below.
+    "RUN",
 ];
+
+/// `KNOWN_COMMANDS` as a `HashSet` — the MULTI-queueing check runs this
+/// on every queued command.
+static KNOWN_COMMANDS_SET: std::sync::LazyLock<HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| KNOWN_COMMANDS.iter().copied().collect());
 
 /// `WRITE_COMMAND_NAMES`, but as a `HashSet` for O(1) membership checks —
 /// `dispatch()` does this check on every single call, so a linear scan over
@@ -2892,7 +3167,7 @@ pub fn request_may_write(req: &Request) -> bool {
         || (name == "SORT" && req[1..].iter().any(|arg| arg.eq_ignore_ascii_case(b"STORE")))
         || matches!(
             name.as_str(),
-            "BLPOP" | "BRPOP" | "BLMPOP" | "BLMOVE" | "BZPOPMIN" | "BZPOPMAX" | "BZMPOP"
+            "BLPOP" | "BRPOP" | "BLMPOP" | "BLMOVE" | "BZPOPMIN" | "BZPOPMAX" | "BZMPOP" | "IDEMPOTENT"
         )
 }
 
@@ -3191,6 +3466,50 @@ mod tests {
     }
 
     #[test]
+    fn lindex_reads_by_index() {
+        let (ctx, mut st) = fresh();
+        run(&ctx, &mut st, &["RPUSH", "l", "a", "b", "c"]);
+        assert_eq!(run(&ctx, &mut st, &["LINDEX", "l", "0"]), Value::bulk(&b"a"[..]));
+        assert_eq!(run(&ctx, &mut st, &["LINDEX", "l", "-1"]), Value::bulk(&b"c"[..]));
+        assert_eq!(run(&ctx, &mut st, &["LINDEX", "l", "5"]), Value::NullBulk);
+        assert_eq!(run(&ctx, &mut st, &["LINDEX", "missing", "0"]), Value::NullBulk);
+        run(&ctx, &mut st, &["SET", "s", "hello"]);
+        assert_eq!(
+            run(&ctx, &mut st, &["LINDEX", "s", "0"]),
+            Value::error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        );
+    }
+
+    #[test]
+    fn smove_moves_members_between_sets() {
+        let (ctx, mut st) = fresh();
+        run(&ctx, &mut st, &["SADD", "src", "a", "b"]);
+        assert_eq!(run(&ctx, &mut st, &["SMOVE", "src", "dst", "a"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut st, &["SISMEMBER", "dst", "a"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut st, &["SISMEMBER", "src", "a"]), Value::Integer(0));
+        // Absent member is a no-op: 0 and `dst` unchanged.
+        assert_eq!(run(&ctx, &mut st, &["SMOVE", "src", "dst", "zzz"]), Value::Integer(0));
+        // Same-key move is just a membership check.
+        assert_eq!(run(&ctx, &mut st, &["SMOVE", "src", "src", "b"]), Value::Integer(1));
+        // A wrong-type destination restores the member to the source.
+        run(&ctx, &mut st, &["SET", "str", "v"]);
+        assert_eq!(
+            run(&ctx, &mut st, &["SMOVE", "src", "str", "b"]),
+            Value::error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        );
+        assert_eq!(run(&ctx, &mut st, &["SISMEMBER", "src", "b"]), Value::Integer(1));
+    }
+
+    #[test]
+    fn zincrby_queues_inside_multi() {
+        let (ctx, mut st) = fresh();
+        run(&ctx, &mut st, &["ZADD", "z", "1", "a"]);
+        run(&ctx, &mut st, &["MULTI"]);
+        assert_eq!(run(&ctx, &mut st, &["ZINCRBY", "z", "2", "a"]), Value::Simple("QUEUED".into()));
+        assert_eq!(run(&ctx, &mut st, &["EXEC"]), Value::Array(vec![Value::bulk(&b"3"[..])]));
+    }
+
+    #[test]
     fn scan_filters_by_pattern_and_type() {
         let (ctx, mut st) = fresh();
         run(&ctx, &mut st, &["SET", "key:1", "v"]);
@@ -3206,6 +3525,31 @@ mod tests {
             panic!("expected [cursor, items]")
         };
         assert_eq!(reply[1], Value::Array(vec![Value::bulk(&b"other"[..])]));
+    }
+
+    #[test]
+    fn scan_paginates_with_count() {
+        let (ctx, mut st) = fresh();
+        for i in 0..15 {
+            run(&ctx, &mut st, &["SET", &format!("k:{i:02}"), "v"]);
+        }
+        let Value::Array(reply) = run(&ctx, &mut st, &["SCAN", "0", "COUNT", "10"]) else {
+            panic!("expected [cursor, items]")
+        };
+        let Value::Array(items) = &reply[1] else { panic!("expected items array") };
+        assert_eq!(items.len(), 10);
+        let cursor = match &reply[0] {
+            Value::Bulk(b) => String::from_utf8_lossy(b).into_owned(),
+            other => panic!("expected bulk cursor, got {other:?}"),
+        };
+        assert_ne!(cursor, "0");
+
+        let Value::Array(reply) = run(&ctx, &mut st, &["SCAN", &cursor, "COUNT", "10"]) else {
+            panic!("expected [cursor, items]")
+        };
+        let Value::Array(items) = &reply[1] else { panic!("expected items array") };
+        assert_eq!(items.len(), 5);
+        assert_eq!(reply[0], Value::bulk(&b"0"[..]));
     }
 
     #[test]
@@ -3607,6 +3951,45 @@ mod tests {
         run(&ctx, &mut st, &["SET", "k", "v"]);
         assert_eq!(run(&ctx, &mut st, &["EXPIREAT", "k", "1"]), Value::Integer(1));
         assert_eq!(run(&ctx, &mut st, &["EXISTS", "k"]), Value::Integer(0));
+    }
+
+    #[test]
+    fn set_get_exat_and_expire_condition_flags() {
+        let (ctx, mut st) = fresh();
+        // SET ... GET hands back the old value (or nil).
+        assert_eq!(run(&ctx, &mut st, &["SET", "k", "v1", "GET"]), Value::NullBulk);
+        assert_eq!(run(&ctx, &mut st, &["SET", "k", "v2", "GET"]), Value::bulk(&b"v1"[..]));
+        // ... and aborts with WRONGTYPE on a non-string key.
+        run(&ctx, &mut st, &["RPUSH", "l", "x"]);
+        assert_eq!(
+            run(&ctx, &mut st, &["SET", "l", "v", "GET"]),
+            Value::error("WRONGTYPE Operation against a key holding the wrong kind of value")
+        );
+        // SET ... EXAT sets an absolute expiry.
+        let future = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 60).to_string();
+        assert_eq!(run(&ctx, &mut st, &["SET", "t", "v", "EXAT", &future]), Value::ok());
+        assert!(matches!(run(&ctx, &mut st, &["TTL", "t"]), Value::Integer(n) if n > 0));
+
+        // EXPIRE NX/XX/GT/LT.
+        run(&ctx, &mut st, &["SET", "e", "v"]);
+        assert_eq!(run(&ctx, &mut st, &["EXPIRE", "e", "100", "XX"]), Value::Integer(0));
+        assert_eq!(run(&ctx, &mut st, &["EXPIRE", "e", "100", "NX"]), Value::Integer(1));
+        assert_eq!(run(&ctx, &mut st, &["EXPIRE", "e", "50", "NX"]), Value::Integer(0));
+        assert_eq!(run(&ctx, &mut st, &["EXPIRE", "e", "50", "GT"]), Value::Integer(0));
+        assert_eq!(run(&ctx, &mut st, &["EXPIRE", "e", "50", "LT"]), Value::Integer(1));
+        assert_eq!(
+            run(&ctx, &mut st, &["EXPIRE", "e", "10", "NX", "XX"]),
+            Value::error("ERR NX and XX, GT or LT options are mutually exclusive")
+        );
+    }
+
+    #[test]
+    fn role_reports_master_shape() {
+        let (ctx, mut st) = fresh();
+        assert_eq!(
+            run(&ctx, &mut st, &["ROLE"]),
+            Value::Array(vec![Value::bulk(&b"master"[..]), Value::Integer(0), Value::Array(vec![])])
+        );
     }
 
     #[test]
@@ -4249,17 +4632,63 @@ mod tests {
 
         // First push should be a SELECT for this replica's first command...
         let first = rx.try_recv().expect("expected a SELECT push");
-        assert_eq!(
-            first.value.as_ref(),
-            &Value::Array(vec![Value::bulk(&b"SELECT"[..]), Value::bulk(&b"0"[..])])
-        );
+        assert_eq!(first.data.as_ref(), b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
         // ...then the replicated command itself.
         let second = rx.try_recv().expect("expected the replicated SET");
-        assert_eq!(
-            second.value.as_ref(),
-            &Value::Array(vec![Value::bulk(&b"SET"[..]), Value::bulk(&b"k"[..]), Value::bulk(&b"v"[..])])
-        );
+        assert_eq!(second.data.as_ref(), b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
         assert_eq!(ctx.master_repl_offset(), 1);
+    }
+
+    #[test]
+    fn psync_with_covered_offset_continues_without_snapshot() {
+        let (ctx, mut st) = fresh();
+        let replid = ctx.replid.clone();
+        match dispatch(&ctx, &mut st, req(&["PSYNC", "?", "-1"])) {
+            Outcome::Multi(v) => assert!(matches!(&v[0], Value::Simple(s) if s.starts_with("FULLRESYNC"))),
+            _ => panic!("expected FULLRESYNC"),
+        }
+
+        run(&ctx, &mut st, &["SET", "a", "1"]);
+        run(&ctx, &mut st, &["SET", "b", "2"]);
+
+        // Reconnect with the same replid and an offset the backlog still
+        // covers → CONTINUE + just the missed commands, no snapshot.
+        let (id2, _rx) = ctx.register_client();
+        let mut st2 = ClientState::with_id(id2, false);
+        match dispatch(&ctx, &mut st2, req(&["PSYNC", replid.as_str(), "0"])) {
+            Outcome::Reply(Value::Simple(s)) => assert_eq!(s, format!("CONTINUE {replid}")),
+            _ => panic!("expected CONTINUE"),
+        }
+        let mut rx = ctx.take_replica_receiver(id2).unwrap();
+        assert_eq!(rx.try_recv().unwrap().data.as_ref(), b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
+        assert_eq!(rx.try_recv().unwrap().data.as_ref(), b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        assert_eq!(rx.try_recv().unwrap().data.as_ref(), b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(ctx.partial_resyncs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn psync_with_uncovered_offset_or_wrong_replid_does_full_resync() {
+        let (mut ctx, mut st) = fresh();
+        // 1-byte backlog: every entry evicts immediately.
+        ctx.partial_resync_backlog = 1;
+        dispatch(&ctx, &mut st, req(&["PSYNC", "?", "-1"]));
+        run(&ctx, &mut st, &["SET", "a", "1"]);
+
+        let (id2, _rx) = ctx.register_client();
+        let mut st2 = ClientState::with_id(id2, false);
+        let replid = ctx.replid.clone();
+        match dispatch(&ctx, &mut st2, req(&["PSYNC", replid.as_str(), "0"])) {
+            Outcome::Multi(v) => assert!(matches!(&v[0], Value::Simple(s) if s.starts_with("FULLRESYNC"))),
+            _ => panic!("evicted offset should FULLRESYNC"),
+        }
+
+        let (id3, _rx) = ctx.register_client();
+        let mut st3 = ClientState::with_id(id3, false);
+        match dispatch(&ctx, &mut st3, req(&["PSYNC", "bogus", "0"])) {
+            Outcome::Multi(v) => assert!(matches!(&v[0], Value::Simple(s) if s.starts_with("FULLRESYNC"))),
+            _ => panic!("wrong replid should FULLRESYNC"),
+        }
     }
 
     #[test]
@@ -4344,8 +4773,8 @@ mod tests {
 
     #[test]
     fn slowlog_logs_commands_over_threshold_and_can_be_reset() {
-        let mut ctx = ServerContext::new(16, None);
-        ctx.slowlog_threshold_us = 0; // log everything, for a deterministic test
+        let ctx = ServerContext::new(16, None);
+        ctx.slowlog_threshold_us.store(0, Ordering::Relaxed); // log everything, for a deterministic test
         let (id, _rx) = ctx.register_client();
         let mut st = ClientState::with_id(id, false);
 
@@ -4490,8 +4919,8 @@ mod tests {
 
     #[test]
     fn min_replicas_to_write_blocks_writes_without_healthy_replicas() {
-        let (mut ctx, mut st) = fresh();
-        ctx.min_replicas_to_write = 1;
+        let (ctx, mut st) = fresh();
+        ctx.min_replicas_to_write.store(1, Ordering::Relaxed);
         // No replicas: writes refused, reads fine.
         assert!(matches!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::Error(_)));
         assert_eq!(run(&ctx, &mut st, &["GET", "k"]), Value::NullBulk);
@@ -4508,8 +4937,8 @@ mod tests {
 
     #[test]
     fn min_replicas_to_write_reblocks_after_replica_disconnect() {
-        let (mut ctx, mut st) = fresh();
-        ctx.min_replicas_to_write = 1;
+        let (ctx, mut st) = fresh();
+        ctx.min_replicas_to_write.store(1, Ordering::Relaxed);
         let (replica_id, _rx) = ctx.register_client();
         ctx.register_replica(replica_id);
         assert_eq!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::ok());
@@ -4529,7 +4958,7 @@ mod tests {
         let mut st = ClientState::with_id(id, false);
 
         assert_eq!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::ok());
-        ctx.aof.as_ref().unwrap().force_io_failure();
+        ctx.aof.read().unwrap().as_ref().unwrap().force_io_failure();
         // Once the log can't persist, writes are refused — reads still work.
         assert!(
             matches!(run(&ctx, &mut st, &["SET", "k", "v2"]), Value::Error(e) if e.starts_with("MISCONF"))
@@ -4540,7 +4969,7 @@ mod tests {
 
     #[test]
     fn shutdown_modifier_parsing() {
-        let (mut ctx, mut st) = fresh();
+        let (ctx, mut st) = fresh();
         let save_flag = |outcome| match outcome {
             Outcome::Shutdown { save } => save,
             _ => panic!("expected Shutdown"),
@@ -4548,7 +4977,7 @@ mod tests {
         // No persistence configured: bare SHUTDOWN saves nothing.
         assert!(!save_flag(dispatch(&ctx, &mut st, req(&["SHUTDOWN"]))));
         // RDB configured, no AOF → bare SHUTDOWN takes a final snapshot.
-        ctx.rdb_path = Some(std::path::PathBuf::from("/tmp/dump.rdb"));
+        *ctx.rdb_dir.write().unwrap() = Some(std::path::PathBuf::from("/tmp"));
         assert!(save_flag(dispatch(&ctx, &mut st, req(&["SHUTDOWN"]))));
         assert!(!save_flag(dispatch(&ctx, &mut st, req(&["SHUTDOWN", "NOSAVE"]))));
         assert!(save_flag(dispatch(&ctx, &mut st, req(&["SHUTDOWN", "SAVE"]))));
@@ -5110,6 +5539,55 @@ mod tests {
         }
         drop(ctx);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_set_runtime_params_apply_live() {
+        let (ctx, mut st) = fresh();
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "slowlog-log-slower-than", "-1"]), Value::ok());
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "notify-keyspace-events", "KEA"]), Value::ok());
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "dir", "/tmp"]), Value::ok());
+
+        // `min-replicas-to-write` takes effect immediately.
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "min-replicas-to-write", "1"]), Value::ok());
+        assert!(matches!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::Error(_)));
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "min-replicas-to-write", "0"]), Value::ok());
+        assert_eq!(run(&ctx, &mut st, &["SET", "k", "v"]), Value::ok());
+
+        // `requirepass` updates the `default` ACL user, so a brand-new
+        // connection must AUTH while the existing one stays authenticated.
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "requirepass", "pw"]), Value::ok());
+        let (id2, _rx2) = ctx.register_client();
+        let mut st2 = ClientState::with_id(id2, true);
+        assert!(matches!(run(&ctx, &mut st2, &["SET", "k2", "v"]), Value::Error(_)));
+        assert_eq!(run(&ctx, &mut st2, &["AUTH", "pw"]), Value::ok());
+        assert_eq!(run(&ctx, &mut st2, &["SET", "k2", "v"]), Value::ok());
+        assert_eq!(run(&ctx, &mut st, &["GET", "k2"]), Value::bulk(&b"v"[..]));
+    }
+
+    #[test]
+    fn config_set_history_enabled_toggles_live() {
+        let dir = std::env::temp_dir().join(format!("reflexdb-cfg-hist-toggle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = ServerContext::new(16, None).with_history_config(dir.clone(), 50);
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, false);
+
+        assert!(matches!(run(&ctx, &mut st, &["HISTORY", "k"]), Value::Error(_)));
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "history-enabled", "yes"]), Value::ok());
+        assert_eq!(run(&ctx, &mut st, &["SET", "k", "v1"]), Value::ok());
+        ctx.history_flush();
+        assert!(matches!(run(&ctx, &mut st, &["HISTORY", "k"]), Value::Array(ref a) if !a.is_empty()));
+
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "history-enabled", "no"]), Value::ok());
+        assert!(matches!(run(&ctx, &mut st, &["HISTORY", "k"]), Value::Error(_)));
+        // Re-enabling reopens the same on-disk store — versions survive.
+        assert_eq!(run(&ctx, &mut st, &["CONFIG", "SET", "history-enabled", "yes"]), Value::ok());
+        ctx.history_flush();
+        assert!(matches!(run(&ctx, &mut st, &["HISTORY", "k"]), Value::Array(ref a) if !a.is_empty()));
+
+        drop(ctx);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

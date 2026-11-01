@@ -12,8 +12,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# This is an application, not a set of libraries meant for crates.io -
-# license hasn't been decided yet either, so there's nothing to publish.
+license = "BUSL-1.1"
+# This is an application, not a set of libraries meant for crates.io.
 publish = false
 
 [workspace.dependencies]

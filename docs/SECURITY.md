@@ -9,9 +9,11 @@ Read this before deploying it anywhere traffic you don't control can reach.
   listener (`tls-port` + `tls-cert-file`/`tls-key-file`; `port 0` disables plaintext for
   TLS-only mode). RFX is auto-detected by a leading `!` byte on the same port — it is a wire
   encoding, not an authentication path, and gets the same ACL checks.
-- **Replication link** — outbound replica connection to a primary, **plaintext only**
-  (`tls-replication` is not implemented). A replica trusts everything the primary sends:
-  run replication only on trusted networks.
+- **Replication link** — outbound replica connection to a primary, plaintext by default;
+  `tls-replication yes` wraps it in TLS verified against `tls-ca-cert-file` (the replica's
+  `tls-cert-file`/`tls-key-file` double as its client certificate when the primary runs
+  `tls-auth-clients yes`). A replica trusts everything the primary sends: keep the link
+  protected.
 - **Persistence files** — AOF/RDB/history/tiered files under `dir`/`tiered-dir`. Anyone with
   filesystem access reads the dataset; nothing at rest is encrypted.
 - **Lua** — `EVAL`/`EVALSHA` run in an `mlua` Lua 5.1 sandbox with `os`/`io` removed and
@@ -43,8 +45,8 @@ Read this before deploying it anywhere traffic you don't control can reach.
 - **Passwords are unsalted SHA-256** — Redis-compatible but weak against offline attacks if
   an attacker reads process memory or `ACL LIST`/`GETUSER` output. Treat hash disclosure as
   password disclosure.
-- **ACLs are in-memory only** — no `aclfile`, `ACL LOAD`/`SAVE`, or `ACL LOG`; users vanish
-  on restart and there is no audit trail of denied commands.
+- **ACLs persist only via `aclfile`** — without the directive users are in-memory and vanish
+  on restart; `ACL SAVE`/`LOAD` exist but there is no `ACL LOG` audit trail of denied commands.
 - **Plaintext listener is on by default** — TLS is additive (`tls-port`); set `port 0`
   explicitly for TLS-only.
 - **No channel-pattern ACLs** — pub/sub channel restrictions (`&pattern`) are rejected, not

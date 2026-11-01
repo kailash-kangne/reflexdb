@@ -24,13 +24,15 @@
 //! **fire-and-forget**, an explicit asynchronous durability trade-off: a
 //! command can reply to the client before its AOF bytes have actually hit
 //! the kernel, so a process crash (not just a power loss) in that narrow
-//! window can lose the last few commands. That's an explicit choice to
-//! chase speed over the old "block until written" guarantee. What we get in exchange: `append()` is now
+//! window can lose the last few commands. `appendfsync always` is the one
+//! exception: it pays for its guarantee by waiting on `flush_and_fsync`
+//! before the reply goes out — the other two policies accept the window.
+//! What we get in exchange: `append()` is now
 //! just an encode + channel push, no lock held across a syscall and no
 //! waiting on the writer thread at all — the full cost of `write`/`fsync`
 //! moves entirely off the request path. The writer thread still drains
-//! everything already queued and coalesces it into one `write` (and, for
-//! `appendfsync always`, one shared `fsync`) per batch — the same "group
+//! everything already queued and coalesces it into one `write` (and one
+//! shared `fsync`) per batch — the same "group
 //! commit" trick Postgres uses for `synchronous_commit` — so throughput
 //! under concurrent load is bounded by how fast the writer thread loops,
 //! not by how many connections are writing at once.
@@ -39,12 +41,12 @@
 //! well, since it's now the only thing touching the file — that drops the
 //! second lock the old code needed entirely.
 //!
-//! One caller still needs a real (not fire-and-forget) answer:
+//! Two callers still need a real (not fire-and-forget) answer:
 //! `WAITAOF numlocal ...` exists specifically to let a client confirm "yes,
-//! my writes are actually durable now" — reporting that honestly requires
-//! an actual round trip to the writer thread, not just checking whether
-//! AOF is turned on. `AofWriter::flush_and_fsync` is that one blocking
-//! escape hatch, used nowhere else.
+//! my writes are actually durable now", and `appendfsync always` waits on
+//! the same `flush_and_fsync` round trip so an acknowledged write is
+//! really on disk — reporting either honestly requires an actual round
+//! trip to the writer thread, not just checking whether AOF is turned on.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -73,8 +75,8 @@ const MAX_COMPRESSED_BATCH: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fsync {
     /// fsync after every batch the writer thread flushes — slowest,
-    /// safest of the three (though, per the module docs, "safest" here
-    /// still means "fire-and-forget on the request path").
+    /// safest of the three: `dispatch` waits on `flush_and_fsync` before
+    /// replying, so an acknowledged write really is on disk.
     Always,
     /// fsync roughly once a second from a background tick (the caller is
     /// responsible for calling `AofWriter::fsync` on that cadence).
@@ -131,6 +133,10 @@ struct RewriteState {
 
 pub struct AofWriter {
     tx: Mutex<SyncSender<Job>>,
+    /// The `appendfsync` policy this writer was opened with — `dispatch`
+    /// reads it via `fsync_policy()` to know whether an acknowledged write
+    /// must wait on `flush_and_fsync` (`Always`) or not.
+    fsync: Fsync,
     // Keeps the writer thread alive for the program's lifetime.
     _worker: thread::JoinHandle<()>,
     /// Set when the writer thread's last `write`/`fsync` failed, cleared
@@ -162,7 +168,12 @@ impl AofWriter {
             .name("reflexdb-aof-writer".into())
             .spawn(move || writer_loop(file, rx, fsync, compressed, thread_flag))
             .map_err(|e| io::Error::other(format!("failed to spawn AOF writer thread: {e}")))?;
-        Ok(Self { tx: Mutex::new(tx), _worker: worker, io_failed })
+        Ok(Self { tx: Mutex::new(tx), fsync, _worker: worker, io_failed })
+    }
+
+    /// The `appendfsync` policy this writer was opened with.
+    pub fn fsync_policy(&self) -> Fsync {
+        self.fsync
     }
 
     /// Queue one command for the log, to be preceded by a `SELECT` if the

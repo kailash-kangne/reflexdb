@@ -8,12 +8,15 @@ semantics.
 
 ## Generic (keyspace)
 
-`COPY`, `DEL`, `DUMP`, `EXISTS`, `EXPIRE`, `EXPIREAT`, `EXPIRETIME`, `KEYS`, `MOVE`, `OBJECT`
-(`ENCODING`, `FREQ`, `IDLETIME`, `REFCOUNT`), `PERSIST`, `PEXPIRE`, `PEXPIREAT`, `PEXPIRETIME`,
-`PTTL`, `RANDOMKEY`, `RENAME`, `RENAMENX`, `RESTORE`, `SCAN`, `SORT`, `SORT_RO`, `SUBSTR`
-(alias of `GETRANGE`), `TOUCH`, `TTL`, `TYPE`, `UNLINK`, `WAIT`, `WAITAOF`, `DEBUG` (subset)
+`COPY`, `DEL`, `DUMP`, `EXISTS`, `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT`
+(`NX|XX|GT|LT`, plus reflexdb `SLIDING`), `EXPIRETIME`, `KEYS`, `MOVE`, `OBJECT ENCODING`,
+`PERSIST`, `PEXPIRETIME`,
+`PTTL`, `RANDOMKEY`, `RENAME`, `RENAMENX`, `RESTORE`, `SCAN`, `SORT`, `SORT_RO`,
+`TOUCH`, `TTL`, `TYPE`, `UNLINK`, `WAIT`, `WAITAOF`
 
 `EVICT`, `MIGRATE`, `LCS`, `NO-TOUCH` — **[planned]**, not implemented.
+
+`SUBSTR`, `DEBUG` — **[cut]** (`SUBSTR` is a deprecated alias of `GETRANGE`).
 
 ## String
 
@@ -23,9 +26,11 @@ semantics.
 
 ## List
 
-`BLMOVE`, `BLMPOP`, `BLPOP`, `BRPOP`, `BRPOPLPUSH`, `LINDEX`, `LINSERT`, `LLEN`, `LMOVE`,
+`BLMOVE`, `BLMPOP`, `BLPOP`, `BRPOP`, `LINDEX`, `LINSERT`, `LLEN`, `LMOVE`,
 `LMPOP`, `LPOP [count]`, `LPOS`, `LPUSH`, `LPUSHX`, `LRANGE`, `LREM`, `LSET`, `LTRIM`,
 `RPOP [count]`, `RPOPLPUSH`, `RPUSH`, `RPUSHX`
+
+`BRPOPLPUSH` — **[cut]** (deprecated since Redis 6.2; use `BLMOVE src dst RIGHT LEFT`).
 
 ## Hash
 
@@ -86,17 +91,21 @@ Not being built.
 ## Server
 
 `ACL` (see [FEATURES.md](FEATURES.md#security)), `BGREWRITEAOF`, `BGSAVE`, `COMMAND` (`COUNT`,
-`DOCS`, `GETKEYS`, `GETKEYSANDFLAGS`, `INFO`, `LIST`), `CONFIG` (`GET`, `REWRITE`, `RESETSTAT`,
-`SET`), `DBSIZE`, `FLUSHALL`, `FLUSHDB`, `INFO`, `LASTSAVE`, `LATENCY` (`DOCTOR`,
+`DOCS`, `INFO`), `CONFIG` (`GET`, `SET` — runtime-settable: `maxmemory`,
+`maxmemory-policy`, `appendonly`, `appendfsync`, `history-enabled`,
+`slowlog-log-slower-than`, `slowlog-max-len`, `notify-keyspace-events`,
+`min-replicas-to-write`, `requirepass`, `aclfile`, `dir`, `dbfilename`),
+`DBSIZE`, `FLUSHALL`, `FLUSHDB`, `INFO`, `LASTSAVE`, `LATENCY` (`DOCTOR`,
 `GRAPH`, `HISTOGRAM`, `HISTORY`, `LATEST`, `RESET`), `MEMORY` (`DOCTOR`,
 `MALLOC-STATS`, `PURGE`, `STATS`, `USAGE`), `SAVE`, `SHUTDOWN` (`[NOSAVE|SAVE]` —
 flushes the AOF, writes a final RDB when AOF is off unless `NOSAVE`, then exits),
 `SLOWLOG` (`GET`, `HELP`, `LEN`, `RESET`), `TIME`
 
-`FAILOVER`, `LOLWUT`, `MONITOR`, `ROLE`, `SWAPDB` — **[planned]** (listed in Redis'
+`FAILOVER`, `LOLWUT`, `MONITOR`, `SWAPDB` — **[planned]** (listed in Redis'
 server group; not implemented yet — verified 2026-11-01, they return `ERR unknown command`).
 
-`MODULE` — parsed but no-op (extensions are compiled-in Rust crates, not `.so` modules).
+`MODULE` — **[cut]** (extensions are compiled-in Rust crates, not `.so` modules; returns
+`ERR unknown command`).
 
 ## Transactions
 
@@ -104,17 +113,16 @@ server group; not implemented yet — verified 2026-11-01, they return `ERR unkn
 
 ## Scripting
 
-`EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `SCRIPT` (`DEBUG`, `EXISTS`, `FLUSH`, `KILL`,
-`LOAD`, `SHOW`)
+`EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `SCRIPT` (`EXISTS`, `FLUSH`, `LOAD`)
 
 `FCALL`, `FCALL_RO`, `FUNCTION *` — **[planned]**.
 
 ## HA / Replication
 
-`PSYNC`, `REPLICAOF` (`SLAVEOF` alias), `REPLCONF`, `WAIT`, `WAITAOF`
+`PSYNC`, `REPLICAOF` (`SLAVEOF` alias), `REPLCONF`, `ROLE`, `WAIT`, `WAITAOF`
 
-`FAILOVER`, `ROLE`, `SYNC` — **[planned]** (`PSYNC` covers the replica handshake; plain `SYNC`,
-`ROLE`, and `FAILOVER` return `ERR unknown command` — verified 2026-11-01).
+`FAILOVER`, `SYNC` — **[planned]** (`PSYNC` covers the replica handshake; plain `SYNC` and
+`FAILOVER` return `ERR unknown command` — verified 2026-11-01).
 
 `ASKING`/`READONLY`/`READWRITE`/`RESTORE-ASKING` — **[cut]** (cluster-mode).
 
@@ -124,16 +132,15 @@ Not being built.
 
 ## Sentinel mode
 
-Active only under `--sentinel` mode (`reflexdb-sentinel` binary): `CKQUORUM`, `CONFIG`,
-`DEBUG`, `FAILOVER`, `FLUSHCONFIG`, `GET-MASTER-ADDR-BY-NAME`, `GET-PRIMARY-ADDR-BY-NAME`,
-`INFO-CACHE`, `IS-MASTER-DOWN-BY-ADDR`, `IS-PRIMARY-DOWN-BY-ADDR`, `MASTER(S)`, `MONITOR`,
-`MYID`, `PENDING-SCRIPTS`, `PRIMAR(Y/IES)`, `REMOVE`, `REPLICAS`, `RESET`, `SENTINELS`, `SET`,
-`SIMULATE-FAILURE`, `SLAVES`
+Active only under `--sentinel` mode (`reflexdb-sentinel` binary): `CKQUORUM`,
+`GET-MASTER-ADDR-BY-NAME`, `IS-MASTER-DOWN-BY-ADDR`, `MASTER`, `MASTERS`, `REPLICAS`
 
-## Debug-only (gated behind `enable-debug-command yes`)
+`SENTINEL CONFIG`/`DEBUG`/`FAILOVER`/`MONITOR`/`REMOVE`/`RESET`/`SET` and the
+`SLAVES`/`PRIMARIES`-style aliases — **[cut]**, not implemented.
 
-`DEBUG SET-ACTIVE-EXPIRE`, `QUICKLIST-PACKED-THRESHOLD`, `STRINGMATCH-LEN`, `SLEEP`, `OBJECT`,
-`DIGEST`, `DIGEST-VALUE`, `RELOAD`, `CHANGE-REPL-ID`, `JMAP`
+## Debug commands — **[cut]**
+
+`DEBUG` returns `ERR unknown command` (no `enable-debug-command` config exists).
 
 ## reflexdb-native commands
 
@@ -144,5 +151,7 @@ Active only under `--sentinel` mode (`reflexdb-sentinel` binary): `CKQUORUM`, `C
 | `GETAT` | `3` | point-in-time read (needs `history-enabled yes`) |
 | `HISTORY` | `-2` | per-key version log (needs `history-enabled yes`) |
 | `SCHEDULE` | `-2` | delayed command execution |
+| `RUN` | `-2` | run registry + checkpoints — `BEGIN`/`STEP`/`CHECKPOINT`/`RESTORE`/`END`/`STATUS`/`LIST`/`AUDIT` |
+| `IDEMPOTENT` | `-4` | `IDEMPOTENT <key> <ttl_ms> <cmd> <args...>` — execute once, replay stored reply on retry |
 
 `JSON.*`/`BF.*` extension families are cut entirely — see [ROADMAP.md](ROADMAP.md).

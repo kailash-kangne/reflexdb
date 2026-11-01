@@ -51,6 +51,27 @@ impl RespClient {
         self.read_reply().await
     }
 
+    /// Pipelines several commands: one write burst, then reads each reply in
+    /// order. The bench UI uses this for per-key TYPE/PTTL lookups — hundreds
+    /// of sequential `call`s would take a round-trip each.
+    pub async fn call_many(&mut self, cmds: &[Vec<&str>]) -> io::Result<Vec<Reply>> {
+        let mut out = Vec::new();
+        for args in cmds {
+            out.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                out.extend_from_slice(a.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        self.writer.write_all(&out).await?;
+        let mut replies = Vec::with_capacity(cmds.len());
+        for _ in cmds {
+            replies.push(self.read_reply().await?);
+        }
+        Ok(replies)
+    }
+
     /// Reads one more reply frame off the wire without sending anything —
     /// for commands like `SUBSCRIBE`/`PSUBSCRIBE` (one confirmation frame
     /// per channel/pattern argument, on top of `call`'s first read) and

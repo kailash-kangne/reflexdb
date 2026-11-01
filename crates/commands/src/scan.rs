@@ -1,10 +1,11 @@
 //! Shared option-parsing and reply-shaping for the `SCAN`-family commands
 //! (`HSCAN`/`SSCAN`/`ZSCAN`). Each one replies `[cursor, [elements...]]`.
 //!
-//! This is a simplified, single-pass "scan": since we don't yet maintain a
-//! real incremental cursor over a resizing hash table, every call walks the
-//! whole collection and always returns cursor `"0"` (i.e. "done"). `COUNT`
-//! is parsed for client compatibility but doesn't limit the batch size yet.
+//! `SCAN` paginates for real: the cursor is an index into the sorted list of
+//! matching keys (sorted because key iteration order isn't stable across
+//! calls), so `COUNT` bounds each page. `HSCAN`/`SSCAN`/`ZSCAN` still walk
+//! their whole collection and always return `"0"` — `COUNT` is parsed for
+//! client compatibility but doesn't limit them yet.
 
 use bytes::Bytes;
 
@@ -64,16 +65,31 @@ pub fn matches_type(opts: &ScanOptions, type_name: &str) -> bool {
     }
 }
 
+impl ScanOptions {
+    pub fn count(&self) -> Option<usize> {
+        self.count
+    }
+
+    pub fn has_type_filter(&self) -> bool {
+        self.type_filter.is_some()
+    }
+}
+
 pub struct ScanReply {
+    cursor: u64,
     items: Vec<Value>,
 }
 
 impl ScanReply {
     pub fn done(items: Vec<Value>) -> Self {
-        Self { items }
+        Self::page(0, items)
+    }
+
+    pub fn page(next_cursor: u64, items: Vec<Value>) -> Self {
+        Self { cursor: next_cursor, items }
     }
 
     pub fn into_value(self) -> Value {
-        Value::Array(vec![Value::bulk(&b"0"[..]), Value::Array(self.items)])
+        Value::Array(vec![Value::bulk(self.cursor.to_string()), Value::Array(self.items)])
     }
 }

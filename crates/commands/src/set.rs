@@ -64,6 +64,68 @@ pub fn cmd_srem(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Out
     reply(Value::Integer(removed as i64))
 }
 
+/// `SMOVE source destination member` — move `member` from the source set
+/// to the destination set: 1 on move, 0 when the member isn't in `source`
+/// (a no-op; the destination is never created). A same-key move is just a
+/// membership check. Follows `lmove`'s restore-on-wrongtype pattern.
+pub fn cmd_smove(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
+    let [source, destination, member] = args else { return wrong_args("smove") };
+    let db = ctx.store.db(state.db_index).expect("valid db index");
+
+    if source == destination {
+        return match db.with_value(source, |v| match v {
+            KVal::Set(s) => Ok(s.contains(member.as_ref())),
+            _ => Err(()),
+        }) {
+            None | Some(Ok(false)) => reply(Value::Integer(0)),
+            Some(Ok(true)) => reply(Value::Integer(1)),
+            Some(Err(())) => wrong_type(),
+        };
+    }
+
+    match db.with_value_mut(source, |v| match v {
+        KVal::Set(s) => Ok(s.swap_remove(member.as_ref())),
+        _ => Err(()),
+    }) {
+        None | Some(Ok(false)) => return reply(Value::Integer(0)),
+        Some(Err(())) => return wrong_type(),
+        Some(Ok(true)) => {}
+    }
+    db.remove_if_empty(source);
+
+    let inserted = db.with_entry_mut(
+        destination.clone(),
+        || KVal::Set(Set::new()),
+        |v| match v {
+            KVal::Set(s) => {
+                s.insert(member.clone());
+                Ok(())
+            }
+            _ => Err(()),
+        },
+    );
+    if inserted.is_err() {
+        // Destination holds a non-set value: put the member back where it
+        // came from instead of silently dropping it.
+        db.with_entry_mut(
+            source.clone(),
+            || KVal::Set(Set::new()),
+            |v| {
+                if let KVal::Set(s) = v {
+                    s.insert(member.clone());
+                }
+            },
+        );
+        return wrong_type();
+    }
+
+    on_key_changed(ctx, state, state.db_index, source.clone(), None);
+    on_key_changed(ctx, state, state.db_index, destination.clone(), None);
+    notify_keyspace_event(ctx, state.db_index, 's', "srem", source);
+    notify_keyspace_event(ctx, state.db_index, 's', "sadd", destination);
+    reply(Value::Integer(1))
+}
+
 pub fn cmd_smembers(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {
     let [key] = args else { return wrong_args("smembers") };
     let db = ctx.store.db(state.db_index).expect("valid db index");

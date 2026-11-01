@@ -111,6 +111,11 @@ pub fn cmd_info(ctx: &ServerContext, _args: &[Bytes]) -> Outcome {
     out.push_str(&format!("connected_slaves:{}\r\n", ctx.connected_replicas()));
     out.push_str(&format!("master_replid:{}\r\n", ctx.replid));
     out.push_str(&format!("master_repl_offset:{}\r\n", ctx.master_repl_offset()));
+    out.push_str(&format!("sync_full:{}\r\n", ctx.full_resyncs.load(std::sync::atomic::Ordering::Relaxed)));
+    out.push_str(&format!(
+        "sync_partial_ok:{}\r\n",
+        ctx.partial_resyncs.load(std::sync::atomic::Ordering::Relaxed)
+    ));
     out.push_str("\r\n");
 
     out.push_str("# Keyspace\r\n");
