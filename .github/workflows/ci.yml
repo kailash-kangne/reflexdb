@@ -31,8 +31,14 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Windows is experimental — its failure doesn't fail the workflow.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -64,3 +70,47 @@ jobs:
           workspaces: fuzz -> target
       - run: cargo install cargo-fuzz --locked
       - run: cargo fuzz build --fuzz-dir fuzz
+
+  # Short server bench per OS — CI runners are shared VMs, so absolute
+  # numbers are noisy; use them to compare platforms, not to quote.
+  bench:
+    name: bench (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # Windows is experimental — its failure doesn't fail the workflow.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p reflexdb-server
+      - name: Start server
+        shell: bash
+        run: |
+          DIR=$(mktemp -d)
+          ./target/release/reflexdb-server --port 7777 --dir "$DIR" &
+          for i in $(seq 1 100); do
+            python3 -c "import socket; s=socket.create_connection(('127.0.0.1',7777),1); s.sendall(b'*1\r\n\$4\r\nPING\r\n'); assert b'PONG' in s.recv(64); s.close()" 2>/dev/null && exit 0
+            sleep 0.2
+          done
+          echo "server did not start"; exit 1
+      - name: Bench
+        shell: bash
+        run: python3 benchmarks/run.py --port 7777 --runs 2 --seconds 3 --live-subscribers 200 --output bench-results.jsonl
+      - name: Feature smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y redis-tools
+          else
+            brew install redis
+          fi
+          HOST=127.0.0.1 PORT=7777 ./benchmarks/smoke.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reflexdb-bench-${{ matrix.os }}
+          path: bench-results.jsonl
