@@ -1,28 +1,21 @@
 //! In-memory keyspace: sharded-by-DB storage with TTL semantics.
 
-use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use indexmap::IndexSet;
 use papaya::HashMap as PapayaMap;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
+mod collections;
 mod stream;
 mod zset;
+/// Packed-under-128-elements representations — see `collections`.
+pub use collections::{Hash, List, Set};
 pub use stream::{parse_for_add, ConsumerGroup, IdSpec, PendingEntry, Stream, StreamId, XaddError};
 pub use zset::ZSet;
-
-pub type List = VecDeque<Bytes>;
-pub type Hash = HashMap<Bytes, Bytes>;
-/// Insertion-order-preserving set, not a plain `HashSet`: `SPOP` needs O(1)
-/// "pick a random element and remove it" (pick a random index, then
-/// `swap_remove_index`), which a `HashSet` can't do without an O(n) scan —
-/// see `commands::set::cmd_spop`.
-pub type Set = IndexSet<Bytes>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -109,9 +102,9 @@ impl Value {
         match self {
             Value::String(s) => s.len(),
             Value::Int(_) => 8,
-            Value::List(l) => l.iter().map(|b| b.len() + 16).sum(),
-            Value::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 32).sum(),
-            Value::Set(s) => s.iter().map(|b| b.len() + 16).sum(),
+            Value::List(l) => l.approx_bytes(),
+            Value::Hash(h) => h.approx_bytes(),
+            Value::Set(s) => s.approx_bytes(),
             Value::ZSet(z) => z.approx_bytes(),
             Value::Stream(s) => s.approx_bytes(),
         }
@@ -265,9 +258,12 @@ pub trait TieringHandler: Send + Sync {
     /// [`TIERED_FULL`] when a configured capacity is exhausted — the key
     /// must stay in RAM in that case; no data is lost.
     fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String>;
-    /// Fetch (and remove from the tier — promotion is a one-way move back
-    /// into RAM, not a cache copy) a previously evicted key.
-    fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)>;
+    /// Read a previously evicted key WITHOUT removing it: the tier entry
+    /// is the durable record and stays put until a delete, overwrite or
+    /// flush drops it — RAM is just a read cache. Removing it here would
+    /// leave the key volatile-only until the next eviction re-spilled it,
+    /// a crash window that loses an acknowledged key entirely.
+    fn fetch(&self, key: &[u8]) -> Option<(Value, Option<Duration>)>;
     /// Whether the tier holds this key, without promoting it — used by
     /// `EXISTS` so it doesn't have to pull the whole value off disk just to
     /// answer a boolean question.
@@ -315,7 +311,7 @@ pub trait TieringHandler: Send + Sync {
     }
     /// Periodic GC: drop expired or undecodable entries still sitting in
     /// the tier — the batch partner to the lazy checks in `contains`/
-    /// `promote`. Returns how many entries were dropped.
+    /// `fetch`. Returns how many entries were dropped.
     fn sweep_expired(&self) -> usize {
         0
     }
@@ -337,14 +333,91 @@ pub trait TieringHandler: Send + Sync {
 /// implementations that can't measure leave them zeroed.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TieredStats {
-    /// Entries removed since open (deletes, promotes, GC sweeps,
-    /// evict-oldest drops) — every removal writes a tombstone, so this is
-    /// the signal for "compaction is worth running".
+    /// Entries removed since open (deletes, GC sweeps, evict-oldest
+    /// drops) — every removal writes a tombstone, so this is the signal
+    /// for "compaction is worth running".
     pub entries_removed: u64,
     pub compactions_completed: u64,
     pub compacting: bool,
     /// Total wall-clock time the engine has spent compacting.
     pub compact_time: Duration,
+}
+
+/// Namespaces one shared `TieringHandler` per logical db index: the
+/// engine keys entries by the raw key bytes alone, so without a db
+/// prefix `db0.foo` and `db1.foo` would clobber each other's spilled
+/// copy. Capacity, GC and compaction calls pass through — they describe
+/// the whole engine, not one db's slice of it.
+struct DbScopedTier {
+    db_index: u32,
+    inner: Arc<dyn TieringHandler>,
+}
+
+impl DbScopedTier {
+    fn scoped(&self, key: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + key.len());
+        out.extend_from_slice(&self.db_index.to_be_bytes());
+        out.extend_from_slice(key);
+        out
+    }
+
+    fn unscope(&self, key: Bytes) -> Option<Bytes> {
+        key.strip_prefix(&self.db_index.to_be_bytes()[..]).map(Bytes::copy_from_slice)
+    }
+}
+
+impl TieringHandler for DbScopedTier {
+    fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String> {
+        self.inner.evict(&Bytes::from(self.scoped(key)), value, ttl)
+    }
+
+    fn fetch(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
+        self.inner.fetch(&self.scoped(key))
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        self.inner.contains(&self.scoped(key))
+    }
+
+    fn remove(&self, key: &[u8]) {
+        self.inner.remove(&self.scoped(key))
+    }
+
+    fn keys_snapshot(&self) -> Vec<Bytes> {
+        self.inner.keys_snapshot().into_iter().filter_map(|k| self.unscope(k)).collect()
+    }
+
+    fn oldest_keys(&self, max: usize) -> Vec<Bytes> {
+        self.inner.oldest_keys(usize::MAX).into_iter().filter_map(|k| self.unscope(k)).take(max).collect()
+    }
+
+    /// Only this db's slice — `FLUSHDB` must not wipe other dbs' tiered
+    /// data, which a shared-engine `clear` would have done.
+    fn clear(&self) {
+        for key in self.keys_snapshot() {
+            self.remove(&key);
+        }
+    }
+
+    fn disk_usage_bytes(&self) -> Option<u64> {
+        self.inner.disk_usage_bytes()
+    }
+
+    fn can_accept(&self, additional: u64) -> bool {
+        self.inner.can_accept(additional)
+    }
+
+    fn sweep_expired(&self) -> usize {
+        self.inner.sweep_expired()
+    }
+
+    fn compact(&self) -> Result<(), String> {
+        self.inner.compact()
+    }
+
+    fn stats(&self) -> TieredStats {
+        self.inner.stats()
+    }
 }
 
 /// A single logical database (what Redis calls `SELECT 0..N`).
@@ -414,25 +487,22 @@ impl Db {
     /// Passing `None` clears any existing TTL (matches `SET` semantics).
     /// Always clears sliding-TTL mode — a plain `SET` is a fresh value.
     ///
-    /// Also drops any stale copy of `key` from the disk tier first: unlike
-    /// `with_entry_mut` (which promotes before mutating), this writes
-    /// straight into RAM, so without this it would be possible for a
-    /// `SET`/`RENAME`/`RESTORE` on a currently-tiered key to leave RAM and
-    /// the tier both holding a copy — breaking the "never coexist"
-    /// invariant `DEL`/`EXISTS`/`GET` rely on (a later `DEL` would only
-    /// clear the RAM copy, leaving the stale tiered value to resurrect on
-    /// the next `GET`).
+    /// A pre-existing tier copy is deliberately left alone: RAM and the
+    /// tier may hold copies of the same key (the tier's is the last
+    /// fsync'd state, RAM's is authoritative while the server is alive),
+    /// and every permanent-removal path clears the tier copy via
+    /// `drop_tier_copy` — so there's no ghost to resurrect, and a crash
+    /// before the next re-eviction still recovers the last durable value.
     pub fn set(&self, key: Bytes, value: Value, expires_at: Option<Instant>) {
         let _tier_guard = self.tier_guard();
-        if let Some(handler) = &self.tiering {
-            handler.remove(&key);
-        }
         let guard = self.map.guard();
         self.map.insert(key, RwLock::new(Entry::new(value, expires_at, None)), &guard);
     }
 
     /// On a RAM miss, ask the tiering handler (if any) for the key and, if
     /// found, rehydrate it into RAM. Returns whether a promotion happened.
+    /// The tier keeps its copy (`fetch`, not a move) — RAM is a read cache
+    /// over the tier's durable record, so a key never becomes volatile-only.
     /// Sliding TTLs don't currently survive a trip through the disk tier.
     fn try_promote(&self, key: &[u8]) -> bool {
         let _tier_guard = self.tier_guard();
@@ -441,7 +511,7 @@ impl Db {
 
     fn try_promote_locked(&self, key: &[u8]) -> bool {
         let Some(handler) = &self.tiering else { return false };
-        let Some((value, ttl)) = handler.promote(key) else { return false };
+        let Some((value, ttl)) = handler.fetch(key) else { return false };
         let expires_at = ttl.map(saturating_deadline);
         let guard = self.map.guard();
         self.map.insert(
@@ -452,12 +522,30 @@ impl Db {
         true
     }
 
+    /// Drop `key`'s tier copy if the tier still holds one. RAM and the
+    /// tier may coexist (RAM is a read cache), so every path that
+    /// *permanently* removes a key — `DEL`, `take`/`RENAME`, expiry — must
+    /// clear the tier copy too or the older value would resurrect on the
+    /// next RAM-miss `fetch`. `contains` first so keys never tiered don't
+    /// pay a tombstone write. Callers already hold `tier_guard`.
+    fn drop_tier_copy(&self, key: &[u8]) {
+        if let Some(handler) = &self.tiering {
+            if handler.contains(key) {
+                handler.remove(key);
+            }
+        }
+    }
+
     /// Remove an expired entry only if it is still the same map entry that
     /// was inspected. A concurrent SET may have replaced it after the
     /// reader dropped its lock.
     fn remove_if_same(&self, key: &[u8], inspected: &RwLock<Entry>, guard: &impl papaya::Guard) {
         if self.map.get(key, guard).is_some_and(|current| std::ptr::eq(current, inspected)) {
             self.map.remove(key, guard);
+            // Expiry is a delete: drop the coexisting tier copy too — its
+            // own deadline can lag after post-promote TTL changes, and
+            // leaving it would resurrect the key on the next RAM miss.
+            self.drop_tier_copy(key);
         }
     }
 
@@ -536,12 +624,12 @@ impl Db {
                 let entry = lock.read();
                 freed = freed.saturating_add(key.len() + 48 + entry.value.approx_bytes());
                 removed += 1;
+                drop(entry);
+                // RAM and tier copies coexist by design — a delete must
+                // drop both or the older tiered value would resurrect.
+                self.drop_tier_copy(key);
                 continue;
             }
-            // Only touch the disk tier when the key wasn't already found in
-            // RAM — a tiered key and its RAM copy never coexist (`promote`
-            // removes it from the tier), so there's nothing to clean up
-            // there once we know it was in RAM.
             let in_tier = self
                 .tiering
                 .as_ref()
@@ -573,6 +661,7 @@ impl Db {
             }
             return None;
         };
+        self.drop_tier_copy(key);
 
         let mut entry = lock.write();
         if entry.is_expired() {
@@ -868,6 +957,7 @@ impl Db {
             if entry.is_expired() {
                 drop(entry);
                 self.map.remove(&key, &guard);
+                self.drop_tier_copy(&key);
             } else {
                 present = true;
             }
@@ -915,6 +1005,7 @@ impl Db {
         if entry.is_expired() {
             drop(entry);
             self.map.remove(key, &guard);
+            self.drop_tier_copy(key);
             return Ok(None);
         }
         let ttl = entry.remaining_ttl();
@@ -939,6 +1030,7 @@ impl Db {
             self.map.get(key, &guard).map(|lock| lock.read().value.is_empty_container()).unwrap_or(false);
         if empty {
             self.map.remove(key, &guard);
+            self.drop_tier_copy(key);
         } else if self.map.get(key, &guard).is_none() {
             if let Some(handler) = &self.tiering {
                 handler.remove(key);
@@ -963,60 +1055,6 @@ impl Db {
     pub fn ram_keys_snapshot(&self) -> Vec<Bytes> {
         let guard = self.map.guard();
         self.map.keys(&guard).cloned().collect()
-    }
-
-    /// Keys currently sitting in the disk tier (not RAM), used by
-    /// `tiered-disk-limit` eviction selection. Empty if there's no tiering
-    /// handler or it can't enumerate its own keys.
-    pub fn tiered_keys_snapshot(&self) -> Vec<Bytes> {
-        self.tiering.as_ref().map(|t| t.keys_snapshot()).unwrap_or_default()
-    }
-
-    /// Up to `max` of the disk tier's keys, oldest-evicted-first — see
-    /// `TieringHandler::oldest_keys`.
-    pub fn tiered_oldest_keys(&self, max: usize) -> Vec<Bytes> {
-        self.tiering.as_ref().map(|t| t.oldest_keys(max)).unwrap_or_default()
-    }
-
-    /// Bytes used by the disk tier, if the handler can report it.
-    pub fn tiered_disk_usage_bytes(&self) -> Option<u64> {
-        self.tiering.as_ref().and_then(|t| t.disk_usage_bytes())
-    }
-
-    /// `TieringHandler::can_accept` via the store — `true` when there's no
-    /// handler or the handler is unbounded.
-    pub fn tiered_can_accept(&self, additional: u64) -> bool {
-        self.tiering.as_ref().map(|t| t.can_accept(additional)).unwrap_or(true)
-    }
-
-    /// `TieringHandler::sweep_expired` via the store.
-    pub fn tiered_sweep_expired(&self) -> usize {
-        self.tiering.as_ref().map(|t| t.sweep_expired()).unwrap_or(0)
-    }
-
-    /// `TieringHandler::compact` via the store.
-    pub fn tiered_compact(&self) -> Result<(), String> {
-        self.tiering.as_ref().map(|t| t.compact()).unwrap_or(Ok(()))
-    }
-
-    /// `TieringHandler::stats` via the store.
-    pub fn tiered_stats(&self) -> TieredStats {
-        self.tiering.as_ref().map(|t| t.stats()).unwrap_or_default()
-    }
-
-    /// Drop a key from the disk tier outright — unlike `evict_to_tier`,
-    /// this is real data loss (the `tiered-disk-limit` equivalent of
-    /// `allkeys-random`: once the disk tier itself is full, something has
-    /// to give). Returns `false` if there's no tiering handler or the key
-    /// isn't actually tiered.
-    pub fn remove_tiered_key_outright(&self, key: &[u8]) -> bool {
-        let _tier_guard = self.tier_guard();
-        let Some(handler) = &self.tiering else { return false };
-        if !handler.contains(key) {
-            return false;
-        }
-        handler.remove(key);
-        true
     }
 
     /// `(last_access, access_count)` for `maxmemory-policy
@@ -1067,6 +1105,7 @@ impl Db {
         let removed = expired.len();
         for key in &expired {
             self.map.remove(key, &guard);
+            self.drop_tier_copy(key);
         }
         removed
     }
@@ -1115,20 +1154,26 @@ impl Db {
 /// The full set of logical databases, indexed by `SELECT`.
 pub struct Store {
     dbs: Vec<Db>,
+    /// The unscoped engine handle for cross-db operations (capacity
+    /// accounting, GC, compaction, `evict-oldest` victim selection).
+    /// Per-db access goes through each `Db`'s `DbScopedTier` wrapper.
+    tier: Option<Arc<dyn TieringHandler>>,
 }
 
 impl Store {
     pub fn new(num_dbs: usize) -> Self {
         let dbs = (0..num_dbs.max(1)).map(|_| Db::new()).collect();
-        Self { dbs }
+        Self { dbs, tier: None }
     }
 
-    /// Every database shares the same tiering handler — a tiered key still
-    /// belongs to its originating db index, same as the doc's "tiered keys
-    /// stay owned by their original shard" cluster note.
+    /// Every database shares the same underlying tiering engine, wrapped
+    /// per-db in `DbScopedTier` so keys can't collide across `SELECT`ed
+    /// databases. `tier` keeps the raw handle for engine-global ops.
     pub fn new_with_tiering(num_dbs: usize, handler: Arc<dyn TieringHandler>) -> Self {
-        let dbs = (0..num_dbs.max(1)).map(|_| Db::with_tiering(handler.clone())).collect();
-        Self { dbs }
+        let dbs = (0..num_dbs.max(1))
+            .map(|i| Db::with_tiering(Arc::new(DbScopedTier { db_index: i as u32, inner: handler.clone() })))
+            .collect();
+        Self { dbs, tier: Some(handler) }
     }
 
     pub fn len(&self) -> usize {
@@ -1143,40 +1188,45 @@ impl Store {
         self.dbs.get(index)
     }
 
-    /// The disk tier is one shared handler across every db index (see
-    /// `new_with_tiering`), so these three just need to ask whichever `Db`
-    /// happens to be first — any of them would report the same thing.
+    /// Engine-global views — `tiered_oldest_keys`/`remove_tiered_key_outright`
+    /// work on the unscoped (db-prefixed) key namespace, which is fine
+    /// since their only caller (`drain_tiered_disk`) treats keys opaquely.
     pub fn tiered_disk_usage_bytes(&self) -> Option<u64> {
-        self.dbs.first()?.tiered_disk_usage_bytes()
+        self.tier.as_ref()?.disk_usage_bytes()
     }
 
     /// `TieringHandler::can_accept` — `true` with no tier attached.
     pub fn tiered_can_accept(&self, additional: u64) -> bool {
-        self.dbs.first().map(|db| db.tiered_can_accept(additional)).unwrap_or(true)
+        self.tier.as_ref().map(|t| t.can_accept(additional)).unwrap_or(true)
     }
 
     pub fn tiered_keys_snapshot(&self) -> Vec<Bytes> {
-        self.dbs.first().map(Db::tiered_keys_snapshot).unwrap_or_default()
+        self.tier.as_ref().map(|t| t.keys_snapshot()).unwrap_or_default()
     }
 
     pub fn tiered_oldest_keys(&self, max: usize) -> Vec<Bytes> {
-        self.dbs.first().map(|db| db.tiered_oldest_keys(max)).unwrap_or_default()
+        self.tier.as_ref().map(|t| t.oldest_keys(max)).unwrap_or_default()
     }
 
     pub fn remove_tiered_key_outright(&self, key: &[u8]) -> bool {
-        self.dbs.first().is_some_and(|db| db.remove_tiered_key_outright(key))
+        let Some(tier) = &self.tier else { return false };
+        if !tier.contains(key) {
+            return false;
+        }
+        tier.remove(key);
+        true
     }
 
     pub fn tiered_sweep_expired(&self) -> usize {
-        self.dbs.first().map(|db| db.tiered_sweep_expired()).unwrap_or(0)
+        self.tier.as_ref().map(|t| t.sweep_expired()).unwrap_or(0)
     }
 
     pub fn tiered_compact(&self) -> Result<(), String> {
-        self.dbs.first().map(|db| db.tiered_compact()).unwrap_or(Ok(()))
+        self.tier.as_ref().map(|t| t.compact()).unwrap_or(Ok(()))
     }
 
     pub fn tiered_stats(&self) -> TieredStats {
-        self.dbs.first().map(|db| db.tiered_stats()).unwrap_or_default()
+        self.tier.as_ref().map(|t| t.stats()).unwrap_or_default()
     }
 
     /// Run an active expire cycle across every database.
@@ -1406,8 +1456,8 @@ mod tests {
             self.store.insert(key.clone(), (value.clone(), ttl));
             Ok(())
         }
-        fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
-            self.store.remove(key).map(|(_, v)| v)
+        fn fetch(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
+            self.store.get(key).map(|v| v.clone())
         }
         fn contains(&self, key: &[u8]) -> bool {
             self.store.contains_key(key)
@@ -1430,10 +1480,11 @@ mod tests {
         assert_eq!(db.dbsize(), 1);
         assert!(tier.store.contains_key(b"k".as_slice()));
 
-        // GET transparently rehydrates it from the tier.
+        // GET transparently rehydrates it into RAM — and the tier keeps
+        // its copy: that's the durable record, RAM is just a read cache.
         assert_eq!(db.get(b"k"), Some(Value::String(Bytes::from("v"))));
         assert_eq!(db.dbsize(), 1);
-        assert!(!tier.store.contains_key(b"k".as_slice()));
+        assert!(tier.store.contains_key(b"k".as_slice()));
     }
 
     #[test]
@@ -1461,25 +1512,20 @@ mod tests {
         assert_eq!(db.exists(&[Bytes::from("k")]), 0);
     }
 
-    /// Regression test: `set()` on a key that's currently tiered-only must
-    /// drop the stale tier copy instead of leaving it to coexist with the
-    /// fresh RAM value — otherwise a later `DEL` (which skips the tier once
-    /// it found the key in RAM) leaves the old value on disk to resurrect
-    /// on the next `GET`.
+    /// A promoted (RAM+tier coexisting) key deleted via `DEL` must drop
+    /// the tier copy too — otherwise the older tiered value would
+    /// resurrect on the next RAM-miss `fetch`.
     #[test]
-    fn set_on_a_tiered_key_drops_the_stale_tier_copy() {
+    fn del_on_a_coexisting_key_clears_the_tier_copy() {
         let tier = Arc::new(MockTier::default());
         let db = Db::with_tiering(tier.clone());
-        db.set(Bytes::from("k"), Value::String(Bytes::from("old")), None);
+        db.set(Bytes::from("k"), Value::String(Bytes::from("v")), None);
         db.evict_to_tier(b"k");
-        assert!(tier.store.contains_key(b"k".as_slice()));
+        assert_eq!(db.get(b"k"), Some(Value::String(Bytes::from("v")))); // promotes into RAM
+        assert!(tier.store.contains_key(b"k".as_slice())); // tier copy stays (durable record)
 
-        db.set(Bytes::from("k"), Value::String(Bytes::from("new")), None);
-        assert!(!tier.store.contains_key(b"k".as_slice()));
-
-        // DEL only needs to clear RAM now — no ghost left in the tier to
-        // resurrect afterward.
         assert_eq!(db.del(&[Bytes::from("k")]), 1);
+        assert!(!tier.store.contains_key(b"k".as_slice()));
         assert_eq!(db.get(b"k"), None);
         assert_eq!(db.exists(&[Bytes::from("k")]), 0);
     }
@@ -1516,5 +1562,24 @@ mod tests {
             })
             .unwrap();
         assert_eq!(items, vec![Bytes::from("a"), Bytes::from("b")]);
+    }
+
+    /// All DBs share one physical tier — `DbScopedTier` namespaces keys
+    /// so `db0.same` and `db1.same` don't overwrite each other on disk.
+    #[test]
+    fn tier_entries_are_scoped_per_db() {
+        let tier = Arc::new(MockTier::default());
+        let store = Store::new_with_tiering(2, tier.clone());
+        let db0 = store.db(0).unwrap();
+        let db1 = store.db(1).unwrap();
+        db0.set(Bytes::from("same"), Value::String(Bytes::from("zero")), None);
+        db1.set(Bytes::from("same"), Value::String(Bytes::from("one")), None);
+
+        assert!(db0.evict_to_tier(b"same"));
+        assert!(db1.evict_to_tier(b"same"));
+        assert_eq!(tier.store.len(), 2);
+
+        assert_eq!(db0.get(b"same"), Some(Value::String(Bytes::from("zero"))));
+        assert_eq!(db1.get(b"same"), Some(Value::String(Bytes::from("one"))));
     }
 }

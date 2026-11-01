@@ -12,9 +12,9 @@ See [ROADMAP.md](ROADMAP.md) for what's designed but not built yet, and
 | Type | Notes |
 |------|-------|
 | String (incl. Bitmap) | `int`/`raw` representation; `INCR` is O(1) |
-| List | `VecDeque<Bytes>` |
-| Hash | `HashMap<Bytes, Bytes>` |
-| Set | `IndexSet<Bytes>` — insertion-ordered, enables O(1) `SPOP` via `swap_remove_index` |
+| List | packed `Vec<Bytes>` under 128 elements, `VecDeque<Bytes>` beyond (one-way promotion) |
+| Hash | packed `Vec<(Bytes, Bytes)>` under 128 fields, `IndexMap` beyond |
+| Set | packed `Vec<Bytes>` under 128 members, `IndexSet` beyond — insertion-ordered, enables O(1) `SPOP` via `swap_remove_index` |
 | Sorted Set (ZSET) | `HashMap<Bytes, f64>` + a `BTreeSet<(score, member)>` index — O(log n) `ZPOPMIN`/`ZPOPMAX`, O(n) range scans |
 | Stream | `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/`XGROUP`/`XREADGROUP`/`XACK`/`XPENDING`/`XREAD`/`XCLAIM`/`XAUTOCLAIM`. Not implemented: `XINFO`, `BLOCK`ing reads, `MINID` trimming, exclusive range bounds |
 
@@ -30,8 +30,12 @@ its full representation. Geo and HyperLogLog are not implemented (see
   read).
 - Eviction policies under `maxmemory`: `noeviction` (default), `allkeys-lru/lfu/random`,
   `volatile-lru/lfu/random/ttl`. LFU is a plain access counter, not a decayed approximation.
-- `SCHEDULE AT/IN <command>`, `SCHEDULE LIST`, `SCHEDULE CANCEL` — delayed command execution,
-  in-memory only (`scheduled-commands-max`, default 100000). Doesn't survive a restart yet.
+- `SCHEDULE AT/IN <command>`, `SCHEDULE LIST`, `SCHEDULE CANCEL` — delayed command execution.
+  Registration writes a `~sched:<id>` marker key, so tasks persist via AOF/RDB, replicate, and
+  re-arm on restart and on replica promotion (cap: `scheduled-commands-max`, default 100000).
+  Markers are user-visible bookkeeping keys — a manual `DEL ~sched:<id>` cancels the task.
+  Firing deletes the marker *after* the command runs: a crash in between re-fires it once —
+  at-least-once, never silently lost.
 
 ## Reactivity — `LIVE` / `UNLIVE`
 
@@ -91,8 +95,9 @@ Raw knobs for non-profile setups:
   write/fsync ("group commit"). New AOF files use compressed batches; legacy RESP-only files
   remain readable and are upgraded by `BGREWRITEAOF`. A crash can lose the last few acked
   commands under `everysec`; `WAITAOF` is the call that explicitly blocks for a real fsync.
-  `BGREWRITEAOF` compacts to one command per live key (manual trigger only — no automatic
-  rewrite-on-growth yet).
+  `BGREWRITEAOF` compacts to one command per live key; it also fires automatically once the
+  AOF exceeds `auto-aof-rewrite-min-size` and has grown by `auto-aof-rewrite-percentage`
+  since the last rewrite (defaults 64mb / 100%).
 - **AOF failure handling**: because `append` is fire-and-forget, a batch the writer thread
   fails to write (disk full, I/O error) has already been acked to its client. Once that
   happens all subsequent writes are refused with `MISCONF Errors writing to the AOF file`
@@ -134,6 +139,7 @@ hour passed — deletes don't reclaim file space until compaction. `INFO` report
 ## Replication & HA
 
 - `REPLICAOF <host> <port>` / `REPLICAOF NO ONE`; `replica-read-only yes` by default.
+  `masterauth` sets the AUTH a replica sends to a `requirepass` primary on connect.
 - `PSYNC <replid> <offset>` does a **partial resync** when the offset is still covered by the
   primary's resync backlog (`partial-resync-backlog`, default `1mb`, `0` disables): the replica
   gets `+CONTINUE` plus just the commands it missed. Anything else — unknown replid, evicted or
@@ -145,13 +151,14 @@ hour passed — deletes don't reclaim file space until compaction. `INFO` report
   pub/sub slow-client timeout does not apply. Queue overflow means the replica has missed writes
   and it is disconnected after a five-second grace period.
 - `WAIT`/`WAITAOF` — write-ack sync points, offset-compare based.
+  `min-replicas-to-write` refuses writes (NOREPLICAS) while fewer than N healthy replicas
+  are connected.
 - `reflexdb-sentinel` binary: monitors primaries, votes with peer Sentinels on failure, promotes
   a replica and re-points the others. Replicas/peers are listed explicitly in
   `sentinel.conf` (no auto-discovery yet); failover always picks "the first configured replica".
 - No cluster mode (hash-slot sharding) — not planned, see [ROADMAP.md](ROADMAP.md).
-- Not implemented: diskless replication, chain replication,
-  `min-replicas-to-write`/`-max-lag` write gating, sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE` —
-  tied to cluster mode).
+- Not implemented: diskless replication, chain replication, `-max-lag` write gating,
+  sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE` — tied to cluster mode).
 
 ## Security
 
@@ -192,7 +199,9 @@ HISTORY <key> [LIMIT n]  # versions: (timestamp, command, summary), newest-first
 ```
 
 Versions are written to a disk-backed side-car store (`fjall`, same engine as the tier), not
-reconstructed from the AOF, and not replicated. Recording a version costs one channel push on
+reconstructed from the AOF. Replicas with `history-enabled yes` record their own versions for
+every write they apply (timestamps are replica-local; history predating the attach doesn't
+transfer, and an RDB/full-resync load records nothing). Recording a version costs one channel push on
 the write path (fire-and-forget to a batching writer thread). `history-retention-ms` defaults to
 24h; `0` disables age-based expiry. `history-max-versions-per-key` defaults to 200 (range
 1–1,000,000); the writer trims older versions and `GETAT`/`HISTORY` observe only the capped
@@ -221,9 +230,15 @@ IDEMPOTENT <key> <ttl_ms> <cmd> <args...>
 
 `IDEMPOTENT` claims `key` atomically, runs `cmd`, stores its reply under `key`, and answers
 retries with the stored reply — no re-execution. Errors release the claim instead of caching.
-Connection-state commands, blockers, and `RUN`/`IDEMPOTENT` itself can't be wrapped. On
-replicas only completed markers answer; the marker replicates as `SET`/`PSETEX`, so a failover
-keeps "execute once" semantics. `GETAT`/`HISTORY` on the `run:` keys give a second audit view
+Connection-state commands, blockers, and `RUN`/`IDEMPOTENT` itself can't be wrapped.
+The durable record is a single internal `IDKAPPLY` command packing the inner command's resolved
+effects plus the stored reply — effects and marker land on disk and on replicas together or not
+at all, so a crash (or failover) mid-execution can't leave an applied-but-unmarked run that a
+retry would double-execute: exactly-once, not just at-least-once. `IDKAPPLY` itself only exists
+on the replication link and in AOF replay; clients can't issue it.
+`CHECKPOINT`/`RESTORE` serialize against each other per run id (a checkpoint can't capture a
+half-restored state); like `BGSAVE`, they aren't atomic against unrelated concurrent writes to
+`run:<id>:*` keys. `GETAT`/`HISTORY` on the `run:` keys give a second audit view
 when `history-enabled` is on.
 
 ## Cache correctness — single-flight
@@ -240,6 +255,10 @@ MVCC snapshot reads (`SNAPSHOT BEGIN`/`END`) and dependency-tracked invalidation
 
 - `INFO` sectioned metrics, `SLOWLOG`, `LATENCY` histograms, `MEMORY USAGE` (hand-counted, not
   allocator-reported).
+- `metrics-port` — Prometheus text exposition over plain HTTP (`GET /metrics`); see
+  [OPERATIONS.md](OPERATIONS.md).
+- `auto-aof-rewrite-percentage`/`auto-aof-rewrite-min-size` — automatic AOF compaction on
+  growth (defaults 100 / 64mb), plus manual `BGREWRITEAOF`.
 - `CONFIG GET/SET/REWRITE`.
 - Multi-threaded: one Tokio task per connection, sharded keyspace locking (see
   [ARCHITECTURE.md](ARCHITECTURE.md)).

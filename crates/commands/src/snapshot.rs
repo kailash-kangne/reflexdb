@@ -78,18 +78,10 @@ pub fn cmd_lastsave(ctx: &ServerContext) -> Outcome {
 /// replies as soon as the rewrite is queued, not once the file swap has
 /// actually happened on the writer thread.
 pub fn cmd_bgrewriteaof(ctx: &ServerContext) -> Outcome {
-    let aof = ctx.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (Some(writer), Some(path)) = (&*aof, &ctx.aof_path) else {
-        return err("ERR no append only file configured (set `appendonly yes`)");
-    };
-    if let Err(e) = writer.begin_rewrite() {
-        return err(format!("ERR {e}"));
+    match ctx.start_aof_rewrite() {
+        Ok(()) => reply(Value::Simple("Background append only file rewriting started".into())),
+        Err(e) => err(format!("ERR {e}")),
     }
-    let base = persistence::aof::build_rewrite_base(&ctx.store);
-    if let Err(e) = writer.finish_rewrite(base, path.clone()) {
-        return err(format!("ERR {e}"));
-    }
-    reply(Value::Simple("Background append only file rewriting started".into()))
 }
 
 pub fn cmd_dump(ctx: &ServerContext, state: &ClientState, args: &[Bytes]) -> Outcome {

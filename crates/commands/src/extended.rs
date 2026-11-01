@@ -84,7 +84,13 @@ fn config_values(ctx: &ServerContext) -> Vec<(&str, String)> {
         ("slowlog-max-len", ctx.slowlog_max_len.load(Relaxed).to_string()),
         ("notify-keyspace-events", notify),
         ("min-replicas-to-write", ctx.min_replicas_to_write.load(Relaxed).to_string()),
-        ("requirepass", lock_read(&ctx.requirepass).clone().unwrap_or_default()),
+        // Masked, not returned verbatim — a plaintext password shouldn't
+        // appear in `CONFIG GET *` output (monitoring/dumps), same as
+        // Redis's redaction of sensitive directives.
+        (
+            "requirepass",
+            lock_read(&ctx.requirepass).as_ref().map(|_| "********".to_string()).unwrap_or_default(),
+        ),
         ("aclfile", lock_read(&ctx.acl_file).as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
         ("dir", lock_read(&ctx.rdb_dir).as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
         ("dbfilename", lock_read(&ctx.rdb_name).clone()),

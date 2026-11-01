@@ -13,6 +13,12 @@ pub struct Config {
     pub port: u16,
     pub databases: usize,
     pub requirepass: Option<String>,
+    /// `auto-aof-rewrite-percentage` — rewrite the AOF once it grows by
+    /// this much over its post-rewrite base size; `0` disables (None).
+    pub auto_aof_rewrite_percentage: Option<u64>,
+    /// `auto-aof-rewrite-min-size` — never auto-rewrite a file smaller
+    /// than this floor. Default 64MB, same as Redis.
+    pub auto_aof_rewrite_min_size: u64,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
     /// `maxclients`: hard ceiling on simultaneously open connections — once
@@ -102,9 +108,20 @@ pub struct Config {
     /// `singleflight-max-wait-ms`: hard cap on how long a `GET ...
     /// SINGLEFLIGHT` caller blocks before getting a timeout error.
     pub singleflight_max_wait_ms: u64,
+    /// `protected-mode yes/no` (default `yes`, like Redis): while no
+    /// password is configured, a listener that accepts non-loopback
+    /// traffic (`bind 0.0.0.0`, a LAN address, …) refuses those
+    /// connections with a DENIED error until auth is set or the operator
+    /// turns it off. Loopback is always allowed.
+    pub protected_mode: bool,
     /// `replicaof <host> <port>` — start up already replicating from a
     /// primary, equivalent to issuing `REPLICAOF` right after boot.
     pub replicaof: Option<(String, u16)>,
+    /// `masterauth <password>` — the AUTH this replica sends its primary
+    /// on connect (the primary's `requirepass` / `default` user
+    /// password). Required for replication to a password-protected
+    /// primary; without it the link gets NOAUTH and retries forever.
+    pub masterauth: Option<String>,
     /// `tls-port`: 0 disables TLS. When set, a second listener accepts TLS
     /// connections on this port alongside the plain-text one on `port`;
     /// set `port 0` for TLS-only operation.
@@ -198,6 +215,11 @@ pub struct Config {
     /// re-reads it. Resolved as given (cwd-relative or absolute), not
     /// relative to `dir`.
     pub acl_file: Option<PathBuf>,
+    /// `metrics-port`: 0 (default) disables. When set, a second listener
+    /// on `bind:metrics-port` answers `GET /metrics` with Prometheus
+    /// text exposition — read-only, no auth (scrape over loopback or
+    /// put it behind your network boundary).
+    pub metrics_port: u16,
 }
 
 impl Default for Config {
@@ -207,6 +229,8 @@ impl Default for Config {
             port: 7379,
             databases: 16,
             requirepass: None,
+            auto_aof_rewrite_percentage: Some(100),
+            auto_aof_rewrite_min_size: 64 * 1024 * 1024,
             maxmemory: None,
             maxmemory_policy: MaxMemoryPolicy::NoEviction,
             maxclients: 10_000,
@@ -227,7 +251,9 @@ impl Default for Config {
             eviction_low_watermark: 0.5,
             max_evictions_per_tick: 10_000,
             singleflight_max_wait_ms: 10_000,
+            protected_mode: true,
             replicaof: None,
+            masterauth: None,
             tls_port: 0,
             tls_cert_file: None,
             tls_key_file: None,
@@ -249,6 +275,7 @@ impl Default for Config {
             live_pace_chunk: 64,
             live_pace_ms: 1,
             acl_file: None,
+            metrics_port: 0,
         }
     }
 }
@@ -323,10 +350,23 @@ impl Config {
         match directive.to_ascii_lowercase().as_str() {
             "bind" => self.bind = value.split_whitespace().next().unwrap_or("127.0.0.1").to_string(),
             "port" => self.port = value.parse().map_err(|_| format!("invalid port: {value}"))?,
+            "metrics-port" => {
+                self.metrics_port =
+                    value.parse().map_err(|_| format!("invalid metrics-port: {value}"))?
+            }
             "databases" => {
                 self.databases = value.parse().map_err(|_| format!("invalid databases: {value}"))?
             }
             "requirepass" => self.requirepass = if value.is_empty() { None } else { Some(value.to_string()) },
+            "auto-aof-rewrite-percentage" => {
+                let pct: u64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid auto-aof-rewrite-percentage: {value}"))?;
+                self.auto_aof_rewrite_percentage = (pct > 0).then_some(pct);
+            }
+            "auto-aof-rewrite-min-size" => {
+                self.auto_aof_rewrite_min_size = parse_memory(value)?
+            }
             "maxmemory" => self.maxmemory = Some(parse_memory(value)?),
             "maxmemory-policy" => {
                 self.maxmemory_policy = MaxMemoryPolicy::parse(value)
@@ -405,6 +445,7 @@ impl Config {
                 self.singleflight_max_wait_ms =
                     value.parse().map_err(|_| format!("invalid singleflight-max-wait-ms: {value}"))?
             }
+            "protected-mode" => self.protected_mode = value.eq_ignore_ascii_case("yes"),
             "replicaof" | "slaveof" => {
                 let mut parts = value.split_whitespace();
                 let (Some(host), Some(port)) = (parts.next(), parts.next()) else {
@@ -415,6 +456,7 @@ impl Config {
                     port.parse().map_err(|_| format!("invalid {directive} port: {port}"))?,
                 ));
             }
+            "masterauth" => self.masterauth = if value.is_empty() { None } else { Some(value.to_string()) },
             "tls-port" => self.tls_port = value.parse().map_err(|_| format!("invalid tls-port: {value}"))?,
             "tls-cert-file" => self.tls_cert_file = Some(PathBuf::from(value)),
             "tls-key-file" => self.tls_key_file = Some(PathBuf::from(value)),
@@ -517,6 +559,30 @@ mod tests {
         assert_eq!(cfg.replica_backlog_max_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.replica_slow_disconnect_ms, 1500);
         assert_eq!(cfg.partial_resync_backlog, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn protected_mode_and_masterauth_parse() {
+        // Defaults: protected on, no master password.
+        let cfg = Config::from_args(args(&[])).unwrap();
+        assert!(cfg.protected_mode);
+        assert_eq!(cfg.masterauth, None);
+
+        let cfg = Config::from_args(args(&[
+            ("protected-mode", "no"),
+            ("masterauth", "s3cret"),
+            ("replicaof", "127.0.0.1 7000"),
+        ]))
+        .unwrap();
+        assert!(!cfg.protected_mode);
+        assert_eq!(cfg.masterauth.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn metrics_port_parses() {
+        assert_eq!(Config::from_args(args(&[])).unwrap().metrics_port, 0);
+        assert_eq!(Config::from_args(args(&[("metrics-port", "9121")])).unwrap().metrics_port, 9121);
+        assert!(Config::from_args(args(&[("metrics-port", "abc")])).is_err());
     }
 
     #[test]

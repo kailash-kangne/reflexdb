@@ -38,7 +38,8 @@ Your background job wrote a **wrong value at 3am**. With any other fast store, t
   read. Working set **>** RAM budget. Full tier? Your call: `reject-writes`,
   `evict-oldest`, or `no-limit`.
 - 🛡️ **Hardened** — real ACL enforcement (`+@categories`, `%R~`/`%W~` key scopes),
-  `port 0` TLS-only mode, `MISCONF` on AOF failure, `SHUTDOWN` + signal-graceful exit.
+  `protected-mode` default-on, AUTH brute-force cap, `port 0` TLS-only mode, `MISCONF`
+  on AOF failure, `SHUTDOWN` + signal-graceful exit.
 - 🔄 **Durable your way** — `profile cache | durable | replicated` presets,
   `min-replicas-to-write`, `WAIT`/`WAITAOF` ack points, compressed RDB + AOF.
 - 🔌 **Drop-in RESP** — point `redis-cli` at it. Optional **RFX** binary wire format
@@ -201,6 +202,7 @@ Full tables: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Crate layout, concurrency model, commit order, internals |
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model, ACL semantics, known gaps — *read this before prod* |
 | [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | Numbers above, reproduced |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | Running it for real — durability, backups, replication, failover, monitoring |
 | [docs/TIERED.md](docs/TIERED.md) | RAM→disk tiering and the overflow policies |
 | [docs/RFX.md](docs/RFX.md) | The binary wire format |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Product and engineering sequence |

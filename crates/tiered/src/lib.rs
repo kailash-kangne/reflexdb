@@ -3,7 +3,7 @@
 //! RocksDB). See `docs/05-persistence-tiering.md` §5.
 //!
 //! Values are bincode-encoded entries keyed by the original key bytes, so a
-//! promote is a single point lookup. Expiry uses wall-clock deadlines so a
+//! fetch is a single point lookup. Expiry uses wall-clock deadlines so a
 //! tiered key's TTL continues to elapse while the server is stopped.
 
 use std::path::Path;
@@ -24,10 +24,9 @@ struct TieredEntry {
     /// drop the actually-oldest entries first instead of a random pick.
     /// Not updated on `contains()`/`EXISTS` checks (that would turn a
     /// cheap existence check into a disk write, defeating the point of
-    /// answering it without promoting), so this is closer to FIFO than a
-    /// true access-recency LRU — a tiered key's only other "access",
-    /// `promote`, removes it from the tier entirely, so there's no
-    /// "touched but stays resident" case to track anyway.
+    /// answering it without fetching), so this is closer to FIFO than a
+    /// true access-recency LRU — `fetch` keeps the tier copy too, so
+    /// there's no "touched but stays resident" case to track anyway.
     evicted_at_ms: u64,
 }
 
@@ -111,8 +110,8 @@ pub struct FjallTier {
     /// before the tier ever reaches it.
     capacity: AtomicU64,
     accounting_lock: Mutex<()>,
-    /// Entries removed since open — deletes, promotes, GC sweeps, outright
-    /// drops; every one writes an LSM tombstone, so this signals when a
+    /// Entries removed since open — deletes, GC sweeps, outright drops;
+    /// every one writes an LSM tombstone, so this signals when a
     /// `major_compact` is worth running.
     entries_removed: AtomicU64,
     /// Set while `major_compact` runs (for `INFO tiered_compacting`).
@@ -151,7 +150,7 @@ impl FjallTier {
 
     /// Looks up `key`'s stored payload length (if present) and subtracts
     /// it from `used_bytes` before actually removing it — every removal
-    /// path (explicit `remove`, promote, corrupt/expired cleanup) goes
+    /// path (explicit `remove`, corrupt/expired cleanup) goes
     /// through this so the counter can't drift out of sync.
     fn remove_tracked(&self, key: &[u8]) {
         let _guard = self.accounting_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -165,7 +164,7 @@ impl FjallTier {
 
     /// Drops every expired (and undecodable) entry still sitting in the
     /// tier — the periodic GC partner to the lazy checks in
-    /// `contains`/`promote`. Returns how many entries were removed.
+    /// `contains`/`fetch`. Returns how many entries were removed.
     pub fn sweep_expired(&self) -> usize {
         let mut dropped = 0;
         for key in self.keys_snapshot_sync() {
@@ -185,7 +184,7 @@ impl FjallTier {
     }
 
     /// Runs an LSM major compaction, reclaiming the space tombstoned by
-    /// `remove`/`sweep_expired`/promotes — deletions don't free disk until
+    /// `remove`/`sweep_expired` — deletions don't free disk until
     /// this (or fjall's own background merging) rewrites the segments.
     /// Transiently needs up to ~the current segment size of headroom;
     /// callers should schedule it off the latency path.
@@ -211,8 +210,8 @@ impl TieringHandler for FjallTier {
         on_blocking_thread(|| self.evict_sync(key, value, ttl))
     }
 
-    fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
-        on_blocking_thread(|| self.promote_sync(key))
+    fn fetch(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
+        on_blocking_thread(|| self.fetch_sync(key))
     }
 
     fn contains(&self, key: &[u8]) -> bool {
@@ -306,7 +305,12 @@ impl FjallTier {
         self._db.persist(fjall::PersistMode::SyncAll).map_err(|e| format!("persist disk tier: {e}"))
     }
 
-    fn promote_sync(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
+    /// Read a tiered entry WITHOUT removing it — the tier copy is the
+    /// durable record and stays put until a delete/overwrite/flush drops
+    /// it; RAM is just a read cache. Removing it here would leave the key
+    /// volatile-only until the next eviction tick re-spilled it, a crash
+    /// window that contradicts the durability contract.
+    fn fetch_sync(&self, key: &[u8]) -> Option<(Value, Option<Duration>)> {
         let payload = match self.keyspace.get(key) {
             Ok(Some(p)) => p,
             Ok(None) => return None,
@@ -323,9 +327,9 @@ impl FjallTier {
                 return None;
             }
         };
-        self.remove_tracked(key);
         let remaining = entry.expires_at_ms.map(|expiry| expiry.saturating_sub(now_ms()));
         if remaining == Some(0) {
+            self.remove_tracked(key);
             return None;
         }
         Some((entry.value, remaining.map(Duration::from_millis)))
@@ -391,13 +395,14 @@ mod tests {
         tier.evict(&key, &value, Some(Duration::from_secs(30))).unwrap();
 
         assert!(tier.contains(b"k"));
-        let (restored, ttl) = tier.promote(b"k").unwrap();
+        let (restored, ttl) = tier.fetch(b"k").unwrap();
         assert_eq!(restored, value);
         assert!(matches!(ttl, Some(d) if d <= Duration::from_secs(30) && d > Duration::from_secs(29)));
 
-        // Promotion is a one-way move: it's gone from the tier afterward.
-        assert!(!tier.contains(b"k"));
-        assert!(tier.promote(b"k").is_none());
+        // Fetch keeps the tier copy — the tier is the durable record,
+        // RAM is just a read cache.
+        assert!(tier.contains(b"k"));
+        assert_eq!(tier.fetch(b"k").unwrap().0, value);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -410,7 +415,7 @@ mod tests {
         let value = Value::String(B::from("v"));
 
         tier.evict(&key, &value, None).unwrap();
-        assert_eq!(tier.promote(b"k").unwrap().0, value);
+        assert_eq!(tier.fetch(b"k").unwrap().0, value);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -470,7 +475,7 @@ mod tests {
         }
         {
             let tier = FjallTier::open(&dir).unwrap();
-            let (value, _) = tier.promote(b"k").unwrap();
+            let (value, _) = tier.fetch(b"k").unwrap();
             assert_eq!(value, Value::String(B::from("v")));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -552,7 +557,7 @@ mod tests {
         }
         {
             let tier = FjallTier::open(&copy).unwrap();
-            let (value, _) = tier.promote(b"k").unwrap();
+            let (value, _) = tier.fetch(b"k").unwrap();
             assert_eq!(value, Value::String(B::from("v")));
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -580,7 +585,7 @@ mod tests {
         // Inject a payload that isn't a `TieredEntry` at all.
         tier.keyspace.insert(b"bad", b"not-a-tiered-entry").unwrap();
         assert!(!tier.contains(b"bad"));
-        assert!(tier.promote(b"bad").is_none());
+        assert!(tier.fetch(b"bad").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

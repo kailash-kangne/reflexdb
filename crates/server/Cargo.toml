@@ -51,4 +51,5 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "l
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2.2.0"
 rustyline = "14.0.0"
+libc = { workspace = true }
 rusqlite = { version = "0.41.1", features = ["bundled"] }

@@ -83,7 +83,17 @@ impl Client {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    // Atomic counter, not bind-and-release: bind(:0) releases the port
+    // before the server claims it, so two parallel tests could probe the
+    // same free port and race for it — the loser exits and the winner's
+    // client gets a connection reset from the wrong server.
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(33_000);
+    loop {
+        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -106,6 +116,14 @@ fn spawn(port: u16, dir: &Path, extra: &[&str]) -> Child {
 fn sigkill(child: &mut Child) {
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// These tests spawn real server processes and poll asynchronous
+/// replication state — parallel runs starve the waits and flake.
+/// Serialize the file; each test is only a couple of seconds.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn bulk(s: &str) -> Reply {
@@ -153,6 +171,7 @@ fn info_field(client: &mut Client, field: &str) -> String {
 /// the resume cursor makes the next `PSYNC` a `+CONTINUE`.
 #[test]
 fn replica_resumes_with_partial_resync_after_link_bounce() {
+    let _serial = serial();
     let dir_a = temp_dir("psync-primary");
     let dir_b = temp_dir("psync-replica");
     let (port_a, port_b) = (free_port(), free_port());
@@ -183,6 +202,7 @@ fn replica_resumes_with_partial_resync_after_link_bounce() {
 /// replica still ends up correct.
 #[test]
 fn replica_falls_back_to_full_resync_when_backlog_disabled() {
+    let _serial = serial();
     let dir_a = temp_dir("psyncoff-primary");
     let dir_b = temp_dir("psyncoff-replica");
     let (port_a, port_b) = (free_port(), free_port());
@@ -207,10 +227,55 @@ fn replica_falls_back_to_full_resync_when_backlog_disabled() {
     let _ = std::fs::remove_dir_all(&dir_b);
 }
 
+/// `kill -9` on the primary while a replica is attached: the link drops,
+/// the replica must refuse writes (still read-only), then reconnect on
+/// its own once the primary is back — with a new replid the resync is a
+/// FULLRESYNC, whose snapshot must also wipe keys the replica replicated
+/// from the pre-crash primary but that no longer exist.
+#[test]
+fn primary_sigkill_recovers_and_replica_converges() {
+    let _serial = serial();
+    let dir_a = temp_dir("crash-primary");
+    let dir_b = temp_dir("crash-replica");
+    let (port_a, port_b) = (free_port(), free_port());
+    // No persistence: the restarted primary comes back EMPTY — the
+    // strongest test of whether the replica converges instead of keeping
+    // stale replicated data.
+    let mut primary = spawn(port_a, &dir_a, &[]);
+    let mut replica = spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}")]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["SET", "seed", "1"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "seed", &bulk("1"));
+    sigkill(&mut primary);
+
+    // While the primary is down the replica must stay read-only — a write
+    // here would diverge permanently once the empty primary resyncs.
+    assert!(matches!(rc.cmd(&["SET", "local", "x"]), Reply::Error(_)));
+
+    let mut primary = spawn(port_a, &dir_a, &[]);
+    let mut pc = Client::connect(port_a);
+    assert_eq!(pc.cmd(&["SET", "after", "2"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "after", &bulk("2"));
+
+    // New replid -> full resync -> replica flushed -> stale "seed" gone.
+    // The restarted primary counts from zero, so this is its first sync.
+    assert_eq!(rc.cmd(&["GET", "seed"]), Reply::Bulk(None));
+    wait_info_field(&mut pc, "sync_full", "1");
+    assert_eq!(info_field(&mut pc, "sync_partial_ok"), "0");
+
+    sigkill(&mut primary);
+    sigkill(&mut replica);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
 /// `REPLICAOF NO ONE` clears the resume cursor — a promoted replica's
 /// data may have diverged, so re-attaching must be a full resync.
 #[test]
 fn replicaof_no_one_clears_resume_cursor() {
+    let _serial = serial();
     let dir_a = temp_dir("psyncpromote-primary");
     let dir_b = temp_dir("psyncpromote-replica");
     let (port_a, port_b) = (free_port(), free_port());
@@ -235,4 +300,83 @@ fn replicaof_no_one_clears_resume_cursor() {
     sigkill(&mut replica);
     let _ = std::fs::remove_dir_all(&dir_a);
     let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// A password-protected primary NOAUTHs a bare `PSYNC` — the link must
+/// AUTH with `masterauth` first. Without the flag replication can't
+/// connect at all; with it, the replica syncs normally.
+#[test]
+fn masterauth_authenticates_the_replication_link() {
+    let _serial = serial();
+    let dir_a = temp_dir("masterauth-primary");
+    let dir_b = temp_dir("masterauth-replica");
+    let (port_a, port_b) = (free_port(), free_port());
+    let mut primary = spawn(port_a, &dir_a, &["--requirepass", "pw"]);
+    let mut replica =
+        spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}"), "--masterauth", "pw"]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["AUTH", "pw"]), Reply::Simple("OK".into()));
+    assert_eq!(pc.cmd(&["SET", "k", "v"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "k", &bulk("v"));
+
+    sigkill(&mut primary);
+    sigkill(&mut replica);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
+/// Automatic failover: a sentinel watching the primary must promote the
+/// replica (`REPLICAOF NO ONE`) once the primary stays dead past
+/// `down-after-milliseconds`. The promoted replica then accepts writes
+/// and holds everything replicated before the kill.
+#[test]
+fn sentinel_promotes_replica_on_primary_death() {
+    let _serial = serial();
+    const SENTINEL_BIN: &str = env!("CARGO_BIN_EXE_reflexdb-sentinel");
+    let dir_a = temp_dir("sentinel-primary");
+    let dir_b = temp_dir("sentinel-replica");
+    let dir_s = temp_dir("sentinel-conf");
+    let (port_a, port_b, port_s) = (free_port(), free_port(), free_port());
+    let mut primary = spawn(port_a, &dir_a, &[]);
+    let mut replica = spawn(port_b, &dir_b, &["--replicaof", &format!("127.0.0.1 {port_a}")]);
+
+    let mut pc = Client::connect(port_a);
+    let mut rc = Client::connect(port_b);
+    assert_eq!(pc.cmd(&["SET", "k", "v"]), Reply::Simple("OK".into()));
+    wait_replicated(&mut rc, "k", &bulk("v"));
+    // Sanity: the replica refuses client writes until promoted.
+    assert!(matches!(rc.cmd(&["SET", "w", "x"]), Reply::Error(_)));
+
+    let conf = dir_s.join("sentinel.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "port {port_s}\n\
+             sentinel monitor mymaster 127.0.0.1 {port_a} 1\n\
+             sentinel down-after-milliseconds mymaster 500\n\
+             sentinel known-replica mymaster 127.0.0.1 {port_b}\n"
+        ),
+    )
+    .unwrap();
+    let mut sentinel = Command::new(SENTINEL_BIN)
+        .arg(&conf)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn reflexdb-sentinel");
+
+    sigkill(&mut primary);
+    wait_info_field(&mut rc, "role", "master");
+
+    // Promoted: writable, and everything replicated pre-kill survived.
+    assert_eq!(rc.cmd(&["SET", "w", "x"]), Reply::Simple("OK".into()));
+    assert_eq!(rc.cmd(&["GET", "k"]), bulk("v"));
+
+    sigkill(&mut sentinel);
+    sigkill(&mut replica);
+    for d in [dir_a, dir_b, dir_s] {
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

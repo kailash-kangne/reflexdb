@@ -23,6 +23,47 @@ use crate::{
     set, singleflight, snapshot, stream, string, txn, zset,
 };
 
+thread_local! {
+    /// When `Some`, `ServerContext::append_aof`/`replicate` divert their
+    /// request here instead of logging/sending it — `recovery`'s
+    /// `IDEMPOTENT`/`IDKAPPLY` use this to pack an inner command's effects
+    /// into one durable `IDKAPPLY` record (the atomic unit that makes the
+    /// wrapped command exactly-once across a crash) rather than letting
+    /// each effect commit on its own. Thread-local because `dispatch` —
+    /// including recursive inner dispatches — runs synchronously on one
+    /// thread.
+    static EFFECT_CAPTURE: RefCell<Option<Vec<Request>>> = const { RefCell::new(None) };
+}
+
+/// Start diverting this thread's effect records into a fresh buffer.
+pub(crate) fn effect_capture_begin() {
+    EFFECT_CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop diverting and return everything captured since
+/// `effect_capture_begin` (empty when none was active).
+pub(crate) fn effect_capture_take() -> Vec<Request> {
+    EFFECT_CAPTURE.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+/// Push `req` into the active capture, returning whether one was.
+pub(crate) fn effect_capture_push(req: &[Bytes]) -> bool {
+    EFFECT_CAPTURE.with(|c| match &mut *c.borrow_mut() {
+        Some(buf) => {
+            buf.push(req.to_vec());
+            true
+        }
+        None => false,
+    })
+}
+
+/// Whether a capture is active on this thread — `replicate` uses this to
+/// stay silent while effects are being bundled (the `IDKAPPLY` record
+/// replicates in their place).
+pub(crate) fn effect_capture_active() -> bool {
+    EFFECT_CAPTURE.with(|c| c.borrow().is_some())
+}
+
 /// `maxmemory-policy` — which keys are candidates for eviction once
 /// `maxmemory` is exceeded. The `-lru`/`-lfu` variants rank candidates by
 /// `keyspace::Db::access_stats` (a plain "last access instant"/"access
@@ -356,6 +397,13 @@ pub struct ServerContext {
     /// `appendfsync` the writer runs (or would run) under; `CONFIG SET
     /// appendfsync` swaps the writer when one's active.
     pub(crate) aof_fsync: std::sync::RwLock<persistence::aof::Fsync>,
+    /// `auto-aof-rewrite-percentage` — trigger a background rewrite once
+    /// the AOF grew by this much over its post-rewrite base size.
+    /// `None` (`auto-aof-rewrite-percentage 0`) disables the trigger.
+    pub auto_aof_rewrite_pct: Option<u64>,
+    /// `auto-aof-rewrite-min-size` — growth alone never rewrites a file
+    /// smaller than this floor.
+    pub auto_aof_rewrite_min_size: u64,
     pub maxmemory: Option<u64>,
     pub maxmemory_policy: MaxMemoryPolicy,
     /// `proto-max-bulk-len`: largest value a single `String` command
@@ -432,6 +480,11 @@ pub struct ServerContext {
     pub max_evictions_per_tick: usize,
     /// `SCHEDULE AT`/`SCHEDULE IN` queue, drained by `run_due_scheduled`.
     pub(crate) scheduler: Scheduler,
+    /// Serializes the multi-key `RUN CHECKPOINT`/`RUN RESTORE` operations
+    /// per run id — two restores (or a checkpoint taken mid-restore) would
+    /// otherwise interleave their delete/rebuild halves and leave a merged
+    /// state matching no snapshot.
+    pub(crate) run_locks: DashMap<Bytes, std::sync::Arc<std::sync::Mutex<()>>>,
     /// Active `GET ... SINGLEFLIGHT` leases, keyed by (db, key).
     pub(crate) singleflight: DashMap<(usize, Bytes), std::sync::Arc<SingleFlightLease>>,
     /// Mirrors `singleflight.len()` — same rationale as `key_watchers_len`.
@@ -490,6 +543,8 @@ pub struct ServerContext {
     /// Resync counters for `INFO replication` (`sync_full`/`sync_partial_ok`).
     pub full_resyncs: AtomicU64,
     pub partial_resyncs: AtomicU64,
+    /// Commands dispatched since boot — `INFO`/`metrics` ops-rate source.
+    pub commands_processed: AtomicU64,
     /// Random id handed to replicas in `FULLRESYNC`, generated once at
     /// startup (not persisted — a restart gets a fresh identity, same as a
     /// real primary after a hard crash with `repl-id` not preserved).
@@ -508,6 +563,10 @@ pub struct ServerContext {
     /// re-attaching must never partial-resync from a pre-promotion
     /// offset.
     pub(crate) replica_generation: AtomicU64,
+    /// `masterauth` — the AUTH a replication link sends its primary on
+    /// connect. Startup-only (set via config/`with_masterauth`); not
+    /// runtime-settable.
+    pub masterauth: Option<String>,
     /// Woken on every `REPLCONF ACK`, so `WAIT` doesn't have to poll on a
     /// tight timer.
     pub replica_ack_notify: tokio::sync::Notify,
@@ -601,6 +660,8 @@ impl ServerContext {
             aof: std::sync::RwLock::new(None),
             aof_path: None,
             aof_fsync: std::sync::RwLock::new(persistence::aof::Fsync::No),
+            auto_aof_rewrite_pct: Some(100),
+            auto_aof_rewrite_min_size: 64 * 1024 * 1024,
             maxmemory: None,
             maxmemory_policy: MaxMemoryPolicy::NoEviction,
             proto_max_bulk_len: 64 * 1024 * 1024,
@@ -620,6 +681,7 @@ impl ServerContext {
             eviction_low_watermark: 0.5,
             max_evictions_per_tick: 10_000,
             scheduler: Scheduler::default(),
+            run_locks: DashMap::new(),
             singleflight: DashMap::new(),
             singleflight_len: AtomicUsize::new(0),
             singleflight_max_wait: Duration::from_secs(10),
@@ -634,10 +696,12 @@ impl ServerContext {
             backlog_active: std::sync::atomic::AtomicBool::new(false),
             full_resyncs: AtomicU64::new(0),
             partial_resyncs: AtomicU64::new(0),
+            commands_processed: AtomicU64::new(0),
             replid: generate_replid(),
             replica_of: std::sync::Mutex::new(None),
             replication_epoch: AtomicU64::new(0),
             replica_generation: AtomicU64::new(0),
+            masterauth: None,
             replica_ack_notify: tokio::sync::Notify::new(),
             blocking_notify: tokio::sync::Notify::new(),
             notify_keyspace_events: std::sync::RwLock::new(NotifyFlags::default()),
@@ -725,6 +789,12 @@ impl ServerContext {
 
     pub fn with_min_replicas_to_write(mut self, n: usize) -> Self {
         self.min_replicas_to_write = AtomicUsize::new(n);
+        self
+    }
+
+    /// `masterauth` — see the field's doc.
+    pub fn with_masterauth(mut self, password: Option<String>) -> Self {
+        self.masterauth = password;
         self
     }
 
@@ -828,6 +898,13 @@ impl ServerContext {
         self
     }
 
+    /// `auto-aof-rewrite-percentage`/`auto-aof-rewrite-min-size`.
+    pub fn with_auto_aof_rewrite(mut self, pct: Option<u64>, min_size: u64) -> Self {
+        self.auto_aof_rewrite_pct = pct;
+        self.auto_aof_rewrite_min_size = min_size;
+        self
+    }
+
     /// `history-enabled yes` — turns on `GETAT`/`HISTORY`, backed by
     /// `writer` (see `ServerContext::history`'s docs for scope).
     pub fn with_history(self, writer: persistence::history::HistoryWriter) -> Self {
@@ -854,6 +931,9 @@ impl ServerContext {
     }
 
     pub(crate) fn append_aof(&self, db_index: usize, req: &[Bytes]) {
+        if effect_capture_push(req) {
+            return;
+        }
         let aof = self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(writer) = &*aof {
             if let Err(e) = writer.append(db_index, req) {
@@ -924,6 +1004,45 @@ impl ServerContext {
         self.history.read().unwrap_or_else(std::sync::PoisonError::into_inner).is_some()
     }
 
+    /// Queues an AOF rewrite — `BGREWRITEAOF`'s shared core. `begin_rewrite`
+    /// is sent *before* walking the keyspace so writes landing mid-snapshot
+    /// are mirrored into the side buffer (see `persistence::aof` docs).
+    /// Fire-and-forget: returns once both jobs are queued.
+    pub fn start_aof_rewrite(&self) -> std::io::Result<()> {
+        let aof = self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (Some(writer), Some(path)) = (&*aof, &self.aof_path) else {
+            return Err(std::io::Error::other("no append only file configured"));
+        };
+        writer.begin_rewrite()?;
+        let base = persistence::aof::build_rewrite_base(&self.store);
+        writer.finish_rewrite(base, path.clone())
+    }
+
+    /// The `auto-aof-rewrite-*` check — a periodic maintenance tick calls
+    /// this: rewrite once the file is past `min_size` AND grew by `pct`%
+    /// over its post-rewrite base, unless one is already in flight.
+    pub fn maybe_rewrite_aof(&self) {
+        let Some(pct) = self.auto_aof_rewrite_pct else { return };
+        let (cur, base, busy, failed) = {
+            let aof = self.aof.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(writer) = &*aof else { return };
+            (
+                writer.current_size(),
+                writer.rewrite_base_size().max(1),
+                writer.rewrite_in_progress(),
+                writer.io_failed(),
+            )
+        };
+        if busy || failed || cur <= self.auto_aof_rewrite_min_size {
+            return;
+        }
+        if cur.saturating_sub(base).saturating_mul(100) >= base.saturating_mul(pct) {
+            if let Err(e) = self.start_aof_rewrite() {
+                tracing::warn!(error = %e, "auto AOF rewrite failed to start");
+            }
+        }
+    }
+
     /// Blocks until every `GETAT`/`HISTORY` version recorded so far has
     /// actually landed on disk. Not used on any request path (recording is
     /// fire-and-forget by design, see `persistence::history`'s docs) —
@@ -983,6 +1102,19 @@ impl ServerContext {
             Some(limit) => self.approx_memory.load(Ordering::Relaxed) as u64 > limit,
             None => false,
         }
+    }
+
+    /// Memory estimate for introspection: the tick-cached value while
+    /// memory limits keep it fresh, one on-demand scan otherwise — so a
+    /// metrics scrape pays O(n) per scrape, not per tick.
+    pub fn approx_memory_for_reporting(&self) -> usize {
+        if self.tiered_disk_limit.is_none()
+            && self.tiered_limit.is_none()
+            && self.effective_maxmemory().is_none()
+        {
+            return self.refresh_memory_usage();
+        }
+        self.approx_memory.load(Ordering::Relaxed)
     }
 
     pub(crate) fn effective_maxmemory(&self) -> Option<u64> {
@@ -1473,6 +1605,10 @@ pub struct ClientState {
     /// see `drain_pending_history`. `RefCell` because many handlers only
     /// have `&ClientState`; push/drain borrows never overlap.
     pub(crate) pending_history: RefCell<PendingHistory>,
+    /// Failed `AUTH`/`HELLO ... AUTH` attempts on this connection — hits
+    /// `MAX_AUTH_FAILURES` and the connection is dropped, capping online
+    /// password brute-force to a handful of tries per socket.
+    pub auth_failures: u32,
 }
 
 impl ClientState {
@@ -1500,6 +1636,7 @@ impl ClientState {
             live_fingerprints: HashSet::new(),
             wire: resp::Wire::Resp,
             pending_history: RefCell::new(Vec::new()),
+            auth_failures: 0,
         }
     }
 
@@ -1897,6 +2034,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
     if req.is_empty() {
         return err("ERR empty command");
     }
+    ctx.commands_processed.fetch_add(1, Ordering::Relaxed);
     // Uppercase the command name on the stack — every real command is
     // short ASCII, so the heap `String` only materializes for weird
     // (non-ASCII / oversized) names. Saves one allocation per command.
@@ -2282,6 +2420,7 @@ pub fn dispatch(ctx: &ServerContext, state: &mut ClientState, req: Request) -> O
 
         "RUN" => recovery::cmd_run(ctx, state, args),
         "IDEMPOTENT" => recovery::cmd_idempotent(ctx, state, args),
+        "IDKAPPLY" => recovery::cmd_idkapply(ctx, state, args),
 
         "ROLE" => replication::cmd_role(ctx, args),
         "REPLICAOF" | "SLAVEOF" => replication::cmd_replicaof(ctx, args),
@@ -2336,6 +2475,11 @@ fn cmd_auth(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Out
 /// Shared by `AUTH` and `HELLO ... AUTH`: checks a username/password pair
 /// against the ACL user table (which always has at least `default`, mirroring
 /// plain `requirepass` when ACL hasn't been touched — see `acl::AclUser::default_user`).
+/// Failed-auth budget per connection before the socket is dropped —
+/// bounds online brute force without rate-limit machinery. Generous
+/// enough that a human typoing a few times never notices.
+const MAX_AUTH_FAILURES: u32 = 16;
+
 fn try_authenticate(
     ctx: &ServerContext,
     state: &mut ClientState,
@@ -2351,7 +2495,15 @@ fn try_authenticate(
             state.acl_user = username.to_string();
             reply(Value::ok())
         }
-        _ => err("WRONGPASS invalid username-password pair or user is disabled."),
+        _ => {
+            state.auth_failures += 1;
+            let e = err("WRONGPASS invalid username-password pair or user is disabled.");
+            if state.auth_failures >= MAX_AUTH_FAILURES {
+                let Outcome::Reply(v) = e else { return e };
+                return Outcome::CloseConnection(v);
+            }
+            e
+        }
     }
 }
 
@@ -2374,8 +2526,12 @@ fn cmd_hello(ctx: &ServerContext, state: &mut ClientState, args: &[Bytes]) -> Ou
                 }
                 let username = String::from_utf8_lossy(&args[i + 1]).into_owned();
                 let pass = &args[i + 2];
-                if let Outcome::Reply(Value::Error(e)) = try_authenticate(ctx, state, &username, pass) {
-                    return err(e);
+                match try_authenticate(ctx, state, &username, pass) {
+                    Outcome::Reply(Value::Error(e)) => return err(e),
+                    // Too many failures: propagate the close or the cap
+                    // is bypassed via HELLO AUTH.
+                    other @ Outcome::CloseConnection(_) => return other,
+                    _ => {}
                 }
                 i += 3;
             }
@@ -3044,6 +3200,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "ACL",
     "RUN",
     "IDEMPOTENT",
+    "IDKAPPLY",
 ];
 
 /// Commands that mutate the keyspace — used both by `EVAL_RO`/`EVALSHA_RO`
@@ -3139,10 +3296,11 @@ const WRITE_COMMAND_NAMES: &[&str] = &[
     "XCLAIM",
     "XAUTOCLAIM",
     // `IDEMPOTENT` is deliberately absent: logging the raw request would
-    // re-execute the inner command on replicas — it logs its result
-    // marker itself (see `recovery::cmd_idempotent`), same pattern as the
-    // blocking commands below.
+    // re-execute the inner command on replicas — it emits one fused
+    // `IDKAPPLY` record instead (see `recovery::cmd_idempotent`), same
+    // pattern as the blocking commands below.
     "RUN",
+    "IDKAPPLY",
 ];
 
 /// `KNOWN_COMMANDS` as a `HashSet` — the MULTI-queueing check runs this
@@ -3167,7 +3325,15 @@ pub fn request_may_write(req: &Request) -> bool {
         || (name == "SORT" && req[1..].iter().any(|arg| arg.eq_ignore_ascii_case(b"STORE")))
         || matches!(
             name.as_str(),
-            "BLPOP" | "BRPOP" | "BLMPOP" | "BLMOVE" | "BZPOPMIN" | "BZPOPMAX" | "BZMPOP" | "IDEMPOTENT"
+            "BLPOP"
+                | "BRPOP"
+                | "BLMPOP"
+                | "BLMOVE"
+                | "BZPOPMIN"
+                | "BZPOPMAX"
+                | "BZMPOP"
+                | "IDEMPOTENT"
+                | "SCHEDULE"
         )
 }
 
@@ -4054,6 +4220,30 @@ mod tests {
             other => panic!("expected an array, got {other:?}"),
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes applied through the replication link go through the same
+    /// `on_key_changed` → `drain_pending_history` path as client writes —
+    /// so a replica with `history-enabled yes` builds its own version log
+    /// as it applies the stream (timestamps are replica-local; history
+    /// predating the attach doesn't transfer).
+    #[test]
+    fn replication_link_writes_record_history() {
+        let (ctx, mut st, dir) = fresh_with_history();
+        let mut repl = ClientState::for_replication_link();
+        run(&ctx, &mut repl, &["SET", "rk", "v1"]);
+        // Versions are keyed by epoch-ms — land the second write in the
+        // next tick so it doesn't collapse into the first (same jitter
+        // guard `getat_and_history_track_string_versions` uses).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        run(&ctx, &mut repl, &["SET", "rk", "v2"]);
+        ctx.history_flush();
+
+        match run(&ctx, &mut st, &["HISTORY", "rk"]) {
+            Value::Array(versions) => assert_eq!(versions.len(), 2),
+            other => panic!("expected an array, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5232,8 +5422,8 @@ mod tests {
             self.disk.insert(key.clone(), (value.clone(), ttl, seq));
             Ok(())
         }
-        fn promote(&self, key: &[u8]) -> Option<(keyspace::Value, Option<Duration>)> {
-            self.disk.remove(key).map(|(_, (v, ttl, _))| (v, ttl))
+        fn fetch(&self, key: &[u8]) -> Option<(keyspace::Value, Option<Duration>)> {
+            self.disk.get(key).map(|e| (e.value().0.clone(), e.value().1))
         }
         fn contains(&self, key: &[u8]) -> bool {
             self.disk.contains_key(key)
@@ -5262,6 +5452,12 @@ mod tests {
         }
     }
 
+    /// `DbScopedTier` stores keys as 4-byte db index + raw key — every
+    /// test below uses db 0, so this reproduces its encoding.
+    fn scoped(key: &[u8]) -> Vec<u8> {
+        [0u32.to_be_bytes().as_slice(), key].concat()
+    }
+
     #[test]
     fn tiered_storage_moves_keys_to_disk_and_promotes_on_read() {
         let tier = std::sync::Arc::new(MockTier::default());
@@ -5281,8 +5477,9 @@ mod tests {
 
         // EXISTS must stay truthful for a tiered key without reading it off
         // disk, and GET must transparently promote it back into RAM.
+        // `DbScopedTier` prefixes stored keys with the 4-byte db index.
         let tiered_key = tier.disk.iter().next().unwrap().key().clone();
-        let tiered_key_str = String::from_utf8(tiered_key.to_vec()).unwrap();
+        let tiered_key_str = String::from_utf8(tiered_key[4..].to_vec()).unwrap();
         assert_eq!(run(&ctx, &mut st, &["EXISTS", &tiered_key_str]), Value::Integer(1));
         assert_eq!(
             run(&ctx, &mut st, &["GET", &tiered_key_str]),
@@ -5306,8 +5503,8 @@ mod tests {
 
             let used = ctx.refresh_memory_usage() as u64;
             assert_eq!(ctx.drain_to_tier(used.saturating_sub(1)), 1);
-            assert!(tier.disk.contains_key(b"cold".as_slice()), "{policy:?} should tier cold first");
-            assert!(!tier.disk.contains_key(b"hot".as_slice()), "{policy:?} should keep hot in RAM");
+            assert!(tier.disk.contains_key(&scoped(b"cold")[..]), "{policy:?} should tier cold first");
+            assert!(!tier.disk.contains_key(&scoped(b"hot")[..]), "{policy:?} should keep hot in RAM");
         }
     }
 
@@ -5409,15 +5606,16 @@ mod tests {
         };
         assert!(e.starts_with("ERR TIERED_STORAGE_FULL"), "got {e}");
         assert_eq!(ctx.tiered_full_rejections.load(Ordering::Relaxed), rejections_before + 1);
-        assert!(!tier.disk.contains_key(b"brand-new".as_slice()));
+        assert!(!tier.disk.contains_key(&scoped(b"brand-new")[..]));
 
-        // Overwrites and deletes of existing keys stay allowed — and
-        // overwriting a *tiered* key pulls it into RAM, shrinking disk.
-        let tiered_key = String::from_utf8(tier.disk.iter().next().unwrap().key().to_vec()).unwrap();
+        // Overwrites and deletes of existing keys stay allowed. An
+        // overwrite keeps the tier copy — it's the last durable record;
+        // DEL is what drops it.
+        let tiered_key = String::from_utf8(tier.disk.iter().next().unwrap().key()[4..].to_vec()).unwrap();
         assert_eq!(run(&ctx, &mut st, &["SET", &tiered_key, "v2"]), Value::ok());
-        assert_eq!(tier.disk.len(), 2);
         assert_eq!(run(&ctx, &mut st, &["GET", &tiered_key]), Value::bulk(&b"v2"[..]));
         assert_eq!(run(&ctx, &mut st, &["DEL", &tiered_key]), Value::Integer(1));
+        assert_eq!(tier.disk.len(), 2);
     }
 
     #[test]
@@ -5565,6 +5763,37 @@ mod tests {
         assert_eq!(run(&ctx, &mut st, &["GET", "k2"]), Value::bulk(&b"v"[..]));
     }
 
+    /// `CONFIG GET requirepass` must never return the plaintext — masked
+    /// output proves set-vs-unset without disclosing the secret; and a
+    /// connection that keeps failing AUTH is dropped after
+    /// `MAX_AUTH_FAILURES`.
+    #[test]
+    fn config_get_masks_requirepass_and_repeated_auth_failures_close_the_socket() {
+        let ctx = ServerContext::new(16, Some("pw".into()));
+        let (id, _rx) = ctx.register_client();
+        let mut st = ClientState::with_id(id, true);
+
+        assert_eq!(run(&ctx, &mut st, &["AUTH", "pw"]), Value::ok());
+        let Value::Array(pairs) = run(&ctx, &mut st, &["CONFIG", "GET", "requirepass"]) else {
+            panic!("expected array");
+        };
+        let val = pairs.windows(2).find(|w| w[0] == Value::bulk(&b"requirepass"[..])).map(|w| &w[1]);
+        assert_eq!(val, Some(&Value::bulk(&b"********"[..])));
+
+        let (id2, _rx2) = ctx.register_client();
+        let mut st2 = ClientState::with_id(id2, true);
+        for i in 0..MAX_AUTH_FAILURES - 1 {
+            match run(&ctx, &mut st2, &["AUTH", "nope"]) {
+                Value::Error(_) => {}
+                other => panic!("attempt {i}: expected WRONGPASS, got {other:?}"),
+            }
+        }
+        match dispatch(&ctx, &mut st2, req(&["AUTH", "nope"])) {
+            Outcome::CloseConnection(_) => {}
+            _ => panic!("final failure should close the socket"),
+        }
+    }
+
     #[test]
     fn config_set_history_enabled_toggles_live() {
         let dir = std::env::temp_dir().join(format!("reflexdb-cfg-hist-toggle-{}", std::process::id()));
@@ -5634,5 +5863,152 @@ mod tests {
         assert_eq!(run(&ctx, &mut state, &["ZLEXCOUNT", "za", "[a", "[b"]), Value::Integer(2));
         assert_eq!(run(&ctx, &mut state, &["ZRANGESTORE", "zr", "za", "0", "-1"]), Value::Integer(2));
         assert_eq!(run(&ctx, &mut state, &["ZREMRANGEBYLEX", "za", "[a", "[a"]), Value::Integer(1));
+    }
+
+    /// Deterministic random-command differential test: every reply is
+    /// checked against a plain in-memory model of Redis semantics. String
+    /// and list ops share a small keyspace so type confusion (WRONGTYPE)
+    /// and key churn are exercised constantly.
+    #[test]
+    fn random_ops_match_a_model() {
+        use std::collections::{HashMap, VecDeque};
+
+        enum M {
+            Str(Vec<u8>),
+            List(VecDeque<Vec<u8>>),
+        }
+
+        let (ctx, mut state) = fresh();
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut model: HashMap<String, M> = HashMap::new();
+
+        for i in 0..20_000u64 {
+            let key = format!("k{}", next() % 40);
+            let arg = format!("v{}", next() % 500);
+            let op = next() % 13;
+            let words: Vec<String>;
+            let expected: Value = match op {
+                0..=2 => {
+                    let val = match next() % 4 {
+                        0 => (next() % 1_000_000).to_string(),
+                        1 => i64::MAX.to_string(),
+                        _ => arg.clone(),
+                    };
+                    model.insert(key.clone(), M::Str(val.clone().into_bytes()));
+                    words = vec!["SET".into(), key.clone(), val];
+                    Value::Simple("OK".into())
+                }
+                3 => {
+                    words = vec!["GET".into(), key.clone()];
+                    match model.get(&key) {
+                        None => Value::NullBulk,
+                        Some(M::Str(s)) => Value::Bulk(s.clone().into()),
+                        Some(M::List(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                4 => {
+                    words = vec!["DEL".into(), key.clone()];
+                    Value::Integer(model.remove(&key).is_some() as i64)
+                }
+                5 => {
+                    words = vec!["APPEND".into(), key.clone(), arg.clone()];
+                    match model.get_mut(&key) {
+                        None => {
+                            model.insert(key.clone(), M::Str(arg.clone().into_bytes()));
+                            Value::Integer(arg.len() as i64)
+                        }
+                        Some(M::Str(s)) => {
+                            s.extend_from_slice(arg.as_bytes());
+                            Value::Integer(s.len() as i64)
+                        }
+                        Some(M::List(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                6 => {
+                    words = vec!["STRLEN".into(), key.clone()];
+                    match model.get(&key) {
+                        None => Value::Integer(0),
+                        Some(M::Str(s)) => Value::Integer(s.len() as i64),
+                        Some(M::List(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                7 => {
+                    words = vec!["INCR".into(), key.clone()];
+                    match model.get_mut(&key) {
+                        None => {
+                            model.insert(key.clone(), M::Str(b"1".to_vec()));
+                            Value::Integer(1)
+                        }
+                        Some(M::Str(s)) => {
+                            match std::str::from_utf8(s.as_slice()).unwrap_or("").parse::<i64>() {
+                                Ok(n) => match n.checked_add(1) {
+                                    Some(m) => {
+                                        *s = m.to_string().into_bytes();
+                                        Value::Integer(m)
+                                    }
+                                    None => Value::Error("would overflow".into()),
+                                },
+                                Err(_) => Value::Error("not an integer".into()),
+                            }
+                        }
+                        Some(M::List(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                8 | 9 => {
+                    let front = op == 8;
+                    words =
+                        vec![if front { "LPUSH".into() } else { "RPUSH".into() }, key.clone(), arg.clone()];
+                    match model.entry(key.clone()).or_insert_with(|| M::List(VecDeque::new())) {
+                        M::List(d) => {
+                            if front {
+                                d.push_front(arg.clone().into_bytes());
+                            } else {
+                                d.push_back(arg.clone().into_bytes());
+                            }
+                            Value::Integer(d.len() as i64)
+                        }
+                        M::Str(_) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+                10 | 11 => {
+                    let front = op == 10;
+                    words = vec![if front { "LPOP".into() } else { "RPOP".into() }, key.clone()];
+                    match model.get_mut(&key) {
+                        Some(M::List(d)) => {
+                            let v = if front { d.pop_front() } else { d.pop_back() }.unwrap();
+                            if d.is_empty() {
+                                model.remove(&key);
+                            }
+                            Value::Bulk(v.into())
+                        }
+                        Some(M::Str(_)) => Value::Error("WRONGTYPE".into()),
+                        None => Value::NullBulk,
+                    }
+                }
+                _ => {
+                    words = vec!["LLEN".into(), key.clone()];
+                    match model.get(&key) {
+                        None => Value::Integer(0),
+                        Some(M::List(d)) => Value::Integer(d.len() as i64),
+                        Some(M::Str(_)) => Value::Error("WRONGTYPE".into()),
+                    }
+                }
+            };
+            let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+            let got = run(&ctx, &mut state, &refs);
+            match (&got, &expected) {
+                (Value::Error(g), Value::Error(sub)) => assert!(
+                    g.contains(sub.as_str()),
+                    "op {i}: {refs:?} -> {got:?}, want error containing {sub:?}"
+                ),
+                _ => assert_eq!(got, expected, "op {i}: {refs:?}"),
+            }
+        }
     }
 }

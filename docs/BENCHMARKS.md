@@ -5,7 +5,12 @@ below came from one Apple M5 machine; the Engine shootout was rerun on an arm64 
 Both are single-machine observations, so re-measure before quoting numbers externally.
 `benchmarks/run.py` provides a checked-in, standard-library-only RESP2 harness for repeatable runs
 against a running server; `benchmarks/run_rfx.py` is the same harness speaking RFX
-(`docs/RFX.md`). `benchmarks/smoke.sh` is a redis-cli feature check that runs against any
+(`docs/RFX.md`). `benchmarks/compare.py` diffs a `--output` JSONL history across `--label`ed builds
+and exits non-zero on regressions past a threshold — see [OPERATIONS.md](OPERATIONS.md).
+`benchmarks/ab.sh` runs the comparison for you: it alternates the two binaries A,B,A,B… across
+rounds so machine drift hits both sides equally (sequential "all of A then all of B" runs show
+fake ±10–25% regressions on a loaded dev box). Always compare builds through `ab.sh`, never by
+eyeballing two `run.py` batches. `benchmarks/smoke.sh` is a redis-cli feature check that runs against any
 RESP-compatible server — the shared command suite passes on ReflexDB, Redis, and Dragonfly, with
 ReflexDB-only commands (`LIVE`, `SCHEDULE`, single-flight, `GETAT`) auto-detected and skipped on
 other engines.
@@ -45,38 +50,22 @@ re-run the harness against the current build before using them as a baseline.
 
 ### LIVE fan-out measurement and change
 
-Release-build runs on the Apple M5 machine described above (no persistence, one writer) measured
-`INCR live:hot` with 0 / 100 / 1,000 `LIVE GET live:hot` subscribers:
+The first fan-out design (one thread feeding subscriber sockets, before sweep coalescing and
+pacing existed) collapsed at high watcher counts — `INCR live:hot` with N
+`LIVE GET live:hot` subscribers, release build, no persistence, one writer:
 
 | Watchers | Writes/s | p50 | p99 | p999 |
 |---:|---:|---:|---:|---:|
 | 0 | 20,377 | 48 µs | 73 µs | 150 µs |
-| 100 | 907 | 1.10 ms | 1.22 ms | 1.59 ms |
-| 1,000 | 80 | 12.4 ms | 17.5 ms | 24.5 ms |
+| 100 | ~900–1,120 | ~1.1 ms | ~1.2 ms | ~1.6 ms |
+| 1,000 | ~80–93 | ~12.4 ms | ~17.5 ms | ~24.5 ms |
 
-The 0- and 100-watcher runs used two-second samples; the 1,000-watcher result is the range from two
-10-second runs. The updated harness uses one selector loop to drain all subscriber sockets; earlier
-runs used one Python thread per watcher and are not directly comparable as an A/B measurement. On
-the 1,000-watcher case, two longer 10-second runs on the measured source measured 79.6–80.6 writes/s,
-p50 12.35–12.59 ms, p99
-16.78–17.54 ms, and p999 23.33–24.54 ms, with zero errors. The 100-watcher two-second run measured 907 writes/s, p50 1.10
-ms, p99 1.20 ms, and p999 1.59 ms. The 1,000-watcher result still shows a large server-wide cost:
-this remains unsuitable for low-latency hot keys at that fan-out. The
-10-second p999 is based on only about 850 writes per run, so treat it as a diagnostic rather than
-a stable tail guarantee. Slow subscribers may skip intermediate states by design.
-
-Rerun (release Docker image, `--cpus 4` / 2 GiB, `INCR` writer + `LIVE GET`
-watchers, buffered drain, loaded host): the fan-out-thread design measured ~1,120 writes/s at
-100 watchers and still collapsed at 1,000 watchers (~93 writes/s) — a single fan-out thread
-couldn't feed 1,000 sockets at once on a 4-CPU cap.
-
-After adding sweep coalescing (`live-sweep-ms`, default 10 ms — writes landing in the gap dedup
-into one re-evaluation) and per-sweep send pacing (`live-pace-chunk`/`live-pace-ms`, defaults
-64 writes / 1 ms), the same setup measured **~2,700–2,840 writes/s at 100 watchers** (p50 ~280 µs)
-and **~1,138 writes/s at 1,000 watchers** (p50 ~484 µs) — a ~12× improvement at the 1,000-watcher
-point, at the price of subscribers seeing slightly staler intermediate values under load.
-The same pass pushed further: **~3,055–3,640 writes/s at 5,000 watchers** (p50 ~150 µs,
-p999 ~3 ms, zero errors) — fan-out now scales past the previous 1,000-watcher collapse point.
+With the current design (sweep coalescing `live-sweep-ms` 10 ms, per-sweep pacing
+`live-pace-chunk`/`live-pace-ms`, shared pre-encoded pushes): **~2,700–2,840 writes/s at 100
+watchers** (p50 ~280 µs), **~1,138 writes/s at 1,000 watchers** (p50 ~484 µs), and
+**~3,055–3,640 writes/s at 5,000 watchers** (p50 ~150 µs, p999 ~3 ms, zero errors) — past the old
+1,000-watcher collapse point. The trade: subscribers see slightly staler intermediate values
+under load (that's what the dedup window buys).
 
 ## Measurements to collect
 
@@ -141,8 +130,9 @@ Re-measure before treating these percentages as fixed; they have drifted between
 This was 129x faster than the original measurement. `ZSet` now keeps a
 `by_score: BTreeSet<(score, member)>` alongside the `HashMap`, kept in sync on each insert and
 remove. `sorted()` (backing `ZRANGE` and related commands) is O(n) instead of O(n log n). `SPOP`
-uses `indexmap::IndexSet` so selecting and removing a random member is O(1), rather than cloning
-all members into a temporary vector.
+selects and removes a random element in O(1) — `swap_remove` on the packed `Vec` under 128
+members, `indexmap::IndexSet::swap_remove_index` above it — rather than cloning all members
+into a temporary vector.
 
 ## Engine shootout: ReflexDB vs. Redis vs. Dragonfly
 
@@ -257,7 +247,8 @@ session). No regression observed versus the table above.
 
 ## Remaining measurement gaps
 
-The harness does not yet measure RSS/bytes per key, disk usage, write amplification, or recovery
-time. Add those as separate measurements before publishing external cost or durability comparisons.
-Keep each result tied to a named workload and its settings; do not generalize a win beyond what was
-measured.
+The harness does not yet measure RSS/bytes per key (`INFO`/`metrics-port` report
+`used_memory`/`used_memory_peak`, but `run.py` doesn't capture them per run), disk usage, write
+amplification, or recovery time. Add those as separate measurements before publishing external
+cost or durability comparisons. Keep each result tied to a named workload and its settings; do
+not generalize a win beyond what was measured.

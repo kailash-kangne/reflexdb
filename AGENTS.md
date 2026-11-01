@@ -81,7 +81,15 @@ shipped vs. planned. Facts not covered there, or worth re-stating for quick refe
 - `ZSet` keeps a `BTreeSet<(score, member)>` index alongside its `HashMap` so `ZPOPMIN`/
   `ZPOPMAX` are O(log n) and range scans are O(n) — see `docs/ARCHITECTURE.md` and
   `docs/BENCHMARKS.md` for the numbers behind this.
-- `keyspace::Set` is `indexmap::IndexSet<Bytes>`, not `HashSet` — `SPOP` picks a random index
-  and `swap_remove_index`s it, O(1) per pop.
+- `keyspace::Hash`/`Set`/`List` are packed small representations (`Vec`/`IndexMap`-backed)
+  under 128 elements that promote one-way to `VecDeque`/`IndexMap`/`IndexSet` on growth —
+  see `keyspace/src/collections.rs`. Serde is byte-identical to the old types (RDB/AOF safe).
 - `docs/BENCHMARKS.md` is one measurement pass on one dev machine — re-measure before quoting
   numbers externally.
+- Benchmarking two builds: use `benchmarks/ab.sh` (interleaved A/B rounds) + `compare.py`.
+  Sequential "all of A then all of B" runs drift ±10–25% on a loaded dev machine and produce
+  fake regressions; interleaving cancels it. Never trust a single run pair.
+- `parse_memory` config values accept only `gb`/`mb`/`kb` suffixes — bare `1k`/`1m` are invalid.
+- This machine runs corporate network extensions (Cisco AnyConnect socket filter, SentinelOne,
+  FireEye, Zscaler) that RST non-loopback connections to unsigned dev binaries — e2e tests must
+  assert "refused" broadly (DENIED *or* reset/timeout), never a specific reply.

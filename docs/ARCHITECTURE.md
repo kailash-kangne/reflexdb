@@ -42,9 +42,11 @@ struct Entry {
 }
 ```
 
-`Value` is a tagged enum of owned collections (`VecDeque<Bytes>`, `HashMap<Bytes,Bytes>`,
-`IndexSet<Bytes>`, `ZSet`) — always the "full" representation, no small-collection compact
-encodings. `Stream` (by far the largest variant — consumer groups, PELs, ...) is boxed
+`Value` is a tagged enum of owned collections (`List`, `Hash`, `Set`, `ZSet`). `List`/`Hash`/`Set`
+are packed small representations (`crates/keyspace/src/collections.rs`): a linear-scanned `Vec`
+below 128 elements — no per-element index/hash overhead — promoting one-way to `VecDeque`/
+`IndexMap`/`IndexSet` on growth, mirroring Redis's listpack→table conversion. `Stream` (by far the
+largest variant — consumer groups, PELs, ...) is boxed
 (`Box<Stream>`) so its size doesn't get paid by every `String`/`List`/`Hash`/`Set`/`ZSet` stored;
 serde treats `Box<T>` like `T` on the wire, so this doesn't touch the RDB/tiered-storage format.
 `Db::get` deep-clones the value (O(1) for `String` via `Bytes`' refcount, O(n) for
@@ -77,7 +79,9 @@ victim; LRU/LFU/TTL policies preserve their ordering.
   concurrent callers into O(1) syscalls. `WAITAOF` is the one blocking exception
   (`AofWriter::flush_and_fsync`, waits for a real ack).
   New AOFs store independently compressed writer batches; the loader accepts legacy RESP-only
-  logs, which are upgraded when `BGREWRITEAOF` replaces them.
+  logs, which are upgraded when `BGREWRITEAOF` replaces them. The writer tracks live file
+  size / last-rewrite base / in-flight state; the maintenance tick triggers a rewrite when
+  `auto-aof-rewrite-percentage`/`auto-aof-rewrite-min-size` thresholds pass.
 - `GETAT`/`HISTORY` versions go through the same fire-and-forget-to-a-writer-thread shape, on
   `fjall` (`persistence::history::HistoryWriter`). Age retention defaults to 24 hours (`0`
   disables it); the writer maintains a configurable per-key cap (default 200). Changing the cap
@@ -117,7 +121,7 @@ uncommitted one.
 ```rust
 trait TieringHandler: Send + Sync {
     fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String>;
-    fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)>;
+    fn fetch(&self, key: &[u8]) -> Option<(Value, Option<Duration>)>;
     fn contains(&self, key: &[u8]) -> bool;
     fn remove(&self, key: &[u8]);
     // capacity/maintenance hooks, all with safe defaults:
@@ -129,8 +133,12 @@ trait TieringHandler: Send + Sync {
 }
 ```
 
-`promote` is a one-way move, not a cache copy — a tiered key and its RAM copy never coexist.
-RAM hits avoid any blocking-pool handoff. On Tokio's multi-thread runtime, actual synchronous
+`fetch` copies, not moves — after a read-promote the key lives in RAM *and* on disk: RAM is a
+read cache over the tier's durable record, so a crash before re-eviction still recovers the last
+tiered state. Key-removal paths (`DEL`, `RENAME`, expiry, `FLUSH*`, `evict-oldest`) clear the
+tier copy too, so an older value can't resurrect. The `Store` wraps the handler in
+`DbScopedTier`, which prefixes every tier key with its DB index — the 16 logical DBs share one
+fjall instance without colliding. RAM hits avoid any blocking-pool handoff. On Tokio's multi-thread runtime, actual synchronous
 Fjall operations use `block_in_place` so Tokio can replace the occupied worker; outside that
 runtime they execute synchronously. Tier spill selection follows the configured maxmemory
 eviction policy, preserving LRU/LFU ordering where selected.

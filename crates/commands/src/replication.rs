@@ -156,6 +156,12 @@ impl ServerContext {
     /// which is fine: an offset only becomes meaningful once a replica
     /// has synced.
     pub(crate) fn replicate(&self, db_index: usize, req: &[Bytes]) {
+        // An `IDKAPPLY` capture in progress bundles these effects into the
+        // fused record instead — sending them individually too would
+        // double-apply on replicas.
+        if crate::dispatch::effect_capture_active() {
+            return;
+        }
         if self.replicas.is_empty() && !self.backlog_active.load(Ordering::Relaxed) {
             return;
         }
