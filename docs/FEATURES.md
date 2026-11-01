@@ -139,6 +139,7 @@ hour passed — deletes don't reclaim file space until compaction. `INFO` report
 ## Replication & HA
 
 - `REPLICAOF <host> <port>` / `REPLICAOF NO ONE`; `replica-read-only yes` by default.
+  `masterauth` sets the AUTH a replica sends to a `requirepass` primary on connect.
 - `PSYNC <replid> <offset>` does a **partial resync** when the offset is still covered by the
   primary's resync backlog (`partial-resync-backlog`, default `1mb`, `0` disables): the replica
   gets `+CONTINUE` plus just the commands it missed. Anything else — unknown replid, evicted or
@@ -150,13 +151,14 @@ hour passed — deletes don't reclaim file space until compaction. `INFO` report
   pub/sub slow-client timeout does not apply. Queue overflow means the replica has missed writes
   and it is disconnected after a five-second grace period.
 - `WAIT`/`WAITAOF` — write-ack sync points, offset-compare based.
+  `min-replicas-to-write` refuses writes (NOREPLICAS) while fewer than N healthy replicas
+  are connected.
 - `reflexdb-sentinel` binary: monitors primaries, votes with peer Sentinels on failure, promotes
   a replica and re-points the others. Replicas/peers are listed explicitly in
   `sentinel.conf` (no auto-discovery yet); failover always picks "the first configured replica".
 - No cluster mode (hash-slot sharding) — not planned, see [ROADMAP.md](ROADMAP.md).
-- Not implemented: diskless replication, chain replication,
-  `min-replicas-to-write`/`-max-lag` write gating, sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE` —
-  tied to cluster mode).
+- Not implemented: diskless replication, chain replication, `-max-lag` write gating,
+  sharded pub/sub (`SPUBLISH`/`SSUBSCRIBE` — tied to cluster mode).
 
 ## Security
 

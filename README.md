@@ -38,7 +38,8 @@ Your background job wrote a **wrong value at 3am**. With any other fast store, t
   read. Working set **>** RAM budget. Full tier? Your call: `reject-writes`,
   `evict-oldest`, or `no-limit`.
 - 🛡️ **Hardened** — real ACL enforcement (`+@categories`, `%R~`/`%W~` key scopes),
-  `port 0` TLS-only mode, `MISCONF` on AOF failure, `SHUTDOWN` + signal-graceful exit.
+  `protected-mode` default-on, AUTH brute-force cap, `port 0` TLS-only mode, `MISCONF`
+  on AOF failure, `SHUTDOWN` + signal-graceful exit.
 - 🔄 **Durable your way** — `profile cache | durable | replicated` presets,
   `min-replicas-to-write`, `WAIT`/`WAITAOF` ack points, compressed RDB + AOF.
 - 🔌 **Drop-in RESP** — point `redis-cli` at it. Optional **RFX** binary wire format

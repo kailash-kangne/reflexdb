@@ -121,7 +121,7 @@ uncommitted one.
 ```rust
 trait TieringHandler: Send + Sync {
     fn evict(&self, key: &Bytes, value: &Value, ttl: Option<Duration>) -> Result<(), String>;
-    fn promote(&self, key: &[u8]) -> Option<(Value, Option<Duration>)>;
+    fn fetch(&self, key: &[u8]) -> Option<(Value, Option<Duration>)>;
     fn contains(&self, key: &[u8]) -> bool;
     fn remove(&self, key: &[u8]);
     // capacity/maintenance hooks, all with safe defaults:
@@ -133,8 +133,12 @@ trait TieringHandler: Send + Sync {
 }
 ```
 
-`promote` is a one-way move, not a cache copy — a tiered key and its RAM copy never coexist.
-RAM hits avoid any blocking-pool handoff. On Tokio's multi-thread runtime, actual synchronous
+`fetch` copies, not moves — after a read-promote the key lives in RAM *and* on disk: RAM is a
+read cache over the tier's durable record, so a crash before re-eviction still recovers the last
+tiered state. Key-removal paths (`DEL`, `RENAME`, expiry, `FLUSH*`, `evict-oldest`) clear the
+tier copy too, so an older value can't resurrect. The `Store` wraps the handler in
+`DbScopedTier`, which prefixes every tier key with its DB index — the 16 logical DBs share one
+fjall instance without colliding. RAM hits avoid any blocking-pool handoff. On Tokio's multi-thread runtime, actual synchronous
 Fjall operations use `block_in_place` so Tokio can replace the occupied worker; outside that
 runtime they execute synchronously. Tier spill selection follows the configured maxmemory
 eviction policy, preserving LRU/LFU ordering where selected.

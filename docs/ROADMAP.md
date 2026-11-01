@@ -44,7 +44,8 @@ agent-memory product.
 These ideas remain possible, but are not active roadmap commitments:
 
 - Broad command parity, vector search, similarity caching, and framework-specific SDKs.
-- CRDTs, active-active replication, partial resynchronization, and expanded Sentinel behavior.
+- CRDTs, active-active replication, and expanded Sentinel behavior (partial resynchronization
+  is shipped — `PSYNC` + backlog, `partial-resync-backlog`).
 - Dependency-tracked invalidation, expiration hooks, general MVCC snapshots, and arbitrary
   time-travel reads.
 - HTTP/WebSocket gateway, proxy feature expansion, and additional binaries or dashboards.
