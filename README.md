@@ -4,6 +4,8 @@
 
 ### _The state store that lets you **watch** it change and **rewind** it._
 
+## REACT · REMEMBER · REWIND
+
 A **RESP-compatible**, **Rust-native** data store with three things Redis doesn't have:
 **live query push**, **per-key time travel**, and **RAM→disk tiering**.
 
@@ -12,7 +14,7 @@ A **RESP-compatible**, **Rust-native** data store with three things Redis doesn'
 [![Protocol: RESP](https://img.shields.io/badge/protocol-RESP2%2F3%20%2B%20RFX-green.svg)](docs/RFX.md)
 [![Benchmarks](https://img.shields.io/badge/led%20all%208%20shootout%20cells-ReflexDB-brightgreen.svg)](docs/BENCHMARKS.md)
 
-**`SET` it. `LIVE` it. `GETAT` yesterday.**
+**`LIVE` to react. `HISTORY` to remember. `GETAT` to rewind.**
 
 </div>
 
