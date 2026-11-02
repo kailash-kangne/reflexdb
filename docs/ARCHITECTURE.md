@@ -7,7 +7,7 @@ reflexdb/
 ├── crates/
 │   ├── resp/          # RESP2/RESP3 codec (hand-rolled on bytes::Bytes)
 │   ├── keyspace/       # Storage engine: String/List/Hash/Set/ZSet/Stream, TTL, eviction, tiering trait
-│   ├── commands/       # Command dispatch (~3,200 lines) — LIVE/UNLIVE, pub/sub, MULTI/EXEC+WATCH,
+│   ├── commands/       # Command dispatch (~16,600 lines across 27 files) — LIVE/UNLIVE, pub/sub, MULTI/EXEC+WATCH,
 │   │                   # scripting, single-flight, history
 │   ├── persistence/    # RDB writer/reader, AOF, history writer
 │   ├── tiered/         # fjall-backed disk tier
@@ -35,10 +35,10 @@ actively-read key early).
 ```rust
 struct Entry {
     value: Value,
-    expires_at: Option<Instant>,
-    sliding: Option<Duration>,   // EXPIRE key seconds SLIDING
-    last_access: Instant,        // LRU
-    access_count: u64,           // LFU (plain counter, no decay)
+    expires_ms: u64,        // absolute expiry in ms since EPOCH; u64::MAX = none
+    sliding_ms: u64,        // EXPIRE key seconds SLIDING reset window; 0 = off
+    last_access_secs: u32,  // LRU (whole seconds — ordering only needs precision)
+    access_count: u32,      // LFU (saturating counter, no decay)
 }
 ```
 
@@ -197,9 +197,10 @@ miss instead of blocking (no `.await` point available in that recursive context)
 RESP2 (default) and RESP3 (`HELLO 3`). Pipelining: the connection loop drains everything already
 buffered from one `read(2)` before a single `write_all`, so a pipelined burst of N commands
 becomes one syscall instead of N (with `TCP_NODELAY`). Protocol limits in
-`crates/resp/src/codec.rs`: `MAX_MULTIBULK_COUNT` (1M) and `MAX_BULK_LEN` (64 MiB) cap declared
-lengths before any allocation happens, so a bare `*99999999999\r\n` can't make the decoder try
-to allocate gigabytes.
+`crates/resp/src/codec.rs`: `MAX_MULTIBULK_COUNT` (1M) and `DEFAULT_MAX_BULK_LEN` (64 MiB,
+configurable via `proto-max-bulk-len` — the same value also bounds the total request frame)
+cap declared lengths before any allocation happens, so a bare `*99999999999\r\n` can't make
+the decoder try to allocate gigabytes.
 
 `Value::encode` (`crates/resp/src/value.rs`) writes every integer/length with a hand-rolled,
 allocation-free digit writer (`put_i64`/`put_u64`) instead of `n.to_string()` — this runs on
