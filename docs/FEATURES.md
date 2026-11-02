@@ -212,6 +212,11 @@ the write path (fire-and-forget to a batching writer thread). `history-retention
 window. A per-key cap does not limit the number of distinct keys, so total disk use can still grow
 when age retention is disabled.
 
+Write cost — every mutation persists a version, so sustained write throughput drops as
+versions accumulate (measured ~170k → ~60k ops/s over repeated 5s P16 `small-mixed` runs vs.
+a stable ~210k with `history-enabled no`; reads are unaffected). Inherent to per-version
+persistence, not a regression — set `history-enabled no` on pure-throughput deployments.
+
 **Crash guarantee** — weaker than the AOF, deliberately: `record()` is fire-and-forget, so a
 crash can lose up to ~one in-flight batch of the *newest* versions (already-committed versions
 are never lost). `GETAT`/`HISTORY` may therefore miss the last ~milliseconds of history after a

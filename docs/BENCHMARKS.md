@@ -31,6 +31,12 @@ the phase work began) showed every workload within ±1%:
 All ACL hot-path work (channel check, key-pattern operand decode) stays behind the
 `allkeys`/`allchannels` fast path — the default user pays zero extra lookups per command.
 
+One config caveat for comparing runs: `history-enabled` defaults to `yes`, and every write
+then persists a version — sustained-write benchmarks degrade as versions accumulate
+(~170k → ~60k ops/s over repeated 5s P16 `small-mixed` runs; `--history-enabled no` holds
+~210k flat). The shootout numbers above were measured with history off; match the flag
+when comparing runs.
+
 ## Reproducible harness
 
 Start a release server in one terminal, then run the harness from the repository root:
