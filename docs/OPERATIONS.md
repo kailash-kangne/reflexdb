@@ -108,6 +108,7 @@ Prometheus text exposition (HTTP/1.0, connection-close):
 
 ```conf
 metrics-port 9121
+metrics-token s3cret   # optional: scrapes must send `Authorization: Bearer s3cret`
 ```
 
 ```yaml

@@ -100,6 +100,13 @@ pub fn cmd_info(ctx: &ServerContext, _args: &[Bytes]) -> Outcome {
     out.push_str("# Persistence\r\n");
     out.push_str(&format!("rdb_last_save_time:{}\r\n", ctx.last_save()));
     out.push_str(&format!("aof_enabled:{}\r\n", ctx.aof_enabled() as i32));
+    let history_io_failed = ctx
+        .history
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|w| w.io_failed());
+    out.push_str(&format!("history_io_failed:{}\r\n", history_io_failed as i32));
     out.push_str("\r\n");
 
     out.push_str("# Replication\r\n");
@@ -316,6 +323,13 @@ pub fn render_metrics(ctx: &ServerContext) -> String {
         g(&mut m, "aof_size_bytes", aof.current_size());
         g(&mut m, "aof_rewrite_in_progress", aof.rewrite_in_progress() as u8);
     }
+    let history_failed = ctx
+        .history
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|w| w.io_failed());
+    g(&mut m, "history_io_failed", history_failed as u8);
     for i in 0..ctx.store.len() {
         if let Some(db) = ctx.store.db(i) {
             let size = db.dbsize();

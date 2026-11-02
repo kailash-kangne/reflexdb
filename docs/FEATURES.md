@@ -167,13 +167,17 @@ hour passed — deletes don't reclaim file space until compaction. `INFO` report
   (`+@read`/`-@write`/...), key-glob patterns (`~pattern`) and read/write-scoped key
   patterns (`%R~`/`%W~`). Rule precedence: explicit `+cmd`/`-cmd` over category rules over
   `allcommands`/`nocommands` (Redis applies tokens left-to-right instead).
-- Rejected rather than silently accepted: `&pattern` pub/sub channel ACLs, `(...)` selectors,
-  and unknown `+@category` names — rules that can't be enforced fail `SETUSER` loudly.
+- Pub/sub channel globs are enforced too: `&pattern`/`allchannels`/`resetchannels` gate every
+  channel operand of `(P)SUBSCRIBE`/`PUBLISH`. Rejected rather than silently accepted:
+  `(...)` selectors and unknown `+@category` names — rules that can't be enforced fail
+  `SETUSER` loudly. Denied commands and failed AUTHs are logged at `warn` level.
 - `aclfile <path>` persists users in Redis's aclfile format (`user <name> <rules>` per line):
   loaded at startup (a missing file warns and continues with in-memory users; a malformed file
   refuses to start), `ACL SAVE` writes the live table back atomically (0600), `ACL LOAD` swaps
   the table from disk. A file without `user default` loads a disabled `default` — never fails
   open. Without `aclfile`, users are in-memory only. Not implemented: `ACL LOG`/`DRYRUN`.
+  One format caveat: `ACL SAVE` writes salted password entries as `!s$…` tokens that stock
+  Redis won't parse (`#sha256` lines still load fine here).
 - TLS (`rustls`) on the client listener. Set `port 0` for TLS-only operation — plaintext is
   then never bound. `tls-auth-clients yes` + `tls-ca-cert-file` enable mTLS (clients must
   present a CA-signed certificate). `tls-replication yes` wraps the replica→primary link in
@@ -206,7 +210,14 @@ the write path (fire-and-forget to a batching writer thread). `history-retention
 24h; `0` disables age-based expiry. `history-max-versions-per-key` defaults to 200 (range
 1–1,000,000); the writer trims older versions and `GETAT`/`HISTORY` observe only the capped
 window. A per-key cap does not limit the number of distinct keys, so total disk use can still grow
-when age retention is disabled. `OBJECTAT`, `RESTOREAT`, `LIVE ... SINCE`, and `EXPIREACTION` are
+when age retention is disabled.
+
+**Crash guarantee** — weaker than the AOF, deliberately: `record()` is fire-and-forget, so a
+crash can lose up to ~one in-flight batch of the *newest* versions (already-committed versions
+are never lost). `GETAT`/`HISTORY` may therefore miss the last ~milliseconds of history after a
+crash; older versions are complete. A failed batch commit sets `history_io_failed` in
+`INFO persistence` and the `metrics-port` exposition — history loss never gates keyspace writes.
+`OBJECTAT`, `RESTOREAT`, `LIVE ... SINCE`, and `EXPIREACTION` are
 designed but not built — see [ROADMAP.md](ROADMAP.md).
 
 ## Workflow recovery — `RUN.*` / `IDEMPOTENT`
@@ -255,7 +266,8 @@ MVCC snapshot reads (`SNAPSHOT BEGIN`/`END`) and dependency-tracked invalidation
 
 - `INFO` sectioned metrics, `SLOWLOG`, `LATENCY` histograms, `MEMORY USAGE` (hand-counted, not
   allocator-reported).
-- `metrics-port` — Prometheus text exposition over plain HTTP (`GET /metrics`); see
+- `metrics-port` — Prometheus text exposition over plain HTTP (`GET /metrics`);
+  `metrics-token` requires `Authorization: Bearer <token>` when set; see
   [OPERATIONS.md](OPERATIONS.md).
 - `auto-aof-rewrite-percentage`/`auto-aof-rewrite-min-size` — automatic AOF compaction on
   growth (defaults 100 / 64mb), plus manual `BGREWRITEAOF`.

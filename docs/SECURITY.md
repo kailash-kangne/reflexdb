@@ -25,11 +25,17 @@ Read this before deploying it anywhere traffic you don't control can reach.
 - Unauthenticated connections may only run `AUTH`/`HELLO`/`QUIT`/`RESET`; everything else
   gets `NOAUTH` (`dispatch.rs`).
 - ACL: per-user command allow/deny (`+cmd`/`-cmd`/`allcommands`/`nocommands`), command
-  categories (`+@read`, `-@write`, ...), key globs (`~pattern`), and read/write-scoped
-  patterns (`%R~`/`%W~`). Rules that can't be enforced (`&channel` patterns, `(...)`
-  selectors, unknown category names) are **rejected** at `SETUSER` time rather than silently
-  accepted. Passwords stored as SHA-256 hashes; the `default` user mirrors plain
-  `requirepass` semantics.
+  categories (`+@read`, `-@write`, ...), key globs (`~pattern`), read/write-scoped
+  patterns (`%R~`/`%W~`), and pub/sub channel globs (`&pattern`/`allchannels`/
+  `resetchannels`, enforced on every channel operand of `(P)SUBSCRIBE`/`PUBLISH`).
+  Rules that can't be enforced (`(...)` selectors, unknown category names) are
+  **rejected** at `SETUSER` time rather than silently accepted. Passwords are stored
+  as salted, iterated SHA-256 (`s$` entries written by `>password` and `requirepass`);
+  legacy `#sha256` aclfile entries still verify so stock Redis files load. The
+  `default` user mirrors plain `requirepass` semantics.
+- Denied commands and failed authentications are logged at `warn` level (user,
+  command, reason) — scrape the server log for an audit trail; `ACL LOG` isn't
+  implemented.
 - Key-pattern checks decode the key operands of every known command shape
   (`acl::command_keys`), including multi-key and `EVAL`/`SORT`/`XREAD` layouts.
 - Connection cap: `maxclients` semaphore; excess sockets are dropped at accept.
@@ -43,15 +49,19 @@ Read this before deploying it anywhere traffic you don't control can reach.
 - **Bounded `AUTH` attempts** — 16 failed authentications on one connection drop the socket,
   capping online brute force per socket (an attacker can still reconnect; use long passwords
   (`ACL GENPASS`) and network-level controls). Passwords are also masked in `CONFIG GET`.
-- **Passwords are unsalted SHA-256** — Redis-compatible but weak against offline attacks if
-  an attacker reads process memory or `ACL LIST`/`GETUSER` output. Treat hash disclosure as
-  password disclosure.
+- **Password hashing is still SHA-256-based** — salted and iterated (`s$` format), which
+  kills rainbow tables and raises offline-crack cost, but it is not a memory-hard KDF.
+  Legacy `#sha256` aclfile entries still verify (needed to read stock Redis files) and are
+  unsalted — rewrite them with `ACL SETUSER … resetpass >newpass`. `ACL SAVE` emits `!s$…`
+  tokens that stock Redis will not parse. Treat hash disclosure as password disclosure
+  regardless.
 - **ACLs persist only via `aclfile`** — without the directive users are in-memory and vanish
-  on restart; `ACL SAVE`/`LOAD` exist but there is no `ACL LOG` audit trail of denied commands.
+  on restart; `ACL SAVE`/`LOAD` exist.
 - **Plaintext listener is on by default** — TLS is additive (`tls-port`); set `port 0`
   explicitly for TLS-only.
-- **No channel-pattern ACLs** — pub/sub channel restrictions (`&pattern`) are rejected, not
-  enforced; any authenticated user can subscribe to any channel.
+- **Metrics listener is separate and unauthenticated by default** — `metrics-port` serves
+  keyspace/statistics to anyone who can reach it. Set `metrics-token` to require
+  `Authorization: Bearer <token>` (401 otherwise), or keep it loopback/network-guarded.
 - **`KEYS`/`CONFIG`/`ACL` are @dangerous but enabled for `allcommands` users** — grant them
   deliberately.
 - **One writer per data dir** — enforced: startup takes an exclusive `flock` on

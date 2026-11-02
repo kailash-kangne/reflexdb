@@ -4,16 +4,16 @@
 //!
 //! Enforced: command-level allow/deny (`+cmd`/`-cmd`/`allcommands`/
 //! `nocommands`), command categories (`+@read`, `-@write`, ... — see
-//! `command_categories`), key globs (`~pattern`/`allkeys`), and
-//! read/write-scoped key patterns (`%R~pattern`/`%W~pattern`).
+//! `command_categories`), key globs (`~pattern`/`allkeys`), read/write-
+//! scoped key patterns (`%R~pattern`/`%W~pattern`), and pub/sub channel
+//! globs (`&pattern`/`allchannels`/`resetchannels`).
 //! Rule precedence: explicit `+cmd`/`-cmd` beats categories, categories beat
 //! `allcommands`/`nocommands`; this differs from Redis's last-token-wins
 //! order but keeps `+get -@read` (grant one read) unsurprising.
 //!
-//! Rejected rather than silently accepted: pub/sub channel patterns
-//! (`&pattern`), `(...)` selectors, and unknown `+@category` names — a
-//! configuration that can't be enforced must fail loudly.
-//! `ACL LOG`/`DRYRUN`/`HELP` aren't implemented.
+//! Rejected rather than silently accepted: `(...)` selectors and unknown
+//! `+@category` names — a configuration that can't be enforced must fail
+//! loudly. `ACL LOG`/`DRYRUN`/`HELP` aren't implemented.
 //!
 //! Persistence: the `aclfile` config directive names a file in Redis's
 //! aclfile format (`user <name> <rules>` per line — exactly what
@@ -41,6 +41,10 @@ use crate::pattern;
 pub struct AclUser {
     pub enabled: bool,
     pub nopass: bool,
+    /// Stored entries are a bare 64-char SHA-256 hex digest (legacy, what
+    /// `#` aclfile rules carry) or `s$<iters>$<salt_hex>$<hash_hex>` —
+    /// iterated salted SHA-256, what `>password` writes. See
+    /// `hash_password`/`password_matches`.
     pub password_hashes: HashSet<String>,
     pub allkeys: bool,
     /// `~pattern` — read and write access.
@@ -49,6 +53,9 @@ pub struct AclUser {
     pub read_patterns: Vec<String>,
     /// `%W~pattern` — write-only access.
     pub write_patterns: Vec<String>,
+    pub allchannels: bool,
+    /// `&pattern` — channel globs checked on (P)SUBSCRIBE/PUBLISH.
+    pub channel_patterns: Vec<String>,
     pub allcommands: bool,
     pub allowed_commands: HashSet<String>,
     pub denied_commands: HashSet<String>,
@@ -65,12 +72,14 @@ impl AclUser {
             enabled: true,
             nopass: requirepass.is_none(),
             password_hashes: requirepass
-                .map(|p| [sha256_hex(p.as_bytes())].into_iter().collect())
+                .map(|p| [hash_password(p.as_bytes())].into_iter().collect())
                 .unwrap_or_default(),
             allkeys: true,
             key_patterns: Vec::new(),
             read_patterns: Vec::new(),
             write_patterns: Vec::new(),
+            allchannels: true,
+            channel_patterns: Vec::new(),
             allcommands: true,
             allowed_commands: HashSet::new(),
             denied_commands: HashSet::new(),
@@ -105,6 +114,67 @@ impl AclUser {
         self.allkeys
             || self.key_patterns.iter().chain(scoped.iter()).any(|p| pattern::matches(p.as_bytes(), key))
     }
+
+    pub fn can_access_channel(&self, channel: &[u8]) -> bool {
+        self.allchannels || self.channel_patterns.iter().any(|p| pattern::matches(p.as_bytes(), channel))
+    }
+
+    pub fn check_password(&self, password: &[u8]) -> bool {
+        self.nopass || self.password_hashes.iter().any(|h| password_matches(h, password))
+    }
+}
+
+/// Rounds of SHA-256 for `s$` stored entries. AUTH is a rare, per-
+/// connection operation, so 10k rounds (~ms) costs nothing an attacker
+/// can't trivially absorb but multiplies offline-crack cost on a leaked
+/// aclfile by the same factor. The count travels inside the entry, so it
+/// can be raised later without breaking existing hashes.
+const PASSWORD_HASH_ITERATIONS: u32 = 10_000;
+
+fn iterated_sha256(password: &[u8], salt: &[u8], iterations: u32) -> String {
+    let mut digest = Sha256::digest([salt, password].concat());
+    for _ in 1..iterations {
+        digest = Sha256::digest(digest);
+    }
+    to_hex(&digest)
+}
+
+fn to_hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn from_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect()
+}
+
+/// Salt + iterate a password into the `s$<iters>$<salt>$<hash>` stored form.
+pub fn hash_password(password: &[u8]) -> String {
+    let mut rng = rand::thread_rng();
+    let salt: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
+    format!(
+        "s${PASSWORD_HASH_ITERATIONS}${}${}",
+        to_hex(&salt),
+        iterated_sha256(password, &salt, PASSWORD_HASH_ITERATIONS)
+    )
+}
+
+/// Verify `password` against one stored entry: `s$` entries recompute the
+/// iterated hash; anything else is compared as a legacy bare SHA-256.
+fn password_matches(stored: &str, password: &[u8]) -> bool {
+    if let Some(rest) = stored.strip_prefix("s$") {
+        let mut parts = rest.splitn(3, '$');
+        let (Some(iters), Some(salt), Some(hash)) = (parts.next(), parts.next(), parts.next()) else {
+            return false;
+        };
+        let (Ok(iters), Some(salt)) = (iters.parse::<u32>(), from_hex(salt)) else {
+            return false;
+        };
+        return iterated_sha256(password, &salt, iters) == *hash;
+    }
+    *stored == sha256_hex(password)
 }
 
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -683,17 +753,32 @@ pub fn authorize(user: &AclUser, name: &str, args: &[Bytes]) -> Result<(), Strin
             name.to_ascii_lowercase()
         ));
     }
-    // `allkeys` (the default user) can skip extracting key operands — the
-    // per-key check below would pass unconditionally anyway. Saves a Vec
-    // allocation plus the category lookup on every command.
-    if user.allkeys {
-        return Ok(());
+    // `allkeys`/`allchannels` (the default user) skip extracting operands —
+    // the per-name checks below would pass unconditionally anyway. Saves a
+    // Vec allocation plus the category lookup on every command.
+    if !user.allkeys {
+        let write = command_categories(name) & cat::WRITE != 0;
+        if command_keys(name, args).into_iter().any(|key| !user.can_access_key(&key, write)) {
+            return Err("NOPERM No permissions to access a key for this user".into());
+        }
     }
-    let write = command_categories(name) & cat::WRITE != 0;
-    if command_keys(name, args).into_iter().any(|key| !user.can_access_key(&key, write)) {
-        return Err("NOPERM No permissions to access a key for this user".into());
+    if !user.allchannels && command_channels(name, args).into_iter().any(|ch| !user.can_access_channel(&ch)) {
+        return Err("NOPERM No permissions to access a channel for this user".into());
     }
     Ok(())
+}
+
+/// Channel operands for pub/sub commands: every arg is a channel (or
+/// channel glob for `P*SUBSCRIBE`), except `PUBLISH`/`SPUBLISH` where the
+/// channel is arg[0]. Non-pub/sub commands yield nothing.
+fn command_channels(name: &str, args: &[Bytes]) -> Vec<Bytes> {
+    match name {
+        "SUBSCRIBE" | "UNSUBSCRIBE" | "PSUBSCRIBE" | "PUNSUBSCRIBE" | "SSUBSCRIBE" | "SUNSUBSCRIBE" => {
+            args.to_vec()
+        }
+        "PUBLISH" | "SPUBLISH" => args.first().cloned().into_iter().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn new_acl_users(requirepass: Option<&str>) -> DashMap<String, AclUser> {
@@ -925,6 +1010,14 @@ fn apply_setuser_tokens(user: &mut AclUser, tokens: &[Bytes]) -> Result<(), Stri
                 user.read_patterns.clear();
                 user.write_patterns.clear();
             }
+            "allchannels" => {
+                user.allchannels = true;
+                user.channel_patterns.clear();
+            }
+            "resetchannels" => {
+                user.allchannels = false;
+                user.channel_patterns.clear();
+            }
             "resetkeys" => {
                 user.allkeys = false;
                 user.key_patterns.clear();
@@ -948,10 +1041,11 @@ fn apply_setuser_tokens(user: &mut AclUser, tokens: &[Bytes]) -> Result<(), Stri
             "reset" => *user = AclUser::default(),
             _ if text.starts_with('>') => {
                 user.nopass = false;
-                user.password_hashes.insert(sha256_hex(text[1..].as_bytes()));
+                user.password_hashes.insert(hash_password(text[1..].as_bytes()));
             }
             _ if text.starts_with('<') => {
-                user.password_hashes.remove(&sha256_hex(text[1..].as_bytes()));
+                let pass = text[1..].as_bytes();
+                user.password_hashes.retain(|h| !password_matches(h, pass));
             }
             _ if text.starts_with('#') => {
                 user.nopass = false;
@@ -960,6 +1054,16 @@ fn apply_setuser_tokens(user: &mut AclUser, tokens: &[Bytes]) -> Result<(), Stri
             "!" => {
                 user.nopass = false;
                 user.password_hashes.clear();
+            }
+            _ if text.starts_with('!') => {
+                let entry = &text[1..];
+                if !entry.starts_with("s$") || entry.split('$').count() != 4 {
+                    return Err(format!(
+                        "ERR Error in ACL SETUSER modifier '{text}': invalid salted-hash entry"
+                    ));
+                }
+                user.nopass = false;
+                user.password_hashes.insert(entry.to_string());
             }
             _ if text.starts_with('~') => {
                 user.allkeys = false;
@@ -1004,9 +1108,8 @@ fn apply_setuser_tokens(user: &mut AclUser, tokens: &[Bytes]) -> Result<(), Stri
                 user.denied_commands.insert(cmd);
             }
             _ if text.starts_with('&') => {
-                return Err(format!(
-                    "ERR Error in ACL SETUSER modifier '{text}': channel patterns are not supported"
-                ));
+                user.allchannels = false;
+                user.channel_patterns.push(text[1..].to_string());
             }
             _ if text.starts_with('(') => {
                 return Err(format!(
@@ -1024,16 +1127,21 @@ fn describe_user(name: &str, user: &AclUser) -> String {
     let pass = if user.nopass {
         "nopass".to_string()
     } else {
-        let mut hashes: Vec<String> = user.password_hashes.iter().map(|h| format!("#{h}")).collect();
+        let mut hashes: Vec<String> = user
+            .password_hashes
+            .iter()
+            .map(|h| if h.starts_with("s$") { format!("!{h}") } else { format!("#{h}") })
+            .collect();
         hashes.sort();
         hashes.join(" ")
     };
     let keys = describe_keys(user);
+    let channels = describe_channels(user);
     let commands = describe_commands(user);
     // Skip empty sections (e.g. a password-less non-nopass user, or a
     // resetkeys user) instead of emitting double spaces.
     let mut line = format!("user {name} {status}");
-    for section in [pass, keys, commands] {
+    for section in [pass, keys, channels, commands] {
         if !section.is_empty() {
             line.push(' ');
             line.push_str(&section);
@@ -1053,6 +1161,13 @@ fn describe_keys(user: &AclUser) -> String {
         .chain(user.write_patterns.iter().map(|p| format!("%W~{p}")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn describe_channels(user: &AclUser) -> String {
+    if user.allchannels {
+        return "&*".to_string();
+    }
+    user.channel_patterns.iter().map(|p| format!("&{p}")).collect::<Vec<_>>().join(" ")
 }
 
 fn describe_commands(user: &AclUser) -> String {
@@ -1088,7 +1203,7 @@ fn describe_user_map(user: &AclUser) -> Value {
         ),
         (Value::bulk("commands"), Value::bulk(describe_commands(user))),
         (Value::bulk("keys"), Value::bulk(describe_keys(user))),
-        (Value::bulk("channels"), Value::bulk("")),
+        (Value::bulk("channels"), Value::bulk(describe_channels(user))),
     ])
 }
 
@@ -1187,7 +1302,7 @@ mod tests {
         assert!(parse_acl_content("user alice on ~* +@all\nbogus line\n").is_err());
         assert!(parse_acl_content("user\n").is_err());
         assert!(parse_acl_content("user alice on +@nosuchcat\n").is_err());
-        assert!(parse_acl_content("user alice &chan\n").is_err());
+        assert!(parse_acl_content("user alice (selectors)\n").is_err());
     }
 
     /// `auth_required` tracks the *effective* default user: an aclfile that
@@ -1208,5 +1323,63 @@ mod tests {
         let mut st = ClientState::new(false);
         assert!(matches!(run(&ctx, &mut st, &["ACL", "SAVE"]), Value::Error(_)));
         assert!(matches!(run(&ctx, &mut st, &["ACL", "LOAD"]), Value::Error(_)));
+    }
+
+    /// `&pattern` rules gate every channel operand of (P)SUBSCRIBE and
+    /// PUBLISH; the `allchannels`/`resetchannels` tokens reset the set.
+    #[test]
+    fn channel_patterns_gate_pubsub() {
+        fn errs(ctx: &ServerContext, state: &mut ClientState, words: &[&str]) -> bool {
+            let req: Vec<Bytes> = words.iter().map(|w| Bytes::from(w.to_string())).collect();
+            match dispatch(ctx, state, req) {
+                Outcome::Reply(Value::Error(_)) => true,
+                Outcome::Multi(vs) => vs.iter().any(|v| matches!(v, Value::Error(_))),
+                _ => false,
+            }
+        }
+        let ctx = ServerContext::new(1, None);
+        let mut admin = ClientState::new(false);
+        assert_eq!(
+            run(&ctx, &mut admin, &["ACL", "SETUSER", "sub", "on", ">pw", "+@all", "&events:*"]),
+            Value::ok()
+        );
+        let mut sub = ClientState::new(false);
+        assert_eq!(run(&ctx, &mut sub, &["AUTH", "sub", "pw"]), Value::ok());
+        assert!(!errs(&ctx, &mut sub, &["PUBLISH", "events:a", "m"]));
+        assert!(errs(&ctx, &mut sub, &["PUBLISH", "metrics:a", "m"]));
+        assert!(!errs(&ctx, &mut sub, &["PSUBSCRIBE", "events:*"]));
+        assert!(errs(&ctx, &mut sub, &["SUBSCRIBE", "other"]));
+
+        run(&ctx, &mut admin, &["ACL", "SETUSER", "sub", "allchannels"]);
+        let mut sub2 = ClientState::new(false);
+        run(&ctx, &mut sub2, &["AUTH", "sub", "pw"]);
+        assert!(!errs(&ctx, &mut sub2, &["PUBLISH", "anything", "m"]));
+    }
+
+    /// `>pass` stores an `s$` salted entry that AUTH verifies and `<pass`
+    /// removes; legacy `#sha256` aclfile entries still authenticate.
+    #[test]
+    fn salted_passwords_verify_remove_and_load_legacy() {
+        let ctx = ServerContext::new(1, None);
+        let mut admin = ClientState::new(false);
+        run(&ctx, &mut admin, &["ACL", "SETUSER", "u", "on", ">s3cret"]);
+        let stored = ctx.acl_users.get("u").unwrap().password_hashes.iter().next().unwrap().clone();
+        assert!(stored.starts_with("s$"), "{stored}");
+
+        let mut u = ClientState::new(false);
+        assert_eq!(run(&ctx, &mut u, &["AUTH", "u", "s3cret"]), Value::ok());
+        let mut bad = ClientState::new(false);
+        assert!(matches!(run(&ctx, &mut bad, &["AUTH", "u", "nope"]), Value::Error(_)));
+
+        run(&ctx, &mut admin, &["ACL", "SETUSER", "u", "<s3cret"]);
+        assert!(ctx.acl_users.get("u").unwrap().password_hashes.is_empty());
+
+        // A stock-Redis aclfile line (`#` = unsalted sha256) loads + verifies.
+        let line = format!("user l on #{} ~* +@all\n", sha256_hex(b"pw"));
+        let (name, legacy) = parse_acl_content(&line).unwrap().remove(0);
+        assert_eq!(name, "l");
+        ctx.acl_users.insert(name, legacy);
+        let mut l = ClientState::new(false);
+        assert_eq!(run(&ctx, &mut l, &["AUTH", "l", "pw"]), Value::ok());
     }
 }

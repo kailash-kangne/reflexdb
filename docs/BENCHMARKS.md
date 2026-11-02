@@ -15,6 +15,22 @@ RESP-compatible server — the shared command suite passes on ReflexDB, Redis, a
 ReflexDB-only commands (`LIVE`, `SCHEDULE`, single-flight, `GETAT`) auto-detected and skipped on
 other engines.
 
+Latest verified state: `ab.sh` (5 interleaved rounds, `--workloads small-mixed,hot-key`,
+16 clients, pipelines 1 and 16) comparing the current tree — compact collection
+representations, channel-pattern ACLs, salted password hashing, `metrics-token`,
+auto-AOF-rewrite, history flush acknowledgements — against `ea5fcb9` (the commit before
+the phase work began) showed every workload within ±1%:
+
+| Workload | Pipeline | Base ops/s | Head ops/s | Delta |
+|---|---:|---:|---:|---:|
+| hot-key | 1 | 24,557 | 24,449 | −0.4% |
+| hot-key | 16 | 179,154 | 180,530 | +0.8% |
+| small-mixed | 1 | 24,879 | 24,751 | −0.5% |
+| small-mixed | 16 | 151,412 | 151,979 | +0.4% |
+
+All ACL hot-path work (channel check, key-pattern operand decode) stays behind the
+`allkeys`/`allchannels` fast path — the default user pays zero extra lookups per command.
+
 ## Reproducible harness
 
 Start a release server in one terminal, then run the harness from the repository root:
@@ -142,10 +158,9 @@ variance is higher; only relative placement is meaningful. ReflexDB's image was 
 working tree — lazy shared-writer fix, `live-sweep-ms`/pacing changes, and the security/
 durability hardening (per-command ACL enforcement, `MISCONF` AOF-failure gate,
 `min-replicas-to-write`, `tiered-overflow-policy` capacity check, `SHUTDOWN`/signal handling);
-a separate host-side A/B against the previous commit showed none of those per-command gates
-cost measurable latency, and the `native` rows — ReflexDB only, uncapped release build of the
-latest tree (partial-resync/`PSYNC` backlog, `ROLE`, command cuts; `live-fanout` measured
-7,986 writes/s there) — show the same. Medians of 3 runs:
+later A/B passes against `ea5fcb9` confirmed none of those gates cost measurable latency
+(see the "Latest verified state" table above), and the `native` rows — ReflexDB only,
+uncapped release build of that tree — show the same. Medians of 3 runs:
 
 | Workload | CPUs | Pipeline 1: Redis / Dragonfly / ReflexDB | Pipeline 16: Redis / Dragonfly / ReflexDB |
 |---|---:|---:|---:|

@@ -287,6 +287,48 @@ fn backup_artifacts_restore_in_a_fresh_dir() {
     }
 }
 
+/// `BGREWRITEAOF` racing a `kill -9`: the rewrite builds `base + mirrored
+/// writes` in a temp file and atomically swaps it in — killing mid-window
+/// must leave either the complete old file or the complete new one. All
+/// writes acked under `appendfsync always` must survive either way.
+#[test]
+fn aof_rewrite_in_flight_then_sigkill_recovers_everything() {
+    let _serial = serial();
+    let dir = temp_dir("aof-rewrite-kill");
+    let port = free_port();
+    let aof_args = ["--appendonly", "yes", "--appendfsync", "always"];
+    let mut server = spawn(port, &dir, &aof_args);
+
+    // Enough keys that building the rewrite base takes real time, so the
+    // SIGKILL actually lands inside the rewrite window.
+    let n_base = 2_000;
+    {
+        let mut c = Client::connect(port);
+        for i in 0..n_base {
+            assert_eq!(c.cmd(&["SET", &format!("k{i}"), "v"]), Reply::Simple("OK".into()));
+        }
+        assert!(matches!(
+            c.cmd(&["BGREWRITEAOF"]),
+            Reply::Simple(s) if s.contains("rewriting")
+        ));
+        // Writes after BeginRewrite are mirrored into the rewrite buffer;
+        // they must appear in whichever file wins the race.
+        let n_after = 20;
+        for i in 0..n_after {
+            assert_eq!(c.cmd(&["SET", &format!("w{i}"), "x"]), Reply::Simple("OK".into()));
+        }
+        // Kill while the rewrite is most likely still building the base.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        sigkill(&mut server);
+    }
+
+    let mut server = spawn(port, &dir, &aof_args);
+    let mut c = Client::connect(port);
+    assert_eq!(c.cmd(&["DBSIZE"]), Reply::Int((n_base + 20) as i64));
+    sigkill(&mut server);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `appendfsync no` + a burst of writes killed mid-flight: the torn tail
 /// must not stop startup — replay keeps the complete prefix and carries on.
 #[test]

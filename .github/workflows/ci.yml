@@ -33,8 +33,6 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Windows is experimental — its failure doesn't fail the workflow.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -54,13 +52,12 @@ jobs:
       # against deny.toml at the repo root.
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # Builds the fuzz scaffold (fuzz/) against libFuzzer — a compile-only
-  # smoke test, not an actual fuzzing run, so a new fuzz target that
-  # doesn't even build gets caught in CI instead of only at `cargo fuzz
-  # run` time. Needs nightly: cargo-fuzz's sanitizer instrumentation isn't
-  # available on stable.
-  fuzz-build:
-    name: fuzz (build only)
+  # Builds the fuzz scaffold and actually fuzzes each target for 90s —
+  # short enough for PRs, long enough to smoke out crashes in the RESP
+  # codec and RESTORE deserializer. Needs nightly: cargo-fuzz's sanitizer
+  # instrumentation isn't available on stable.
+  fuzz:
+    name: fuzz
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,15 +66,30 @@ jobs:
         with:
           workspaces: fuzz -> target
       - run: cargo install cargo-fuzz --locked
-      - run: cargo fuzz build --fuzz-dir fuzz
+      - run: |
+          for target in resp_decode restore_deserialize; do
+            cargo fuzz run "$target" --fuzz-dir fuzz -- -max_total_time=90 -print_final_stats=1
+          done
+
+  # Crash-recovery + soak coverage the unit matrix doesn't emphasize:
+  # SIGKILL during writes/rewrites, restart+replay, then a 60s mixed-load
+  # soak ending in SIGKILL — every acked write must survive.
+  durability:
+    name: durability (crash + soak)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p reflexdb-server --test crash_recovery --test partial_resync
+        env:
+          REFLEXDB_SOAK_SECS: "60"
 
   # Short server bench per OS — CI runners are shared VMs, so absolute
   # numbers are noisy; use them to compare platforms, not to quote.
   bench:
     name: bench (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Windows is experimental — its failure doesn't fail the workflow.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:

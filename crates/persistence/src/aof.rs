@@ -508,10 +508,17 @@ fn writer_loop(
                         rewrite = Some(RewriteState { buffer: Vec::new(), last_db: None });
                     }
                 }
-                Job::FinishRewrite { base, path } => match rewrite.take() {
-                    Some(rw) => pending_finish = Some((base, rw, path)),
-                    None => tracing::warn!("no AOF rewrite in progress; ignoring FinishRewrite"),
-                },
+                Job::FinishRewrite { base, path } => {
+                    // Keep `rewrite` alive until the swap below: writes
+                    // queued *after* FinishRewrite (same or later batch)
+                    // still go to the doomed old file, so they must keep
+                    // mirroring or the swap would silently drop them.
+                    if rewrite.is_none() {
+                        tracing::warn!("no AOF rewrite in progress; ignoring FinishRewrite");
+                    } else {
+                        pending_finish = Some((base, path));
+                    }
+                }
             }
         }
 
@@ -547,7 +554,18 @@ fn writer_loop(
         // landed — otherwise a batch that contains both ordinary writes
         // and the `FinishRewrite` that follows them could race the rename
         // against `file.write_all` above still targeting the old file.
-        if let Some((mut base, rw, path)) = pending_finish {
+        // The mirror is taken here, not at `FinishRewrite`: any writes it
+        // captured after that job are part of this batch's `buf` and are
+        // exactly the ones the swap would otherwise lose.
+        if let Some((mut base, path)) = pending_finish {
+            // `rewrite` can only be gone here if the mirror hit its byte
+            // limit after FinishRewrite — swapping then would lose the
+            // unmirrored writes, so keep the old file instead.
+            let Some(rw) = rewrite.take() else {
+                tracing::warn!("AOF rewrite mirror was cancelled; keeping the old file");
+                rewriting.store(false, Ordering::Relaxed);
+                continue;
+            };
             base.extend_from_slice(&rw.buffer);
             match swap_aof_file(&path, &base) {
                 Ok(new_file) => {

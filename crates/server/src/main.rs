@@ -139,6 +139,11 @@ async fn main() -> std::io::Result<()> {
                 ("tls-ca-cert-file".into(), path(&cfg.tls_ca_cert_file)),
                 ("tls-auth-clients".into(), yn(cfg.tls_auth_clients)),
                 ("tls-replication".into(), yn(cfg.tls_replication)),
+                ("metrics-port".into(), cfg.metrics_port.to_string()),
+                (
+                    "metrics-token".into(),
+                    cfg.metrics_token.as_ref().map(|_| "******".to_string()).unwrap_or_default(),
+                ),
                 ("history-dir".into(), cfg.history_dir_path().display().to_string()),
                 ("history-retention-ms".into(), cfg.history_retention_ms.to_string()),
                 ("history-max-versions-per-key".into(), cfg.history_max_versions_per_key.to_string()),
@@ -414,8 +419,9 @@ async fn main() -> std::io::Result<()> {
         let ctx = ctx.clone();
         let bind = cfg.bind.clone();
         let port = cfg.metrics_port;
+        let token = cfg.metrics_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_metrics_listener(ctx, &bind, port).await {
+            if let Err(e) = run_metrics_listener(ctx, &bind, port, token).await {
                 tracing::error!(error = %e, "metrics listener failed");
             }
         });
@@ -491,14 +497,22 @@ async fn deny_protected(socket: &mut tokio::net::TcpStream, peer: &std::net::Soc
 
 /// `metrics-port` listener: minimal HTTP/1.0 — read one request (any
 /// path answers the same exposition, so `GET /` and `GET /metrics` both
-/// work), respond, close. No keep-alive, no auth — loopback-bound or
-/// network-guarded by the operator.
-async fn run_metrics_listener(ctx: Arc<ServerContext>, bind: &str, port: u16) -> std::io::Result<()> {
+/// work), respond, close. No keep-alive. `metrics-token` optionally
+/// requires `Authorization: Bearer <token>`; with no token configured the
+/// port is meant for loopback or a network-guarded boundary.
+async fn run_metrics_listener(
+    ctx: Arc<ServerContext>,
+    bind: &str,
+    port: u16,
+    token: Option<String>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(format!("{bind}:{port}")).await?;
     tracing::info!(bind, port, "metrics endpoint listening (Prometheus /metrics)");
+    let expected = token.map(|t| format!("Bearer {t}"));
     loop {
         let (mut socket, _peer) = listener.accept().await?;
         let ctx = ctx.clone();
+        let expected = expected.clone();
         tokio::spawn(async move {
             // Bound the request read — a scrape is one small request;
             // anything larger is not a scraper.
@@ -520,6 +534,21 @@ async fn run_metrics_listener(ctx: Arc<ServerContext>, bind: &str, port: u16) ->
             };
             if !headers_done {
                 return;
+            }
+            if let Some(expected) = &expected {
+                let authorized = String::from_utf8_lossy(&req[..filled]).lines().any(|line| {
+                    line.split_once(':').is_some_and(|(name, value)| {
+                        name.trim().eq_ignore_ascii_case("authorization") && value.trim() == expected
+                    })
+                });
+                if !authorized {
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.0 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                    return;
+                }
             }
             let body = commands::render_metrics(&ctx);
             let resp = format!(
