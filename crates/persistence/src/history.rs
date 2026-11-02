@@ -35,12 +35,16 @@
 //! `record()` is fire-and-forget: a version is durable only once the
 //! writer thread's batch commits. A crash (or `kill -9`) can therefore
 //! lose up to ~one in-flight batch of the *newest* versions — never
-//! already-committed ones. `GETAT`/`HISTORY` may thus report the most
-//! recent ~milliseconds of history as missing after a crash; older
-//! versions are complete. `flush()` blocks until pending records have
-//! been through a commit and returns whether it landed; `io_failed()`
-//! reports whether the last commit failed (surfaced via `INFO`/
-//! `metrics-port` since `record()` itself can't return the error).
+//! already-committed ones. If the writer can't keep up with sustained
+//! writes the bounded queue fills and versions are *dropped* (counted in
+//! `history_dropped`) rather than throttling the keyspace — history must
+//! never gate keyspace writes. `GETAT`/`HISTORY` may thus report the most
+//! recent ~milliseconds of history as missing after a crash, or gaps
+//! under sustained overload; older committed versions are complete.
+//! `flush()` blocks until pending records have been through a commit and
+//! returns whether it landed; `io_failed()` reports whether the last
+//! commit failed (surfaced via `INFO`/`metrics-port` since `record()`
+//! itself can't return the error).
 //!
 //! # On-disk key layout
 //!
@@ -65,7 +69,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -110,6 +114,8 @@ pub struct HistoryWriter {
     /// `aof`'s `io_failed`, all we can do is report it (INFO/metrics)
     /// rather than pretend it landed.
     io_failed: Arc<AtomicBool>,
+    /// Versions dropped on a full queue — the writer couldn't keep up.
+    dropped: Arc<AtomicU64>,
     // Keeps the writer thread alive for the program's lifetime.
     _worker: thread::JoinHandle<()>,
 }
@@ -164,6 +170,7 @@ impl HistoryWriter {
             max_versions_per_key,
             write_lock,
             io_failed,
+            dropped: Arc::new(AtomicU64::new(0)),
             _worker: worker,
         })
     }
@@ -175,11 +182,25 @@ impl HistoryWriter {
     /// `HISTORY`'s existing nil-means-deleted convention.
     pub fn record(&self, db_index: usize, key: Bytes, ts_ms: u64, value: Option<Bytes>) {
         let job = Job::Record { db_index: db_index as u16, key, ts_ms, value };
-        // The writer thread only ever exits if the process is shutting
-        // down (it loops for the program's lifetime otherwise); a failed
-        // send just means "too late to record this one," not a bug worth
+        // try_send, not send: a blocking send would throttle the whole
+        // write path down to history-writer speed once the queue fills,
+        // which is exactly what "never gates keyspace writes" forbids.
+        // A full queue drops the version and counts it — surfaced via
+        // `history_dropped` in INFO/metrics. A disconnected writer means
+        // shutdown, and is also "too late to record," not a bug worth
         // surfacing on every write's hot path.
-        let _ = self.tx.lock().unwrap().send(job);
+        match self.tx.lock().unwrap().try_send(job) {
+            Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Versions dropped because the writer queue was full — surfaced via
+    /// `history_dropped` in INFO/`metrics-port`.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Blocks until every `record()` call made before this one has been
@@ -443,6 +464,12 @@ fn compact_history(
 /// Trim a key after its write batch commits. The common case removes only a
 /// small excess; chunking also bounds temporary memory when upgrading a key
 /// that accumulated many versions under an older configuration.
+/// Let a key overshoot the cap before paying for a scan+delete: without
+/// slack, a key sitting at the cap pays a full trim on *every* write
+/// batch that touches it. `history()`/`get_at` still read at most the
+/// capped window — the slack just exists on disk briefly.
+const TRIM_SLACK: u64 = 64;
+
 fn trim_key_history(
     db: &Database,
     keyspace: &Keyspace,
@@ -451,7 +478,7 @@ fn trim_key_history(
     max_versions_per_key: usize,
     count: u64,
 ) -> io::Result<()> {
-    if count <= max_versions_per_key as u64 {
+    if count <= max_versions_per_key as u64 + TRIM_SLACK {
         return Ok(());
     }
     let prefix = by_key_prefix(db_index, key);
