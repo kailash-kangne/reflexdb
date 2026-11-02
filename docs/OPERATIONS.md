@@ -122,7 +122,8 @@ Exported: `reflexdb_up`, `uptime_seconds`, `connected_clients`, `blocked_clients
 `used_memory_bytes`/`used_memory_peak_bytes`/`maxmemory_bytes`,
 `commands_processed_total`, `role_master`, `connected_replicas`, `master_repl_offset`,
 `resync_full_total`/`resync_partial_total`, `aof_enabled`, `aof_size_bytes`,
-`aof_rewrite_in_progress`, `reflexdb_keys{db="N"}`.
+`aof_rewrite_in_progress`, `history_io_failed`, `history_dropped_total`,
+`reflexdb_keys{db="N"}`.
 
 The endpoint is unauthenticated and read-only — keep it on a loopback bind or behind
 your network boundary. Scrapes are cheap (they reuse the maintenance tick's cached

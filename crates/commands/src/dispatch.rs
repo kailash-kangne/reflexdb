@@ -1898,34 +1898,35 @@ fn on_key_changed_impl(
 /// this dispatch — called after the AOF/replication enqueues so the
 /// commit order is value -> LIVE -> AOF -> replication -> history. A crash
 /// can then only leave history *missing* a version the AOF has (a gap),
-/// never a phantom version the AOF lacks.
+/// never a phantom version the AOF lacks. The whole drain goes to the
+/// writer as one channel message, so a multi-key write costs one
+/// `try_send` instead of one per key.
 fn drain_pending_history(ctx: &ServerContext, pending: &mut PendingHistory) {
-    for (db_index, key, snap) in pending.drain(..) {
-        record_history(ctx, db_index, &key, snap);
+    if pending.is_empty() {
+        return;
     }
-}
-
-/// Queues a `(now, string-value-or-None)` version of `key` for the
-/// disk-backed history log (`persistence::history::HistoryWriter`). A
-/// `Some` snapshot is recorded as-is; `None` re-reads the key — `with_value`
-/// returns `None` for a missing key and `Some(None)` for a non-string
-/// value, and `.flatten()` collapses both into `None`, which is exactly
-/// the distinction `GETAT`/`HISTORY` need: "string with this value"
-/// (`Some`) vs. "deleted, or never a string" (`None`).
-/// `HistoryWriter::record` itself is fire-and-forget (see its module
-/// docs), so this doesn't block the write path on any disk I/O.
-fn record_history(ctx: &ServerContext, db_index: usize, key: &Bytes, snap: Option<Bytes>) {
     let history = ctx.history.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(writer) = &*history else { return };
-    let snapshot = match snap {
-        snap @ Some(_) => snap,
-        None => {
-            let Some(db) = ctx.store.db(db_index) else { return };
-            db.with_value(key, |v| v.string_bytes()).flatten()
-        }
+    let Some(writer) = &*history else {
+        pending.clear();
+        return;
     };
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-    writer.record(db_index, key.clone(), now_ms, snapshot);
+    // A `Some` snapshot is recorded as-is; `None` re-reads the key —
+    // `with_value` returns `None` for a missing key and `Some(None)` for a
+    // non-string value, and `.flatten()` collapses both into `None`, which
+    // is exactly the distinction `GETAT`/`HISTORY` need: "string with this
+    // value" (`Some`) vs. "deleted, or never a string" (`None`).
+    let items: Vec<(u16, Bytes, Option<Bytes>)> = pending
+        .drain(..)
+        .filter_map(|(db_index, key, snap)| {
+            let value = match snap {
+                snap @ Some(_) => snap,
+                None => ctx.store.db(db_index)?.with_value(&key, |v| v.string_bytes()).flatten(),
+            };
+            Some((db_index as u16, key, value))
+        })
+        .collect();
+    writer.record_batch(now_ms, items);
 }
 
 /// Publishes a `notify-keyspace-events` notification for a single-key

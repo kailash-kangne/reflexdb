@@ -169,14 +169,17 @@ fn config_set(ctx: &ServerContext, key: &str, value: &str) -> Outcome {
         }
         "history-enabled" => match value.to_ascii_lowercase().as_str() {
             "yes" => {
-                let mut guard = lock_write(&ctx.history);
-                if guard.is_none() {
+                if lock_read(&ctx.history).is_none() {
                     let Some(dir) = &ctx.history_dir else {
                         return err("ERR history can't be enabled: no history-dir configured");
                     };
+                    // Open before taking the write lock: fjall's open (plus
+                    // a possible version-limit compaction) can take seconds
+                    // while every write command read-locks `ctx.history` —
+                    // holding the write lock across it would stall them all.
                     match persistence::history::HistoryWriter::open_with_limit(dir, ctx.history_max_versions)
                     {
-                        Ok(w) => *guard = Some(w),
+                        Ok(w) => *lock_write(&ctx.history) = Some(w),
                         Err(e) => return err(format!("ERR could not open history store: {e}")),
                     }
                 }

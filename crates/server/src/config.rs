@@ -147,7 +147,8 @@ pub struct Config {
     /// `NotifyFlags` once, in `main.rs`, when building `ServerContext`).
     pub notify_keyspace_events: String,
     /// `history-enabled yes/no` — turns on `GETAT`/`HISTORY` (see
-    /// `persistence::history`'s docs). Off by default to avoid extra disk I/O.
+    /// `persistence::history`'s docs). On by default; set `no` to skip the
+    /// per-write disk history entirely.
     pub history_enabled: bool,
     /// `history-dir`: where the disk-backed history store's files land,
     /// relative to `dir` if not absolute.

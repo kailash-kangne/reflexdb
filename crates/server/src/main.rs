@@ -918,7 +918,10 @@ pub(crate) async fn dispatch_offloaded(
     state: &mut ClientState,
     req: resp::Request,
 ) -> Outcome {
-    let offload = ((ctx.aof_enabled() || ctx.history_enabled()) && commands::request_may_write(&req))
+    // History's `record()` is a non-blocking `try_send`, so it never has
+    // to park a Tokio worker — only the AOF (whose send can block on a
+    // full queue, and which can't drop writes) forces the pool handoff.
+    let offload = (ctx.aof_enabled() && commands::request_may_write(&req))
         || req.first().is_some_and(|name| {
             matches!(
                 name.to_ascii_uppercase().as_slice(),

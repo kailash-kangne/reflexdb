@@ -32,15 +32,17 @@
 //!
 //! # Crash guarantee — weaker than the AOF, on purpose
 //!
-//! `record()` is fire-and-forget: a version is durable only once the
-//! writer thread's batch commits. A crash (or `kill -9`) can therefore
-//! lose up to ~one in-flight batch of the *newest* versions — never
-//! already-committed ones. If the writer can't keep up with sustained
-//! writes the bounded queue fills and versions are *dropped* (counted in
-//! `history_dropped`) rather than throttling the keyspace — history must
-//! never gate keyspace writes. `GETAT`/`HISTORY` may thus report the most
-//! recent ~milliseconds of history as missing after a crash, or gaps
-//! under sustained overload; older committed versions are complete.
+//! `record()` is fire-and-forget: a version is durable once the writer
+//! thread's batch commits *and* the journal's `SyncData` tick lands it
+//! (`manual_journal_persist`, every `PERSIST_INTERVAL` ~200ms). A crash —
+//! `kill -9` included — can therefore lose up to ~a persist interval of the
+//! *newest* versions — never already-synced ones. If the writer can't keep
+//! up with sustained writes the bounded queue fills and versions are
+//! *dropped* (counted in `history_dropped`) rather than throttling the
+//! keyspace — history must never gate keyspace writes. `GETAT`/`HISTORY`
+//! may thus report the most recent ~fraction-of-a-second of history as
+//! missing after a crash, or gaps under sustained overload; older synced
+//! versions are complete.
 //! `flush()` blocks until pending records have been through a commit and
 //! returns whether it landed; `io_failed()` reports whether the last
 //! commit failed (surfaced via `INFO`/`metrics-port` since `record()`

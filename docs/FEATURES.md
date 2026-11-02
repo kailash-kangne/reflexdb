@@ -215,14 +215,14 @@ when age retention is disabled.
 Write cost — the writer batches one channel message per command, caches per-key state to
 skip LSM reads, compresses payloads (lz4), and fdatasyncs the journal every ~200ms rather
 than per batch; sustained writes with history on measure within noise of history-off
-(~190–200k ops/s P16 `small-mixed`, `history_dropped` 0). If a burst ever outruns the
+(~190–200k ops/s P16 `small-mixed`). If a burst ever outruns the
 disk, the bounded record queue drops versions and counts them in `history_dropped`
 (INFO/`metrics-port`) — the keyspace is never throttled by history.
 
 **Crash guarantee** — weaker than the AOF, deliberately: `record()` is fire-and-forget, so a
-crash can lose up to ~one in-flight batch of the *newest* versions (already-committed versions
-are never lost). `GETAT`/`HISTORY` may therefore miss the last ~milliseconds of history after a
-crash; older versions are complete. A failed batch commit sets `history_io_failed` in
+crash can lose up to ~a journal persist interval (~200ms) of the *newest* versions (already-
+synced versions are never lost). `GETAT`/`HISTORY` may therefore miss the most recent moments
+of history after a crash; older versions are complete. A failed batch commit sets `history_io_failed` in
 `INFO persistence` and the `metrics-port` exposition — history loss never gates keyspace writes.
 `OBJECTAT`, `RESTOREAT`, `LIVE ... SINCE`, and `EXPIREACTION` are
 designed but not built — see [ROADMAP.md](ROADMAP.md).
