@@ -31,11 +31,11 @@ the phase work began) showed every workload within ±1%:
 All ACL hot-path work (channel check, key-pattern operand decode) stays behind the
 `allkeys`/`allchannels` fast path — the default user pays zero extra lookups per command.
 
-One config caveat for comparing runs: `history-enabled` defaults to `yes`, and every write
-then persists a version — write-heavy benchmarks run ~30% slower (~150k vs ~210k ops/s
-P16 `small-mixed` measured), and versions dropped under sustained overload show up in
-`history_dropped`. The shootout numbers above were measured with history off; match the
-flag when comparing runs.
+One config caveat for comparing runs: `history-enabled` defaults to `yes`. The history
+writer is a separate batched disk path — after the queue/journal/cache work it measures
+within noise of history-off (~190–200k ops/s P16 `small-mixed`); if a burst ever outruns
+the disk, dropped versions show up in `history_dropped`. The shootout numbers above were
+measured with history off.
 
 ## Reproducible harness
 

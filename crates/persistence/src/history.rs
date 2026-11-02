@@ -62,9 +62,10 @@
 //!   history size)` — it never has to touch `BY_KEY` entries that are
 //!   still fresh.
 //!
-//! Both entries for a version carry the same encoded value, so the sweep
-//! can delete a `BY_TIME` entry and derive its matching `BY_KEY` entry's
-//! key directly from the bytes it already scanned, without an extra read.
+//! `BY_TIME` entries carry an empty value — the sweep derives the matching
+//! `BY_KEY` entry's key from the `BY_TIME` entry's *key* bytes it already
+//! scanned, so duplicating the payload would just double the bytes journaled
+//! and compacted per version for nothing.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -73,9 +74,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use fjall::{Database, Keyspace, KeyspaceCreateOptions};
+use fjall::config::CompressionPolicy;
+use fjall::{CompressionType, Database, Keyspace, KeyspaceCreateOptions, OwnedWriteBatch, PersistMode};
 
 const BY_KEY: u8 = 1;
 const BY_TIME: u8 = 2;
@@ -85,13 +88,13 @@ pub const DEFAULT_MAX_VERSIONS_PER_KEY: usize = 200;
 const MAX_VERSIONS_PER_KEY: usize = 1_000_000;
 const COMPACT_BATCH: usize = 4096;
 
-/// One queued version append, handed to the writer thread.
+/// One queued version-append batch, handed to the writer thread. One
+/// command's worth of writes travels as a single channel message so a
+/// multi-key write costs one `try_send`, not N.
 enum Job {
-    Record {
-        db_index: u16,
-        key: Bytes,
+    Records {
         ts_ms: u64,
-        value: Option<Bytes>,
+        items: Vec<(u16, Bytes, Option<Bytes>)>,
     },
     /// Ack once every job sent before this one has been through the
     /// writer's batch commit — used by tests (and anything else that
@@ -101,7 +104,10 @@ enum Job {
 }
 
 pub struct HistoryWriter {
-    tx: Mutex<SyncSender<Job>>,
+    // A single shared `SyncSender` (it's `Sync`) — no outer mutex. What
+    // `Flush` needs is "a `record()` that returned is already queued,"
+    // which holds without one: messages land in send-completion order.
+    tx: SyncSender<Job>,
     // Kept alongside `keyspace` so `sweep_older_than` can start a
     // `WriteBatch` (`Database::batch()`) without the writer thread's copy.
     db: Database,
@@ -116,6 +122,11 @@ pub struct HistoryWriter {
     io_failed: Arc<AtomicBool>,
     /// Versions dropped on a full queue — the writer couldn't keep up.
     dropped: Arc<AtomicU64>,
+    /// Bumped by `sweep_older_than` after it rewrites `BY_COUNT` entries —
+    /// the writer thread watches this to invalidate its count cache
+    /// (checked under `write_lock`, so it can never observe a half-swept
+    /// state).
+    sweep_epoch: Arc<AtomicU64>,
     // Keeps the writer thread alive for the program's lifetime.
     _worker: thread::JoinHandle<()>,
 }
@@ -137,18 +148,32 @@ impl HistoryWriter {
         }
         std::fs::create_dir_all(dir)?;
         let db = Database::builder(dir).open().map_err(io::Error::other)?;
-        let keyspace =
-            db.keyspace("reflexdb-history", KeyspaceCreateOptions::default).map_err(io::Error::other)?;
+        // manual_journal_persist: commits land in the journal's OS-buffered
+        // pages immediately; the writer thread calls `persist(SyncData)`
+        // every PERSIST_INTERVAL instead of paying an fsync per batch —
+        // history's crash guarantee already only promises committed-prefix
+        // (~a sync interval of newest versions at worst, and only on
+        // power/OS loss — `kill -9` leaves OS pages intact). Lz4 on every
+        // level: version payloads are the bulk of journal+compaction bytes.
+        let keyspace = db
+            .keyspace("reflexdb-history", || {
+                KeyspaceCreateOptions::default()
+                    .manual_journal_persist(true)
+                    .data_block_compression_policy(CompressionPolicy::all(CompressionType::Lz4))
+            })
+            .map_err(io::Error::other)?;
         let limit_marker = keyspace.get(HISTORY_LIMIT_META).map_err(io::Error::other)?;
         let expected_marker = (max_versions_per_key as u64).to_be_bytes();
         let compact_on_start = limit_marker.as_deref() != Some(expected_marker.as_slice());
         let (tx, rx) = mpsc::sync_channel(4096);
         let io_failed = Arc::new(AtomicBool::new(false));
+        let sweep_epoch = Arc::new(AtomicU64::new(0));
         let worker_db = db.clone();
         let worker_keyspace = keyspace.clone();
         let write_lock = Arc::new(Mutex::new(()));
         let worker_write_lock = write_lock.clone();
         let worker_io_failed = io_failed.clone();
+        let worker_sweep_epoch = sweep_epoch.clone();
         let worker = thread::Builder::new()
             .name("reflexdb-history-writer".into())
             .spawn(move || {
@@ -160,17 +185,19 @@ impl HistoryWriter {
                     compact_on_start,
                     worker_write_lock,
                     worker_io_failed,
+                    worker_sweep_epoch,
                 )
             })
             .map_err(|e| io::Error::other(format!("failed to spawn history writer thread: {e}")))?;
         Ok(Self {
-            tx: Mutex::new(tx),
+            tx,
             db,
             keyspace,
             max_versions_per_key,
             write_lock,
             io_failed,
             dropped: Arc::new(AtomicU64::new(0)),
+            sweep_epoch,
             _worker: worker,
         })
     }
@@ -181,18 +208,28 @@ impl HistoryWriter {
     /// records a delete (or "wasn't a string"), matching `GETAT`/
     /// `HISTORY`'s existing nil-means-deleted convention.
     pub fn record(&self, db_index: usize, key: Bytes, ts_ms: u64, value: Option<Bytes>) {
-        let job = Job::Record { db_index: db_index as u16, key, ts_ms, value };
+        self.record_batch(ts_ms, vec![(db_index as u16, key, value)]);
+    }
+
+    /// Queue several versions sharing one timestamp as a single channel
+    /// message — the request path builds one per command, so a multi-key
+    /// write costs one `try_send` instead of one per key.
+    pub fn record_batch(&self, ts_ms: u64, items: Vec<(u16, Bytes, Option<Bytes>)>) {
+        if items.is_empty() {
+            return;
+        }
         // try_send, not send: a blocking send would throttle the whole
         // write path down to history-writer speed once the queue fills,
         // which is exactly what "never gates keyspace writes" forbids.
-        // A full queue drops the version and counts it — surfaced via
+        // A full queue drops the versions and counts them — surfaced via
         // `history_dropped` in INFO/metrics. A disconnected writer means
         // shutdown, and is also "too late to record," not a bug worth
         // surfacing on every write's hot path.
-        match self.tx.lock().unwrap().try_send(job) {
+        let dropped = items.len() as u64;
+        match self.tx.try_send(Job::Records { ts_ms, items }) {
             Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {}
             Err(mpsc::TrySendError::Full(_)) => {
-                self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.dropped.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -210,7 +247,7 @@ impl HistoryWriter {
     /// sleeping/polling).
     pub fn flush(&self) -> bool {
         let (ack_tx, ack_rx) = mpsc::sync_channel(1);
-        self.tx.lock().unwrap().send(Job::Flush(ack_tx)).is_ok() && ack_rx.recv().unwrap_or(false)
+        self.tx.send(Job::Flush(ack_tx)).is_ok() && ack_rx.recv().unwrap_or(false)
     }
 
     /// `true` once the writer thread has reported a batch commit failure
@@ -314,10 +351,39 @@ impl HistoryWriter {
             tracing::warn!(error = %e, "history sweep failed to commit deletions");
             return 0;
         }
+        // Deletions rewrote `BY_COUNT` entries — tell the writer thread to
+        // drop its cached counts before its next batch.
+        self.sweep_epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         stale.len()
     }
 }
 
+/// Writer-thread cache of one key's on-disk state: `count` mirrors the
+/// `BY_COUNT` entry and `max_ts` is an upper bound on every `ts_ms` the key
+/// has on disk (every version on disk was queued through this writer, or
+/// measured by `newest_ts_on_disk` on the cold path). A `ts_ms` above
+/// `max_ts` is therefore guaranteed absent — steady-state batches then need
+/// no LSM reads at all, which is what keeps throughput flat as the store
+/// grows.
+struct KeyState {
+    count: u64,
+    max_ts: u64,
+}
+
+/// Bound on `key_states` — cleared rather than grown past this, falling
+/// back to disk reads until it repopulates. ~tens of MB worst case for
+/// very large keyspaces.
+const MAX_KEY_STATES: usize = 250_000;
+
+const MAX_BATCH: usize = 4096;
+
+/// How often the writer thread fdatasyncs the journal while
+/// `manual_journal_persist` is set — the durability window the crash
+/// guarantee actually exposes on OS/power loss (a `kill -9` leaves the
+/// OS-buffered pages intact, so it loses nothing extra).
+const PERSIST_INTERVAL: Duration = Duration::from_millis(200);
+
+#[allow(clippy::too_many_arguments)]
 fn writer_loop(
     db: Database,
     keyspace: Keyspace,
@@ -326,6 +392,7 @@ fn writer_loop(
     compact_on_start: bool,
     write_lock: Arc<Mutex<()>>,
     io_failed: Arc<AtomicBool>,
+    sweep_epoch: Arc<AtomicU64>,
 ) {
     if compact_on_start {
         if let Err(error) = compact_history(&db, &keyspace, max_versions_per_key, &write_lock) {
@@ -333,9 +400,34 @@ fn writer_loop(
         }
     }
 
-    while let Ok(first) = rx.recv() {
-        const MAX_BATCH: usize = 1024;
-        let mut jobs = Vec::with_capacity(MAX_BATCH.min(64));
+    let mut key_states: HashMap<(u16, Bytes), KeyState> = HashMap::new();
+    let mut seen_sweep_epoch = sweep_epoch.load(std::sync::atomic::Ordering::Relaxed);
+    let mut jobs = Vec::with_capacity(1024);
+    let mut pending_timestamps: HashMap<(u16, Bytes), HashSet<u64>> = HashMap::new();
+    let mut acks = Vec::new();
+    let mut touched = Vec::new();
+    let mut last_persist = Instant::now();
+    let mut dirty = false;
+
+    loop {
+        let first = match rx.recv_timeout(PERSIST_INTERVAL) {
+            Ok(job) => job,
+            // Idle tick: a committed-but-unsynced batch must still reach
+            // disk inside ~the interval, even with no writes flowing.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if dirty && last_persist.elapsed() >= PERSIST_INTERVAL {
+                    let _write_guard = write_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Err(error) = db.persist(PersistMode::SyncData) {
+                        tracing::warn!(%error, "history journal persist failed; will retry next interval");
+                    } else {
+                        dirty = false;
+                    }
+                    last_persist = Instant::now();
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         jobs.push(first);
         while jobs.len() < MAX_BATCH {
             let Ok(job) = rx.try_recv() else { break };
@@ -343,51 +435,114 @@ fn writer_loop(
         }
 
         let _write_guard = write_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut batch = db.batch();
-        let mut acks = Vec::new();
-        let mut pending_timestamps: HashMap<(u16, Bytes), HashSet<u64>> = HashMap::new();
-        for job in jobs {
+        // A sweep rewrites `BY_COUNT` entries under this same lock, so the
+        // epoch read here is never mid-sweep; a bump means cached counts are
+        // stale-high and would trim more than the cap allows.
+        let epoch = sweep_epoch.load(std::sync::atomic::Ordering::Relaxed);
+        if epoch != seen_sweep_epoch {
+            key_states.clear();
+            seen_sweep_epoch = epoch;
+        }
+
+        let item_count: usize = jobs
+            .iter()
+            .map(|j| match j {
+                Job::Records { items, .. } => items.len(),
+                _ => 0,
+            })
+            .sum();
+        let mut batch = OwnedWriteBatch::with_capacity(db.clone(), item_count * 3 + 8);
+        for job in jobs.drain(..) {
             match job {
-                Job::Record { db_index, key, ts_ms, value } => {
-                    let payload = encode_value(value.as_ref());
-                    pending_timestamps.entry((db_index, key.clone())).or_default().insert(ts_ms);
-                    batch.insert(&keyspace, by_key_full(db_index, &key, ts_ms), payload.clone());
-                    batch.insert(&keyspace, by_time_full(db_index, &key, ts_ms), payload);
+                Job::Records { ts_ms, items } => {
+                    for (db_index, key, value) in items {
+                        pending_timestamps.entry((db_index, key.clone())).or_default().insert(ts_ms);
+                        batch.insert(
+                            &keyspace,
+                            by_key_full(db_index, &key, ts_ms),
+                            encode_value(value.as_ref()),
+                        );
+                        batch.insert(&keyspace, by_time_full(db_index, &key, ts_ms), Vec::new());
+                    }
                 }
                 Job::Flush(ack) => acks.push(ack),
             }
         }
-        let mut touched = Vec::with_capacity(pending_timestamps.len());
-        for ((db_index, key), timestamps) in pending_timestamps {
-            let mut count = read_count(&keyspace, db_index, &key);
-            for ts_ms in timestamps {
-                if keyspace.get(by_key_full(db_index, &key, ts_ms)).ok().flatten().is_none() {
-                    count = count.saturating_add(1);
+        for ((db_index, key), timestamps) in pending_timestamps.drain() {
+            let prior = key_states.get(&(db_index, key.clone()));
+            let mut count = prior.map_or_else(|| read_count(&keyspace, db_index, &key), |s| s.count);
+            let known_max = match prior {
+                Some(s) => Some(s.max_ts),
+                None => newest_ts_on_disk(&keyspace, db_index, &key),
+            };
+            let mut added = 0u64;
+            for &ts_ms in &timestamps {
+                let fresh = match known_max {
+                    Some(max) if ts_ms > max => true,
+                    _ => keyspace.get(by_key_full(db_index, &key, ts_ms)).ok().flatten().is_none(),
+                };
+                if fresh {
+                    added += 1;
                 }
             }
-            batch.insert(&keyspace, by_count_key(db_index, &key), count.to_be_bytes());
-            touched.push((db_index, key, count));
+            count = count.saturating_add(added);
+            if added > 0 {
+                batch.insert(&keyspace, by_count_key(db_index, &key), count.to_be_bytes());
+            }
+            // Upper bound on this key's on-disk ts after this batch commits:
+            // the batch's newest ts or an older ceiling we already know.
+            let ceiling = timestamps.iter().copied().max().unwrap_or(0).max(known_max.unwrap_or(0));
+            touched.push((db_index, key, count, ceiling));
         }
         let committed = match batch.commit() {
             Ok(()) => {
                 io_failed.store(false, std::sync::atomic::Ordering::Relaxed);
-                for (db_index, key, count) in touched {
-                    if let Err(error) =
-                        trim_key_history(&db, &keyspace, db_index, &key, max_versions_per_key, count)
-                    {
-                        tracing::warn!(%error, db_index, key = ?key, "failed to enforce per-key history limit");
+                for (db_index, key, count, ceiling) in touched.drain(..) {
+                    match trim_key_history(&db, &keyspace, db_index, &key, max_versions_per_key, count) {
+                        Ok(retained) => {
+                            if key_states.len() >= MAX_KEY_STATES {
+                                key_states.clear();
+                            }
+                            let prev_max = key_states.get(&(db_index, key.clone())).map_or(0, |s| s.max_ts);
+                            key_states.insert(
+                                (db_index, key),
+                                KeyState { count: retained, max_ts: ceiling.max(prev_max) },
+                            );
+                        }
+                        Err(error) => {
+                            // Partial trim may have rewritten BY_COUNT —
+                            // don't trust what we computed for this key.
+                            key_states.remove(&(db_index, key.clone()));
+                            tracing::warn!(%error, db_index, key = ?key, "failed to enforce per-key history limit");
+                        }
                     }
                 }
                 true
             }
             Err(error) => {
                 io_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                // Batch commits are atomic, so nothing landed — the cache is
+                // still valid, but clearing it is cheap insurance against
+                // ever reasoning about a partially-applied batch.
+                key_states.clear();
+                touched.clear();
                 tracing::warn!(%error, "history writer thread failed to commit a batch");
                 false
             }
         };
-        for ack in acks {
+        for ack in acks.drain(..) {
             let _ = ack.send(committed);
+        }
+        if committed {
+            dirty = true;
+            if last_persist.elapsed() >= PERSIST_INTERVAL {
+                if let Err(error) = db.persist(PersistMode::SyncData) {
+                    tracing::warn!(%error, "history journal persist failed; will retry next interval");
+                } else {
+                    dirty = false;
+                }
+                last_persist = Instant::now();
+            }
         }
     }
 }
@@ -470,6 +625,8 @@ fn compact_history(
 /// capped window — the slack just exists on disk briefly.
 const TRIM_SLACK: u64 = 64;
 
+/// Returns the version count left on disk, so the caller's `key_states`
+/// cache can store exactly what was written.
 fn trim_key_history(
     db: &Database,
     keyspace: &Keyspace,
@@ -477,13 +634,14 @@ fn trim_key_history(
     key: &[u8],
     max_versions_per_key: usize,
     count: u64,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     if count <= max_versions_per_key as u64 + TRIM_SLACK {
-        return Ok(());
+        return Ok(count);
     }
     let prefix = by_key_prefix(db_index, key);
     let count_key = by_count_key(db_index, key);
     let mut remaining = count - max_versions_per_key as u64;
+    let mut retained = count;
     while remaining > 0 {
         let stale: Vec<Vec<u8>> = keyspace
             .prefix(&prefix)
@@ -501,11 +659,24 @@ fn trim_key_history(
             }
         }
         remaining = remaining.saturating_sub(stale.len() as u64);
-        let retained_count = count.saturating_sub((count - max_versions_per_key as u64) - remaining);
-        batch.insert(keyspace, count_key.clone(), retained_count.to_be_bytes());
+        retained = count.saturating_sub((count - max_versions_per_key as u64) - remaining);
+        batch.insert(keyspace, count_key.clone(), retained.to_be_bytes());
         batch.commit().map_err(io::Error::other)?;
     }
-    Ok(())
+    Ok(retained)
+}
+
+/// The newest `ts_ms` `key` has on disk — one reverse `prefix` step, taken
+/// only on the `key_states` cold path so `max_ts` covers versions a
+/// previous process wrote (an upper bound below the true on-disk max would
+/// let a rewrite of an existing ts skip the existence check and overcount).
+fn newest_ts_on_disk(keyspace: &Keyspace, db_index: u16, key: &[u8]) -> Option<u64> {
+    let prefix = by_key_prefix(db_index, key);
+    keyspace
+        .prefix(&prefix)
+        .next_back()
+        .and_then(|guard| guard.key().ok())
+        .and_then(|full| parse_ts_suffix(&full, prefix.len()))
 }
 
 fn by_key_prefix_from_full(full_key: &[u8]) -> Option<&[u8]> {
@@ -768,6 +939,48 @@ mod tests {
                 vec![(500, Some(Bytes::from("v500"))), (400, Some(Bytes::from("v400")))]
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recording_after_a_sweep_still_trims_to_the_cap() {
+        let dir = temp_dir("post-sweep");
+        let writer = HistoryWriter::open_with_limit(&dir, 3).unwrap();
+        for ts in [100, 200, 300] {
+            writer.record(0, Bytes::from("k"), ts, Some(Bytes::from(format!("v{ts}"))));
+        }
+        writer.flush();
+        // Sweep removes all three; their BY_COUNT entry goes to zero and is
+        // deleted. The writer's cached count must be invalidated (sweep
+        // epoch) or it would overcount and trim below the cap.
+        assert_eq!(writer.sweep_older_than(1000), 3);
+        // 70 versions > cap(3) + TRIM_SLACK(64): a stale count would push
+        // the trim past every on-disk version and wipe the key's history.
+        for ts in 400..470u64 {
+            writer.record(0, Bytes::from("k"), ts, Some(Bytes::from(format!("v{ts}"))));
+        }
+        writer.flush();
+        let history = writer.history(0, b"k", 10);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].0, 469);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn re_recording_an_existing_timestamp_does_not_double_count() {
+        let dir = temp_dir("dup-ts");
+        let writer = HistoryWriter::open_with_limit(&dir, 3).unwrap();
+        writer.record(0, Bytes::from("k"), 100, Some(Bytes::from("a")));
+        writer.flush();
+        // Same (key, ts) in a later batch: overwrites on disk, must not bump
+        // the version count (else the cap trims real versions early).
+        writer.record(0, Bytes::from("k"), 100, Some(Bytes::from("b")));
+        writer.record(0, Bytes::from("k"), 200, Some(Bytes::from("c")));
+        writer.flush();
+        assert_eq!(
+            writer.history(0, b"k", 10),
+            vec![(200, Some(Bytes::from("c"))), (100, Some(Bytes::from("b")))]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
