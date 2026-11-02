@@ -32,10 +32,10 @@ All ACL hot-path work (channel check, key-pattern operand decode) stays behind t
 `allkeys`/`allchannels` fast path — the default user pays zero extra lookups per command.
 
 One config caveat for comparing runs: `history-enabled` defaults to `yes`, and every write
-then persists a version — sustained-write benchmarks degrade as versions accumulate
-(~170k → ~60k ops/s over repeated 5s P16 `small-mixed` runs; `--history-enabled no` holds
-~210k flat). The shootout numbers above were measured with history off; match the flag
-when comparing runs.
+then persists a version — write-heavy benchmarks run ~30% slower (~150k vs ~210k ops/s
+P16 `small-mixed` measured), and versions dropped under sustained overload show up in
+`history_dropped`. The shootout numbers above were measured with history off; match the
+flag when comparing runs.
 
 ## Reproducible harness
 
