@@ -177,7 +177,11 @@ same workloads, median of 3. On a loaded host:
 **ReflexDB led all eight shootout cells** — plus all five aggressive cases
 (64 clients, deep P64 pipelines, 100k keys, 8 KiB values). All engines within ~±15%;
 *one machine, one session — re-measure before quoting.*
-Full tables: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+The current tree (compact collections, channel ACLs, salted hashes, auto-AOF-rewrite,
+metrics endpoint) re-verified flat vs. the pre-hardening baseline via interleaved
+A/B (`benchmarks/ab.sh`): every workload within ±1%. Methodology, the honest-noise
+story, and full tables: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ---
 
