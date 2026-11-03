@@ -2666,9 +2666,9 @@ fn cmd_ttl(ctx: &ServerContext, state: &ClientState, args: &[Bytes], millis: boo
         Ttl::Persistent => -1,
         Ttl::Expires(d) => {
             if millis {
-                d.as_millis() as i64
+                d.as_millis().min(i64::MAX as u128) as i64
             } else {
-                d.as_secs_f64().round() as i64
+                d.as_secs().min(i64::MAX as u64) as i64
             }
         }
     };
