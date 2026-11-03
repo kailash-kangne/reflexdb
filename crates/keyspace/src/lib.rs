@@ -153,7 +153,7 @@ fn now_secs() -> u32 {
 /// `is_expired` treats as already elapsed ("no expiry" is `u64::MAX`,
 /// not `0`, so `0` is free to mean "expired").
 fn instant_to_ms(at: Instant) -> u64 {
-    at.saturating_duration_since(*EPOCH).as_millis().min(u64::MAX as u128) as u64
+    at.saturating_duration_since(*EPOCH).as_millis().min((u64::MAX - 1) as u128) as u64
 }
 
 /// `Duration` → `sliding_ms`. Same `.max(1)` sentinel rule: a sub-ms
