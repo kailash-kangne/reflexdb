@@ -731,7 +731,8 @@ fn protected_mode_denies_non_loopback_clients() {
     }
 
     // Loopback is always allowed.
-    assert_eq!(health.cmd(&["PING"]), Reply::Simple("PONG".into()));
+    let mut loopback = Client::connect(port);
+    assert_eq!(loopback.cmd(&["PING"]), Reply::Simple("PONG".into()));
 
     sigkill(&mut server);
     let _ = std::fs::remove_dir_all(&dir);
@@ -783,7 +784,7 @@ fn soak_mixed_load_then_sigkill_recovers() {
     // Keep a control connection open before the sustained write load. Reconnecting
     // after 60 seconds of appendfsync=always traffic can fail under runner load
     // even though the already-established client remains healthy.
-    let mut health = Client::connect(port);
+    let health = Client::connect(port);
 
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut joins = Vec::new();
@@ -807,8 +808,7 @@ fn soak_mixed_load_then_sigkill_recovers() {
     }
     let counts: Vec<i64> = joins.into_iter().map(|j| j.join().unwrap()).collect();
 
-    let mut c = Client::connect(port);
-    assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
+    assert_eq!(health.cmd(&["PING"]), Reply::Simple("PONG".into()));
 
     sigkill(&mut server);
     let mut server = spawn(port, &dir, &["--appendonly", "yes", "--appendfsync", "always"]);
