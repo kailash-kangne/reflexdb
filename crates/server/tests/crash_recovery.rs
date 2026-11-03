@@ -784,7 +784,7 @@ fn soak_mixed_load_then_sigkill_recovers() {
     // Keep a control connection open before the sustained write load. Reconnecting
     // after 60 seconds of appendfsync=always traffic can fail under runner load
     // even though the already-established client remains healthy.
-    let health = Client::connect(port);
+    let mut health = Client::connect(port);
 
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut joins = Vec::new();
