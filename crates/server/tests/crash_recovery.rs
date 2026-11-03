@@ -30,7 +30,10 @@ struct Client {
 
 impl Client {
     fn connect(port: u16) -> Client {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        // 60s, not 15: the server binds only after AOF replay finishes, and
+        // replaying a 60s `appendfsync=always` soak AOF on a shared CI
+        // runner can take well over 15s before the port accepts.
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             match TcpStream::connect(("127.0.0.1", port)) {
                 Ok(stream) => {
