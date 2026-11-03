@@ -731,8 +731,7 @@ fn protected_mode_denies_non_loopback_clients() {
     }
 
     // Loopback is always allowed.
-    let mut c = Client::connect(port);
-    assert_eq!(c.cmd(&["PING"]), Reply::Simple("PONG".into()));
+    assert_eq!(health.cmd(&["PING"]), Reply::Simple("PONG".into()));
 
     sigkill(&mut server);
     let _ = std::fs::remove_dir_all(&dir);
@@ -781,6 +780,11 @@ fn soak_mixed_load_then_sigkill_recovers() {
     let mut server = spawn(port, &dir, &["--appendonly", "yes", "--appendfsync", "always"]);
 
     let secs: u64 = std::env::var("REFLEXDB_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    // Keep a control connection open before the sustained write load. Reconnecting
+    // after 60 seconds of appendfsync=always traffic can fail under runner load
+    // even though the already-established client remains healthy.
+    let mut health = Client::connect(port);
+
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut joins = Vec::new();
     for t in 0..4u64 {
